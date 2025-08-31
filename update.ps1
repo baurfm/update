@@ -137,11 +137,36 @@ if (-not $NoScoop) {
     Write-SectionHeader "Updating Scoop and its packages"
     try {
         if (Get-Command scoop -ErrorAction SilentlyContinue) {
+            Write-Host "Checking for outdated Scoop packages..."
+            $scoopStatus = scoop status
+            $outdatedApps = @()
+            # We parse the output of 'scoop status' to find packages marked as outdated.
+            foreach ($line in ($scoopStatus -split [System.Environment]::NewLine)) {
+                if ($line -like '*outdated*') {
+                    # Extracts the package name, which is the first element on the line.
+                    $appName = ($line.Trim() -split '\s+')[0]
+                    if (-not [string]::IsNullOrWhiteSpace($appName)) {
+                        $outdatedApps += $appName
+                    }
+                }
+            }
+
+            if ($outdatedApps.Count -gt 0) {
+                Write-Host "Found $($outdatedApps.Count) outdated packages: $($outdatedApps -join ', ')"
+                $updatedItems["Scoop"] += $outdatedApps
+            } else {
+                Write-Host "No outdated Scoop packages found to update."
+            }
+
             Write-Host "Updating Scoop itself..."
             scoop update
             Write-Host "Updating all installed packages via Scoop..."
             scoop update *
-            $updatedItems["Scoop"] += "Ran 'scoop update *' command."
+
+            # Add a generic message to the summary if no specific packages were found to be outdated.
+            if ($updatedItems["Scoop"].Count -eq 0) {
+                $updatedItems["Scoop"] += "Ran 'scoop update *' (no outdated packages were detected beforehand)."
+            }
         } else {
             Write-Host "Scoop is not installed. Skipping."
         }
@@ -158,10 +183,49 @@ if (-not $NoWinget) {
     Write-SectionHeader "Updating Winget & Microsoft Store apps"
     try {
         if (Get-Command winget -ErrorAction SilentlyContinue) {
+            Write-Host "Checking for outdated Winget packages..."
+            # We run 'winget upgrade' to get the list of upgradable packages.
+            # We need to specify --include-unknown to match the upgrade command.
+            $wingetUpgradeOutput = winget upgrade --include-unknown
+            $upgradablePackages = @()
+
+            if ($wingetUpgradeOutput -and $wingetUpgradeOutput.Length -gt 2) {
+                $lines = $wingetUpgradeOutput -split [System.Environment]::NewLine
+                # The first line is the header, which we can use to find column positions.
+                $headerLine = $lines[0]
+                $idColIndex = $headerLine.IndexOf('Id')
+                $versionColIndex = $headerLine.IndexOf('Version')
+
+                if ($idColIndex -ge 0 -and $versionColIndex -gt $idColIndex) {
+                    # Start processing from the third line (index 2) to skip header and separator.
+                    for ($i = 2; $i -lt $lines.Length; $i++) {
+                        $line = $lines[$i]
+                        if ($line.Trim().Length -gt 0) {
+                            # Extract the Id based on the column position.
+                            $packageId = $line.Substring($idColIndex, $versionColIndex - $idColIndex).Trim()
+                            if (-not [string]::IsNullOrWhiteSpace($packageId)) {
+                                $upgradablePackages += $packageId
+                            }
+                        }
+                    }
+                }
+            }
+
+            if ($upgradablePackages.Count -gt 0) {
+                Write-Host "Found $($upgradablePackages.Count) upgradable packages."
+                $updatedItems["Winget"] += $upgradablePackages
+            } else {
+                Write-Host "No outdated Winget packages found to update."
+            }
+
             Write-Host "Running winget to upgrade all packages (including pinned and unknown)..."
             # Using the standard command-line tool directly. It will print its own progress.
             sudo winget upgrade --all --accept-source-agreements --accept-package-agreements --include-pinned --include-unknown
-            $updatedItems["Winget"] += "Ran 'winget upgrade --all' command."
+
+            # Add a generic message to the summary if no specific packages were found to be outdated.
+            if ($updatedItems["Winget"].Count -eq 0) {
+                $updatedItems["Winget"] += "Ran 'winget upgrade --all' (no outdated packages were detected beforehand)."
+            }
         } else {
             Write-Host "Winget is not installed. Skipping."
         }
@@ -180,14 +244,41 @@ if (-not $NoVsCode) {
     Write-SectionHeader "Updating Visual Studio Code Extensions"
     try {
         if (Get-Command code -ErrorAction SilentlyContinue) {
-            Write-Host "Updating all VS Code extensions..."
-            code --update-extensions
-            $updatedItems["VS Code Extensions"] += "Ran 'code --update-extensions' command."
+            Write-Host "Checking for and updating all VS Code extensions..."
+            $installedExtensions = code --list-extensions
+            $actuallyUpdated = @()
+
+            foreach ($extensionId in $installedExtensions) {
+                if ($extensionId.Trim().Length -gt 0) {
+                    Write-Host "Checking/updating extension: $extensionId..."
+                    # The '--force' flag ensures that the extension is updated if it's already installed. We capture stderr too.
+                    $updateOutput = code --install-extension $extensionId --force 2>&1
+
+                    # We check the output to see if the extension was actually updated.
+                    # The message for a successful update/install is "Extension ... was successfully installed."
+                    # The message for no update is "Extension ... is already installed."
+                    if ($updateOutput -join ' ' -like '*successfully installed*') {
+                        Write-Host "--> Successfully updated $extensionId" -ForegroundColor Cyan
+                        $actuallyUpdated += $extensionId
+                    }
+                }
+            }
+
+            if ($actuallyUpdated.Count -gt 0) {
+                Write-Host "$($actuallyUpdated.Count) extensions were updated." -ForegroundColor Green
+                $updatedItems["VS Code Extensions"] += $actuallyUpdated
+            } else {
+                Write-Host "All VS Code extensions were already up-to-date."
+            }
+
+            if ($updatedItems["VS Code Extensions"].Count -eq 0) {
+                $updatedItems["VS Code Extensions"] += "All extensions checked and were up-to-date."
+            }
         } else {
             Write-Host "The 'code' command is not in your PATH. Skipping VS Code extension updates."
         }
     } catch {
-        Write-Host "An error occurred while updating VS Code extensions. $_"
+        Write-Host "An error occurred while updating VS Code extensions. $_" -ForegroundColor Red
         $failedItems["VS Code Extensions"] += "General VS Code Error - $($_.Exception.Message)"
     }
 } else {
