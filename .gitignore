@@ -1,0 +1,23 @@
+# PowerShell history
+*History.txt
+*PSReadline*
+
+# Local script settings
+local.*
+private.*
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Common PowerShell module folders
+/Modules/*
+!/Modules/README.md
+
+# PowerShell Core files
+/bin/
+/obj/
+
+# User-specific files
+.DS_Store
+Thumbs.db
