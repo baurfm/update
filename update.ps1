@@ -80,6 +80,17 @@ param(
     [switch]$NoWsl
 )
 
+# Set error action preference for consistent error handling
+$ErrorActionPreference = 'Continue'
+
+# Security: Require script to be run from the directory where it's located
+$ScriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
+if ((Get-Location).Path -ne $ScriptPath) {
+    Write-Warning "Script should be run from its directory: $ScriptPath"
+    Write-Host "Changing to script directory..." -ForegroundColor Yellow
+    Set-Location $ScriptPath
+}
+
 # If -Help, -h, or -? is used, show the help for this script and exit.
 if ($Help) {
     # Use the built-in Get-Help command to display the comment-based help block from the top of this script.
@@ -90,9 +101,12 @@ if ($Help) {
 
 # Function to display a formatted section header
 function Write-SectionHeader {
+    [CmdletBinding()]
     param (
+        [Parameter(Mandatory = $true)]
         [string]$Title
     )
+    
     Write-Host ""
     Write-Host "=================================================="
     Write-Host "  $Title"
@@ -100,12 +114,25 @@ function Write-SectionHeader {
     Write-Host ""
 }
 
-# Initialize arrays to store results for the final summary
+# Initialize hashtables to store results for the final summary
 $updatedItems = @{
-    "PowerShell Modules" = @(); "Scoop" = @(); "Winget" = @(); "VS Code Extensions" = @(); "Conda" = @(); "TeX Live" = @(); "WSL" = @()
+    "PowerShell Modules" = @()
+    "Scoop" = @()
+    "Winget" = @()
+    "VS Code Extensions" = @()
+    "Conda" = @()
+    "TeX Live" = @()
+    "WSL" = @()
 }
+
 $failedItems = @{
-    "PowerShell Modules" = @(); "Scoop" = @(); "Winget" = @(); "VS Code Extensions" = @(); "Conda" = @(); "TeX Live" = @(); "WSL" = @()
+    "PowerShell Modules" = @()
+    "Scoop" = @()
+    "Winget" = @()
+    "VS Code Extensions" = @()
+    "Conda" = @()
+    "TeX Live" = @()
+    "WSL" = @()
 }
 
 # --- Update PowerShell Modules ---
@@ -138,14 +165,15 @@ if (-not $NoScoop) {
     try {
         if (Get-Command scoop -ErrorAction SilentlyContinue) {
             Write-Host "Checking for outdated Scoop packages..."
-            $scoopStatus = scoop status
+            $scoopStatus = & scoop status
             $outdatedApps = @()
             # We parse the output of 'scoop status' to find packages marked as outdated.
             foreach ($line in ($scoopStatus -split [System.Environment]::NewLine)) {
                 if ($line -like '*outdated*') {
                     # Extracts the package name, which is the first element on the line.
+                    # Security: Sanitize input to prevent injection
                     $appName = ($line.Trim() -split '\s+')[0]
-                    if (-not [string]::IsNullOrWhiteSpace($appName)) {
+                    if (-not [string]::IsNullOrWhiteSpace($appName) -and $appName -match '^[a-zA-Z0-9._-]+$') {
                         $outdatedApps += $appName
                     }
                 }
@@ -159,9 +187,9 @@ if (-not $NoScoop) {
             }
 
             Write-Host "Updating Scoop itself..."
-            scoop update
+            & scoop update
             Write-Host "Updating all installed packages via Scoop..."
-            scoop update *
+            & scoop update *
 
             # Add a generic message to the summary if no specific packages were found to be outdated.
             if ($updatedItems["Scoop"].Count -eq 0) {
@@ -186,7 +214,7 @@ if (-not $NoWinget) {
             Write-Host "Checking for outdated Winget packages..."
             # We run 'winget upgrade' to get the list of upgradable packages.
             # We need to specify --include-unknown to match the upgrade command.
-            $wingetUpgradeOutput = winget upgrade --include-unknown
+            $wingetUpgradeOutput = & winget upgrade --include-unknown
             $upgradablePackages = @()
 
             if ($wingetUpgradeOutput -and $wingetUpgradeOutput.Length -gt 2) {
@@ -220,7 +248,7 @@ if (-not $NoWinget) {
 
             Write-Host "Running winget to upgrade all packages (including pinned and unknown)..."
             # Using the standard command-line tool directly. It will print its own progress.
-            sudo winget upgrade --all --accept-source-agreements --accept-package-agreements --include-pinned --include-unknown
+            & sudo winget upgrade --all --accept-source-agreements --accept-package-agreements --include-pinned --include-unknown
 
             # Add a generic message to the summary if no specific packages were found to be outdated.
             if ($updatedItems["Winget"].Count -eq 0) {
@@ -245,21 +273,26 @@ if (-not $NoVsCode) {
     try {
         if (Get-Command code -ErrorAction SilentlyContinue) {
             Write-Host "Checking for and updating all VS Code extensions..."
-            $installedExtensions = code --list-extensions
+            $installedExtensions = & code --list-extensions
             $actuallyUpdated = @()
 
             foreach ($extensionId in $installedExtensions) {
                 if ($extensionId.Trim().Length -gt 0) {
-                    Write-Host "Checking/updating extension: $extensionId..."
-                    # The '--force' flag ensures that the extension is updated if it's already installed. We capture stderr too.
-                    $updateOutput = code --install-extension $extensionId --force 2>&1
+                    # Security: Validate extension ID format to prevent injection
+                    if ($extensionId -match '^[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+$') {
+                        Write-Host "Checking/updating extension: $extensionId..."
+                        # The '--force' flag ensures that the extension is updated if it's already installed. We capture stderr too.
+                        $updateOutput = & code --install-extension $extensionId --force 2>&1
 
-                    # We check the output to see if the extension was actually updated.
-                    # The message for a successful update/install is "Extension ... was successfully installed."
-                    # The message for no update is "Extension ... is already installed."
-                    if ($updateOutput -join ' ' -like '*successfully installed*') {
-                        Write-Host "--> Successfully updated $extensionId" -ForegroundColor Cyan
-                        $actuallyUpdated += $extensionId
+                        # We check the output to see if the extension was actually updated.
+                        # The message for a successful update/install is "Extension ... was successfully installed."
+                        # The message for no update is "Extension ... is already installed."
+                        if ($updateOutput -join ' ' -like '*successfully installed*') {
+                            Write-Host "--> Successfully updated $extensionId" -ForegroundColor Cyan
+                            $actuallyUpdated += $extensionId
+                        }
+                    } else {
+                        Write-Warning "Skipping invalid extension ID: $extensionId"
                     }
                 }
             }
@@ -291,12 +324,12 @@ if (-not $NoConda) {
     try {
         if (Get-Command conda -ErrorAction SilentlyContinue) {
             Write-Host "Updating the base conda environment..."
-            conda update -n base -c defaults conda -y
+            & conda update -n base -c defaults conda -y
             $updatedItems["Conda"] += "Miniconda (base)"
             
-            if (conda env list | Select-String -SimpleMatch -Quiet -Pattern "ocr-azure") {
+            if (& conda env list | Select-String -SimpleMatch -Quiet -Pattern "ocr-azure") {
                 Write-Host "Found 'ocr-azure' environment. Updating all packages within it..."
-                conda update -n ocr-azure --all -y
+                & conda update -n ocr-azure --all -y
                 $updatedItems["Conda"] += "Conda environment (ocr-azure)"
             } else {
                 Write-Host "'ocr-azure' environment not found. Skipping."
@@ -318,7 +351,7 @@ if (-not $NoTex) {
     try {
         if (Get-Command tlmgr -ErrorAction SilentlyContinue) {
             Write-Host "Updating TeX Live package manager (tlmgr) and all packages..."
-            tlmgr update --self --all
+            & tlmgr update --self --all
             $updatedItems["TeX Live"] += "All packages"
         } else {
             Write-Host "TeX Live (tlmgr) is not installed or not in your PATH. Skipping."
@@ -337,9 +370,9 @@ if (-not $NoWsl) {
     try {
         if (Get-Command wsl -ErrorAction SilentlyContinue) {
             Write-Host "Updating the WSL kernel..."
-            wsl --update
+            & wsl --update
             Write-Host "Shutting down WSL to apply updates..."
-            wsl --shutdown
+            & wsl --shutdown
             $updatedItems["WSL"] += "WSL Kernel"
         } else {
             Write-Host "WSL is not installed. Skipping."
