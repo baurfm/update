@@ -380,18 +380,33 @@ if (-not $NoWsl) {
 
             # Now, attempt to update packages within the default WSL distro
             Write-Host "Attempting to update packages within the default WSL distribution..."
+<<<<<<< HEAD
             try {
                 # Use 'sudo -n true' as a generic check for non-interactive sudo access.
                 # If this command fails, it means a password is required.
                 Write-Host "Checking for passwordless sudo access..."
                 & wsl.exe -e sudo -n true
 
+=======
+
+            # Check for passwordless sudo access by checking the exit code of an external command.
+            # A try/catch block will not work for this.
+            Write-Host "Checking for passwordless sudo access..."
+            & wsl.exe -e sudo -n true 2>$null
+
+            if ($LASTEXITCODE -eq 0) {
+>>>>>>> origin/feature/improve-update-script
                 Write-Host "Passwordless sudo confirmed. Proceeding with package updates..." -ForegroundColor Green
                 & wsl.exe -e sudo apt-get update
                 & wsl.exe -e sudo apt-get upgrade -y
                 $updatedItems["WSL"] += "Updated packages in default WSL distro"
+<<<<<<< HEAD
             } catch {
                 # This block will be hit if the sudo command fails, likely due to requiring a password.
+=======
+            } else {
+                # This block is now correctly triggered if the sudo command fails.
+>>>>>>> origin/feature/improve-update-script
                 Write-Warning "Could not run package updates with sudo automatically. This usually means you need to configure passwordless sudo for your user in WSL."
                 Write-Warning "To enable this, run 'wsl' to enter your Linux environment, then get your username with the 'whoami' command."
                 Write-Warning "Next, run 'sudo visudo' and add the following line at the end of the file, replacing 'your_linux_username' with the result from 'whoami':"
