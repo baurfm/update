@@ -382,14 +382,14 @@ if (-not $NoWsl) {
             Write-Host "Attempting to update packages within the default WSL distribution..."
 
             # Check for passwordless sudo access by checking the exit code of an external command.
-            # A try/catch block will not work for this.
+            # Commands must be run in the default shell, so the '-e' flag is omitted.
             Write-Host "Checking for passwordless sudo access..."
-            & wsl.exe -e sudo -n true 2>$null
+            & wsl.exe sudo -n true 2>$null
 
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "Passwordless sudo confirmed. Proceeding with package updates..." -ForegroundColor Green
-                & wsl.exe -e sudo apt-get update
-                & wsl.exe -e sudo apt-get upgrade -y
+                & wsl.exe sudo apt-get update
+                & wsl.exe sudo apt-get upgrade -y
                 $updatedItems["WSL"] += "Updated packages in default WSL distro"
             } else {
                 # This block is now correctly triggered if the sudo command fails.
