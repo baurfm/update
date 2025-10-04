@@ -77,7 +77,8 @@ param(
     [switch]$NoVsCode,
     [switch]$NoConda,
     [switch]$NoTex,
-    [switch]$NoWsl
+    [switch]$NoWsl,
+    [switch]$NoNpm
 )
 
 # Set error action preference for consistent error handling
@@ -108,9 +109,9 @@ function Write-SectionHeader {
     )
     
     Write-Host ""
-    Write-Host "=================================================="
-    Write-Host "  $Title"
-    Write-Host "=================================================="
+    Write-Host "==================================================" -ForegroundColor Cyan
+    Write-Host "  $Title" -ForegroundColor White
+    Write-Host "==================================================" -ForegroundColor Cyan
     Write-Host ""
 }
 
@@ -123,6 +124,7 @@ $updatedItems = @{
     "Conda" = @()
     "TeX Live" = @()
     "WSL" = @()
+    "npm" = @()
 }
 
 $failedItems = @{
@@ -133,6 +135,7 @@ $failedItems = @{
     "Conda" = @()
     "TeX Live" = @()
     "WSL" = @()
+    "npm" = @()
 }
 
 # --- Update PowerShell Modules ---
@@ -147,13 +150,13 @@ if (-not $NoPowerShell) {
                 Update-Module -Name $module.Name -Force -ErrorAction Stop
                 $updatedItems["PowerShell Modules"] += $module.Name
             } catch {
-                Write-Host "--> Failed to update module: $($module.Name). Error: $_"
+                Write-Host "--> Failed to update module: $($module.Name). Error: $_" -ForegroundColor Red
                 $failedItems["PowerShell Modules"] += "$($module.Name) - $($_.Exception.Message)"
             }
         }
         Write-Host "PowerShell module update check completed."
     } catch {
-        Write-Host "An error occurred while updating PowerShell modules. $_"
+        Write-Host "An error occurred while updating PowerShell modules. $_" -ForegroundColor Red
     }
 } else {
     Write-Host "Skipping PowerShell Module updates as requested."
@@ -199,7 +202,7 @@ if (-not $NoScoop) {
             Write-Host "Scoop is not installed. Skipping."
         }
     } catch {
-        Write-Host "An error occurred while updating Scoop. Please check your Scoop installation."
+        Write-Host "An error occurred while updating Scoop. Please check your Scoop installation." -ForegroundColor Red
         $failedItems["Scoop"] += "General Scoop Error - $($_.Exception.Message)"
     }
 } else {
@@ -259,7 +262,7 @@ if (-not $NoWinget) {
         }
     } catch {
         $errorMessage = if ($_.Exception) { $_.Exception.Message } else { $_ }
-        Write-Host "An error occurred while running 'winget upgrade'. The command may have failed." -ForegroundColor Red
+        Write-Host "An error occurred while running 'winget upgrade'. The command may have failed. Error: $errorMessage" -ForegroundColor Red
         $failedItems["Winget"] += "Winget command failed - $errorMessage"
     }
 } else {
@@ -338,7 +341,7 @@ if (-not $NoConda) {
             Write-Host "conda is not found in your PATH. Skipping."
         }
     } catch {
-        Write-Host "An error occurred while updating conda."
+        Write-Host "An error occurred while updating conda. $_" -ForegroundColor Red
         $failedItems["Conda"] += "General Conda Error - $($_.Exception.Message)"
     }
 } else {
@@ -357,7 +360,7 @@ if (-not $NoTex) {
             Write-Host "TeX Live (tlmgr) is not installed or not in your PATH. Skipping."
         }
     } catch {
-        Write-Host "An error occurred while updating TeX Live. Ensure you are running PowerShell as an Administrator."
+        Write-Host "An error occurred while updating TeX Live. Ensure you are running PowerShell as an Administrator. $_" -ForegroundColor Red
         $failedItems["TeX Live"] += "General TeX Live Error - $($_.Exception.Message)"
     }
 } else {
@@ -374,6 +377,26 @@ if (-not $NoWsl) {
             Write-Host "Shutting down WSL to apply updates..."
             & wsl --shutdown
             $updatedItems["WSL"] += "WSL Kernel"
+
+            # Now, attempt to update packages within the default WSL distro
+            Write-Host "Attempting to update packages within the default WSL distribution..."
+            try {
+                # The '-e' flag executes a command without using the default shell.
+                # We pipe the output to Out-Null because we just want to check if it succeeds.
+                # We use 'sudo -n' to run sudo in non-interactive mode. If a password is required, it will fail immediately.
+                Write-Host "Checking for passwordless sudo access..."
+                & wsl.exe -e sudo -n apt-get update *> $null
+
+                Write-Host "Passwordless sudo confirmed. Proceeding with package updates..." -ForegroundColor Green
+                & wsl.exe -e sudo apt-get upgrade -y
+                $updatedItems["WSL"] += "Updated packages in default WSL distro"
+            } catch {
+                # This block will be hit if the sudo command fails, likely due to requiring a password.
+                Write-Warning "Could not run 'apt-get update' with sudo automatically. This usually means you need to configure passwordless sudo for your user in WSL."
+                Write-Warning "To enable this, run 'wsl' to enter your Linux environment, then run 'sudo visudo' and add the following line:"
+                Write-Warning "$($env:UserName) ALL=(ALL) NOPASSWD: /usr/bin/apt-get"
+                $failedItems["WSL"] += "Package update failed (sudo configuration needed)"
+            }
         } else {
             Write-Host "WSL is not installed. Skipping."
         }
@@ -383,6 +406,48 @@ if (-not $NoWsl) {
     }
 } else {
     Write-Host "Skipping WSL updates as requested."
+}
+
+# --- Update npm Packages ---
+if (-not $NoNpm) {
+    Write-SectionHeader "Updating npm (Node Package Manager) Packages"
+    try {
+        if (Get-Command npm -ErrorAction SilentlyContinue) {
+            Write-Host "Updating globally installed npm packages..."
+            # Get a list of outdated packages first for the summary
+            $outdatedNpmPackages = & npm outdated -g --parseable --depth=0
+            $npmToUpdate = @()
+            foreach ($line in ($outdatedNpmPackages -split [System.Environment]::NewLine)) {
+                if ($line) {
+                    $packageName = ($line.Split(':'))[2]
+                    if ($packageName) {
+                        $npmToUpdate += $packageName
+                    }
+                }
+            }
+
+            if ($npmToUpdate.Count -gt 0) {
+                Write-Host "Found $($npmToUpdate.Count) outdated npm packages: $($npmToUpdate -join ', ')"
+                $updatedItems["npm"] += $npmToUpdate
+            } else {
+                Write-Host "No outdated global npm packages found."
+            }
+
+            # Run the update command
+            & npm update -g
+
+            if ($updatedItems["npm"].Count -eq 0) {
+                $updatedItems["npm"] += "Ran 'npm update -g' (no outdated packages were detected beforehand)."
+            }
+        } else {
+            Write-Host "npm is not installed or not in your PATH. Skipping."
+        }
+    } catch {
+        Write-Host "An error occurred while updating npm packages. $_" -ForegroundColor Red
+        $failedItems["npm"] += "General npm Error - $($_.Exception.Message)"
+    }
+} else {
+    Write-Host "Skipping npm updates as requested."
 }
 
 
@@ -396,7 +461,7 @@ foreach ($key in $updatedItems.Keys) {
         $hasUpdates = $true
         Write-Host ""
         Write-Host "--- Successfully Ran: $key ---" -ForegroundColor Green
-        $updatedItems[$key] | ForEach-Object { Write-Host "- $_" }
+        $updatedItems[$key] | ForEach-Object { Write-Host "  - $_" }
     }
 }
 
@@ -411,7 +476,7 @@ foreach ($key in $failedItems.Keys) {
         $hasFailures = $true
         Write-Host ""
         Write-Host "--- Failed Sections: $key ---" -ForegroundColor Red
-        $failedItems[$key] | ForEach-Object { Write-Host "- $_" }
+        $failedItems[$key] | ForEach-Object { Write-Host "  - $_" }
     }
 }
 
