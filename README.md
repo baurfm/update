@@ -24,8 +24,9 @@ A comprehensive PowerShell script that automates the update process for multiple
 | **Winget** | All Microsoft Store apps | `winget upgrade --all` |
 | **VS Code** | All installed extensions | `code --install-extension` |
 | **Conda** | Base environment + ocr-azure | `conda update` |
+| **npm** | All globally installed packages | `npm update -g` |
 | **TeX Live** | All TeX packages | `tlmgr update --self --all` |
-| **WSL** | WSL kernel | `wsl --update` |
+| **WSL** | WSL kernel + distro packages | `wsl --update`, `apt-get upgrade` |
 
 ## 🛠️ Installation
 
@@ -74,6 +75,7 @@ Get-Help .\update.ps1 -Full
 | `-NoWinget` | - | Skip updating Winget and Microsoft Store apps |
 | `-NoVsCode` | - | Skip updating Visual Studio Code extensions |
 | `-NoConda` | - | Skip updating Miniconda and its environments |
+| `-NoNpm` | - | Skip updating global npm packages |
 | `-NoTex` | - | Skip updating TeX Live |
 | `-NoWsl` | - | Skip updating Windows Subsystem for Linux (WSL) |
 
@@ -89,6 +91,7 @@ Get-Help .\update.ps1 -Full
 - **Winget** - Microsoft's package manager (Windows 10 1709+)
 - **Visual Studio Code** - Code editor
 - **Miniconda/Anaconda** - Python package manager
+- **npm (Node.js)** - JavaScript package manager
 - **TeX Live** - LaTeX distribution
 - **WSL** - Windows Subsystem for Linux
 
@@ -108,6 +111,22 @@ The script provides:
 - **Detailed error reporting** for failed operations
 - **Comprehensive summary** at completion
 - **Color-coded output** for easy reading
+
+### WSL Package Updates
+
+The script now automatically updates packages within your default WSL distribution using `apt-get`. This requires `sudo` access. To allow the script to run `sudo` without a password prompt, you need to add a configuration file to your WSL instance.
+
+**How to Configure Passwordless `sudo` for `apt-get`**
+
+1. Open your WSL terminal by running `wsl` in PowerShell or Command Prompt.
+2. Open the `sudoers` configuration file by running `sudo visudo`.
+3. Add the following line to the end of the file, replacing `your_username` with your actual Linux username:
+
+   ```
+   your_username ALL=(ALL) NOPASSWD: /usr/bin/apt-get
+   ```
+
+4. Save the file and exit. The script will now be able to update your WSL packages.
 
 ### Sample Output
 
