@@ -118,15 +118,15 @@ The script now automatically updates packages within your default WSL distributi
 
 **How to Configure Passwordless `sudo` for `apt-get`**
 
-1. Open your WSL terminal by running `wsl` in PowerShell or Command Prompt.
-2. Open the `sudoers` configuration file by running `sudo visudo`.
-3. Add the following line to the end of the file, replacing `your_username` with your actual Linux username:
+1.  Open your WSL terminal (e.g., by running `wsl` in PowerShell).
+2.  Find your exact Linux username by running the command: `whoami`.
+3.  Open the `sudoers` configuration file with the command: `sudo visudo`. This will open the file in a terminal-based editor like `nano` or `vim`.
+4.  Add the following line to the very end of the file. **It is critical to replace `your_linux_username` with the actual username you found in step 2.**
 
-   ```
-   your_username ALL=(ALL) NOPASSWD: /usr/bin/apt-get
-   ```
-
-4. Save the file and exit. The script will now be able to update your WSL packages.
+    ```
+    your_linux_username ALL=(ALL) NOPASSWD: /usr/bin/apt-get
+    ```
+5.  Save the file and exit the editor (in `nano`, press `Ctrl+X`, then `Y`, then `Enter`). The script will now be able to update your WSL packages without a password prompt.
 
 ### Sample Output
 

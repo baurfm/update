@@ -381,20 +381,21 @@ if (-not $NoWsl) {
             # Now, attempt to update packages within the default WSL distro
             Write-Host "Attempting to update packages within the default WSL distribution..."
             try {
-                # The '-e' flag executes a command without using the default shell.
-                # We pipe the output to Out-Null because we just want to check if it succeeds.
-                # We use 'sudo -n' to run sudo in non-interactive mode. If a password is required, it will fail immediately.
+                # Use 'sudo -n true' as a generic check for non-interactive sudo access.
+                # If this command fails, it means a password is required.
                 Write-Host "Checking for passwordless sudo access..."
-                & wsl.exe -e sudo -n apt-get update *> $null
+                & wsl.exe -e sudo -n true
 
                 Write-Host "Passwordless sudo confirmed. Proceeding with package updates..." -ForegroundColor Green
+                & wsl.exe -e sudo apt-get update
                 & wsl.exe -e sudo apt-get upgrade -y
                 $updatedItems["WSL"] += "Updated packages in default WSL distro"
             } catch {
                 # This block will be hit if the sudo command fails, likely due to requiring a password.
-                Write-Warning "Could not run 'apt-get update' with sudo automatically. This usually means you need to configure passwordless sudo for your user in WSL."
-                Write-Warning "To enable this, run 'wsl' to enter your Linux environment, then run 'sudo visudo' and add the following line:"
-                Write-Warning "$($env:UserName) ALL=(ALL) NOPASSWD: /usr/bin/apt-get"
+                Write-Warning "Could not run package updates with sudo automatically. This usually means you need to configure passwordless sudo for your user in WSL."
+                Write-Warning "To enable this, run 'wsl' to enter your Linux environment, then get your username with the 'whoami' command."
+                Write-Warning "Next, run 'sudo visudo' and add the following line at the end of the file, replacing 'your_linux_username' with the result from 'whoami':"
+                Write-Warning "your_linux_username ALL=(ALL) NOPASSWD: /usr/bin/apt-get"
                 $failedItems["WSL"] += "Package update failed (sudo configuration needed)"
             }
         } else {
