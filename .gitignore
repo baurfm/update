@@ -10,6 +10,12 @@ private.*
 .vscode/
 *.code-workspace
 
+# Visual Studio
+.vs/
+
+# Log files
+update.log
+
 # Common PowerShell module folders
 /Modules/*
 !/Modules/README.md

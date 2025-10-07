@@ -97,7 +97,7 @@
 .NOTES
     Author: Your Name
     Date: 2024-08-02
-    Version: 9.1 (Fixed PSScriptAnalyzer warning for unused '$hasFailures' variable)
+    Version: 9.3 (Improved WSL updates with retry logic and better sudo handling)
 #>
 
 param(

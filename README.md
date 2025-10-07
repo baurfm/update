@@ -12,7 +12,7 @@ A comprehensive PowerShell script that automates the update process for multiple
 - **Selective Updates**: Skip specific sections using command-line parameters
 - **Error Handling**: Robust error handling with detailed reporting
 - **Progress Tracking**: Real-time progress updates and final summary
-- **Administrative Support**: Handles elevated privileges when needed
+- **Administrative Support**: Handles elevated privileges when needed, including the new Windows `sudo`.
 - **Cross-Platform Tools**: Supports both Windows-native and cross-platform tools
 
 ## 📦 Supported Tools
@@ -94,6 +94,7 @@ Get-Help .\update.ps1 -Full
 - **npm (Node.js)** - JavaScript package manager
 - **TeX Live** - LaTeX distribution
 - **WSL** - Windows Subsystem for Linux
+- **Sudo for Windows** - For a more streamlined elevation experience.
 
 ## 🔧 Configuration
 
@@ -226,6 +227,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📈 Version History
 
+- **v9.3** - Improved WSL updates with retry logic and better sudo handling
+- **v9.2** - Added support for the new Windows `sudo` command.
 - **v9.1** - Fixed PSScriptAnalyzer warning for unused variable
 - **v9.0** - Added comprehensive error handling and summary reporting
 - **v8.x** - Previous versions with incremental improvements
