@@ -382,274 +382,231 @@ Update-Section "Scoop and its packages" "Scoop" ($NoScoop -or $OnlyWsl -or $Only
 }
 
 # --- Update Winget & Microsoft Store Apps ---
-if (-not $NoWinget -and !$OnlyWsl -and !$OnlyWslPackages) {
-    Write-SectionHeader "Updating Winget & Microsoft Store apps"
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        Write-Host "Checking for outdated Winget packages..."
-        # We run 'winget upgrade' to get the list of upgradable packages.
-        # We need to specify --include-unknown to match the upgrade command.
-        $wingetUpgradeOutput = & winget upgrade --include-unknown
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "The 'winget upgrade' command failed with exit code $LASTEXITCODE. Skipping Winget updates."
-            $failedItems["Winget"] += "winget upgrade (check) (Exit Code: $LASTEXITCODE)"
-        } else {
-            $upgradablePackages = @()
+Update-Section "Winget & Microsoft Store apps" "Winget" ($NoWinget -or $OnlyWsl -or $OnlyWslPackages) { Get-Command winget -ErrorAction SilentlyContinue } {
+    Write-Host "Checking for outdated Winget packages..."
+    # We run 'winget upgrade' to get the list of upgradable packages.
+    # We need to specify --include-unknown to match the upgrade command.
+    $wingetUpgradeOutput = & winget upgrade --include-unknown
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "The 'winget upgrade' command failed with exit code $LASTEXITCODE. Skipping Winget updates."
+        $failedItems["Winget"] += "winget upgrade (check) (Exit Code: $LASTEXITCODE)"
+    } else {
+        $upgradablePackages = @()
 
-            if ($wingetUpgradeOutput -and $wingetUpgradeOutput.Length -gt 2) {
-                $lines = $wingetUpgradeOutput -split [System.Environment]::NewLine
-                # The first line is the header, which we can use to find column positions.
-                $headerLine = $lines[0]
-                $idColIndex = $headerLine.IndexOf('Id')
-                $versionColIndex = $headerLine.IndexOf('Version')
+        if ($wingetUpgradeOutput -and $wingetUpgradeOutput.Length -gt 2) {
+            $lines = $wingetUpgradeOutput -split [System.Environment]::NewLine
+            # The first line is the header, which we can use to find column positions.
+            $headerLine = $lines[0]
+            $idColIndex = $headerLine.IndexOf('Id')
+            $versionColIndex = $headerLine.IndexOf('Version')
 
-                if ($idColIndex -ge 0 -and $versionColIndex -gt $idColIndex) {
-                    # Start processing from the third line (index 2) to skip header and separator.
-                    for ($i = 2; $i -lt $lines.Length; $i++) {
-                        $line = $lines[$i]
-                        if ($line.Trim().Length -gt 0) {
-                            # Extract the Id based on the column position.
-                            $packageId = $line.Substring($idColIndex, $versionColIndex - $idColIndex).Trim()
-                            if (-not [string]::IsNullOrWhiteSpace($packageId)) {
-                                $upgradablePackages += $packageId
-                            }
+            if ($idColIndex -ge 0 -and $versionColIndex -gt $idColIndex) {
+                # Start processing from the third line (index 2) to skip header and separator.
+                for ($i = 2; $i -lt $lines.Length; $i++) {
+                    $line = $lines[$i]
+                    if ($line.Trim().Length -gt 0) {
+                        # Extract the Id based on the column position.
+                        $packageId = $line.Substring($idColIndex, $versionColIndex - $idColIndex).Trim()
+                        if (-not [string]::IsNullOrWhiteSpace($packageId)) {
+                            $upgradablePackages += $packageId
                         }
                     }
                 }
             }
-
-            if ($upgradablePackages.Count -gt 0) {
-                Write-Host "Found $($upgradablePackages.Count) upgradable packages."
-                $updatedItems["Winget"] += $upgradablePackages
-            } else {
-                Write-Host "No outdated Winget packages found to update."
-            }
-
-            Write-Host "Running winget to upgrade all packages (including pinned and unknown)..."
-            # Using the standard command-line tool directly. It will print its own progress.
-            & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-pinned --include-unknown
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "The 'winget upgrade --all' command failed with exit code $LASTEXITCODE."
-                $failedItems["Winget"] += "winget upgrade --all (Exit Code: $LASTEXITCODE)"
-            }
-
-            # Add a generic message to the summary if no specific packages were found to be outdated.
-            if ($updatedItems["Winget"].Count -eq 0 -and $failedItems["Winget"].Count -eq 0) {
-                $updatedItems["Winget"] += "Ran 'winget upgrade --all' (no outdated packages were detected beforehand)."
-            }
         }
-    } else {
-        Write-Host "Winget is not installed. Skipping."
+
+        if ($upgradablePackages.Count -gt 0) {
+            Write-Host "Found $($upgradablePackages.Count) upgradable packages."
+            $updatedItems["Winget"] += $upgradablePackages
+        } else {
+            Write-Host "No outdated Winget packages found to update."
+        }
+
+        Write-Host "Running winget to upgrade all packages (including pinned and unknown)..."
+        # Using the standard command-line tool directly. It will print its own progress.
+        & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-pinned --include-unknown
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "The 'winget upgrade --all' command failed with exit code $LASTEXITCODE."
+            $failedItems["Winget"] += "winget upgrade --all (Exit Code: $LASTEXITCODE)"
+        }
+
+        # Add a generic message to the summary if no specific packages were found to be outdated.
+        if ($updatedItems["Winget"].Count -eq 0 -and $failedItems["Winget"].Count -eq 0) {
+            $updatedItems["Winget"] += "Ran 'winget upgrade --all' (no outdated packages were detected beforehand)."
+        }
     }
-} else {
-    Write-Host "Skipping Winget updates as requested."
 }
 
 
 # --- Update Visual Studio Code Extensions ---
-if (-not $NoVsCode -and !$OnlyWsl -and !$OnlyWslPackages) {
-    Write-SectionHeader "Updating Visual Studio Code Extensions"
-    if (Get-Command code -ErrorAction SilentlyContinue) {
-        Write-Host "Listing installed VS Code extensions..."
-        $installedExtensions = & code --list-extensions
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "The 'code --list-extensions' command failed with exit code $LASTEXITCODE. Skipping VS Code extension updates."
-            $failedItems["VS Code Extensions"] += "code --list-extensions (Exit Code: $LASTEXITCODE)"
-        } else {
-            $actuallyUpdated = @()
+Update-Section "Visual Studio Code Extensions" "VS Code Extensions" ($NoVsCode -or $OnlyWsl -or $OnlyWslPackages) { Get-Command code -ErrorAction SilentlyContinue } {
+    Write-Host "Listing installed VS Code extensions..."
+    $installedExtensions = & code --list-extensions
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "The 'code --list-extensions' command failed with exit code $LASTEXITCODE. Skipping VS Code extension updates."
+        $failedItems["VS Code Extensions"] += "code --list-extensions (Exit Code: $LASTEXITCODE)"
+    } else {
+        $actuallyUpdated = @()
 
-            foreach ($extensionId in $installedExtensions) {
-                if ($extensionId.Trim().Length -gt 0) {
-                    # Security: Validate extension ID format to prevent injection
-                    if ($extensionId -match '^[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+$') {
-                        Write-Host "Checking/updating extension: $extensionId..."
-                        # The '--force' flag ensures that the extension is updated if it's already installed. We capture stderr too.
-                        $updateOutput = & code --install-extension $extensionId --force 2>&1
+        foreach ($extensionId in $installedExtensions) {
+            if ($extensionId.Trim().Length -gt 0) {
+                # Security: Validate extension ID format to prevent injection
+                if ($extensionId -match '^[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+$') {
+                    Write-Host "Checking/updating extension: $extensionId..."
+                    # The '--force' flag ensures that the extension is updated if it's already installed. We capture stderr too.
+                    $updateOutput = & code --install-extension $extensionId --force 2>&1
 
-                        if ($LASTEXITCODE -ne 0) {
-                            Write-Warning "Failed to update extension: $extensionId (Exit Code: $LASTEXITCODE)"
-                            $failedItems["VS Code Extensions"] += "$extensionId (Exit Code: $LASTEXITCODE)"
-                        } else {
-                            # We check the output to see if the extension was actually updated.
-                            # The message for a successful update/install is "Extension ... was successfully installed."
-                            # The message for no update is "Extension ... is already installed."
-                            if ($updateOutput -join ' ' -like '*successfully installed*') {
-                                Write-Host "--> Successfully updated $extensionId" -ForegroundColor Cyan
-                                $actuallyUpdated += $extensionId
-                            }
-                        }
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Warning "Failed to update extension: $extensionId (Exit Code: $LASTEXITCODE)"
+                        $failedItems["VS Code Extensions"] += "$extensionId (Exit Code: $LASTEXITCODE)"
                     } else {
-                        Write-Warning "Skipping invalid extension ID: $extensionId"
+                        # We check the output to see if the extension was actually updated.
+                        # The message for a successful update/install is "Extension ... was successfully installed."
+                        # The message for no update is "Extension ... is already installed."
+                        if ($updateOutput -join ' ' -like '*successfully installed*') {
+                            Write-Host "--> Successfully updated $extensionId" -ForegroundColor Cyan
+                            $actuallyUpdated += $extensionId
+                        }
                     }
+                } else {
+                    Write-Warning "Skipping invalid extension ID: $extensionId"
                 }
             }
-
-            if ($actuallyUpdated.Count -gt 0) {
-                Write-Host "$($actuallyUpdated.Count) extensions were updated." -ForegroundColor Green
-                $updatedItems["VS Code Extensions"] += $actuallyUpdated
-            } else {
-                Write-Host "All VS Code extensions were already up-to-date."
-            }
-
-            if ($updatedItems["VS Code Extensions"].Count -eq 0 -and $failedItems["VS Code Extensions"].Count -eq 0) {
-                $updatedItems["VS Code Extensions"] += "All extensions checked and were up-to-date."
-            }
         }
-    } else {
-        Write-Host "The 'code' command is not in your PATH. Skipping VS Code extension updates."
+
+        if ($actuallyUpdated.Count -gt 0) {
+            Write-Host "$($actuallyUpdated.Count) extensions were updated." -ForegroundColor Green
+            $updatedItems["VS Code Extensions"] += $actuallyUpdated
+        } else {
+            Write-Host "All VS Code extensions were already up-to-date."
+        }
+
+        if ($updatedItems["VS Code Extensions"].Count -eq 0 -and $failedItems["VS Code Extensions"].Count -eq 0) {
+            $updatedItems["VS Code Extensions"] += "All extensions checked and were up-to-date."
+        }
     }
-} else {
-    Write-Host "Skipping VS Code Extension updates as requested."
 }
 
 # --- Update Miniconda ---
-if (-not $NoConda -and !$OnlyWsl -and !$OnlyWslPackages) {
-    Write-SectionHeader "Updating Miniconda and 'ocr-azure' environment"
-    if (Get-Command conda -ErrorAction SilentlyContinue) {
-        Write-Host "Updating the base conda environment..."
-        & conda update -n base -c defaults conda -y
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "The 'conda update -n base' command failed with exit code $LASTEXITCODE."
-            $failedItems["Conda"] += "conda update -n base (Exit Code: $LASTEXITCODE)"
-        } else {
-            $updatedItems["Conda"] += "Miniconda (base)"
-        }
+Update-Section "Miniconda and 'ocr-azure' environment" "Conda" ($NoConda -or $OnlyWsl -or $OnlyWslPackages) { Get-Command conda -ErrorAction SilentlyContinue } {
+    Write-Host "Updating the base conda environment..."
+    & conda update -n base -c defaults conda -y
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "The 'conda update -n base' command failed with exit code $LASTEXITCODE."
+        $failedItems["Conda"] += "conda update -n base (Exit Code: $LASTEXITCODE)"
+    } else {
+        $updatedItems["Conda"] += "Miniconda (base)"
+    }
 
-        # Check if 'ocr-azure' environment exists
-        $condaEnvs = & conda env list
-        if ($LASTEXITCODE -eq 0 -and ($condaEnvs -join ' ') -match 'ocr-azure') {
-            Write-Host "Found 'ocr-azure' environment. Updating all packages within it..."
-            & conda update -n ocr-azure --all -y
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "The 'conda update -n ocr-azure' command failed with exit code $LASTEXITCODE."
-                $failedItems["Conda"] += "conda update -n ocr-azure (Exit Code: $LASTEXITCODE)"
-            } else {
-                $updatedItems["Conda"] += "Conda environment (ocr-azure)"
-            }
+    # Check if 'ocr-azure' environment exists
+    $condaEnvs = & conda env list
+    if ($LASTEXITCODE -eq 0 -and ($condaEnvs -join ' ') -match 'ocr-azure') {
+        Write-Host "Found 'ocr-azure' environment. Updating all packages within it..."
+        & conda update -n ocr-azure --all -y
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "The 'conda update -n ocr-azure' command failed with exit code $LASTEXITCODE."
+            $failedItems["Conda"] += "conda update -n ocr-azure (Exit Code: $LASTEXITCODE)"
         } else {
-            Write-Host "'ocr-azure' environment not found or 'conda env list' failed. Skipping."
-            if ($LASTEXITCODE -ne 0) {
-                $failedItems["Conda"] += "conda env list (Exit Code: $LASTEXITCODE)"
-            }
+            $updatedItems["Conda"] += "Conda environment (ocr-azure)"
         }
     } else {
-        Write-Host "conda is not found in your PATH. Skipping."
+        Write-Host "'ocr-azure' environment not found or 'conda env list' failed. Skipping."
+        if ($LASTEXITCODE -ne 0) {
+            $failedItems["Conda"] += "conda env list (Exit Code: $LASTEXITCODE)"
+        }
     }
-} else {
-    Write-Host "Skipping Conda updates as requested."
 }
 
 # --- Update TeX Live ---
-if (-not $NoTex -and !$OnlyWsl -and !$OnlyWslPackages) {
-    Write-SectionHeader "Updating TeX Live"
-    if (Get-Command tlmgr -ErrorAction SilentlyContinue) {
-        Write-Host "Updating TeX Live package manager (tlmgr) and all packages..."
-        & tlmgr update --self --all
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "The 'tlmgr update --self --all' command failed with exit code $LASTEXITCODE. Ensure you are running as an Administrator."
-            $failedItems["TeX Live"] += "tlmgr update (Exit Code: $LASTEXITCODE)"
-        } else {
-            $updatedItems["TeX Live"] += "All packages"
-        }
+Update-Section "TeX Live" "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Command tlmgr -ErrorAction SilentlyContinue } {
+    Write-Host "Updating TeX Live package manager (tlmgr) and all packages..."
+    & tlmgr update --self --all
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "The 'tlmgr update --self --all' command failed with exit code $LASTEXITCODE. Ensure you are running as an Administrator."
+        $failedItems["TeX Live"] += "tlmgr update (Exit Code: $LASTEXITCODE)"
     } else {
-        Write-Host "TeX Live (tlmgr) is not installed or not in your PATH. Skipping."
+        $updatedItems["TeX Live"] += "All packages"
     }
-} else {
-    Write-Host "Skipping TeX Live updates as requested."
 }
 
 # --- Update WSL ---
-if (-not $NoWsl -or $OnlyWsl -or $OnlyWslPackages) {
-    Write-SectionHeader "Updating Windows Subsystem for Linux (WSL)"
+Update-Section "Windows Subsystem for Linux (WSL)" "WSL" ($NoWsl -and !$OnlyWsl -and !$OnlyWslPackages) { Get-Command wsl -ErrorAction SilentlyContinue } {
     Write-Log "Starting WSL updates."
-    if (Get-Command wsl -ErrorAction SilentlyContinue) {
-        # Since elevation is handled at the start, we can proceed directly.
-        if (-not $OnlyWslPackages) {
-            Write-Host "Updating the WSL kernel..."
-            Write-Log "Updating WSL kernel."
-            if (Invoke-UpdateCommand "wsl" @("--update", "--web-download") 2 "WSL") {
-                $updatedItems["WSL"] += "WSL Kernel"
-            }
-
-            Write-Host "Shutting down WSL to apply updates..."
-            Write-Log "Shutting down WSL."
-            Invoke-UpdateCommand "wsl" @("--shutdown") 1 "WSL"  # Shutdown might not need retry
-        } else {
-            Write-Log "Skipping WSL kernel update as requested."
-        }
-        # Now, attempt to update packages within the default WSL distro
-        Write-Host "Attempting to update packages within the default WSL distribution..."
-        # Check for passwordless sudo access by checking the exit code of an external command.
-        # A try/catch block will not work for this.
-        Write-Host "Checking for passwordless sudo access..."
-        & wsl.exe -e sudo -n true 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "Passwordless sudo confirmed. Proceeding with package updates..." -ForegroundColor Green
-            & wsl.exe -e sudo apt-get update
-            & wsl.exe -e sudo apt-get upgrade -y
-            $updatedItems["WSL"] += "Updated packages in default WSL distro"
-        } else {
-            # This block is now correctly triggered if the sudo command fails.
-            Write-Warning "Could not run package updates with sudo automatically. This usually means you need to configure passwordless sudo for your user in WSL."
-            Write-Warning "To enable this, run 'wsl' to enter your Linux environment, then get your username with the 'whoami' command."
-            Write-Warning "Next, run 'sudo visudo' and add the following line at the end of the file, replacing 'your_linux_username' with the result from 'whoami':"
-            Write-Warning "your_linux_username ALL=(ALL) NOPASSWD: /usr/bin/apt-get"
-            $failedItems["WSL"] += "Package update failed (sudo configuration needed)"
+    # Since elevation is handled at the start, we can proceed directly.
+    if (-not $OnlyWslPackages) {
+        Write-Host "Updating the WSL kernel..."
+        Write-Log "Updating WSL kernel."
+        if (Invoke-UpdateCommand "wsl" @("--update", "--web-download") 2 "WSL") {
+            $updatedItems["WSL"] += "WSL Kernel"
         }
 
-
+        Write-Host "Shutting down WSL to apply updates..."
+        Write-Log "Shutting down WSL."
+        Invoke-UpdateCommand "wsl" @("--shutdown") 1 "WSL"  # Shutdown might not need retry
     } else {
-        Write-Host "WSL is not installed. Skipping."
-        Write-Log "WSL not installed."
+        Write-Log "Skipping WSL kernel update as requested."
     }
-} else {
-    Write-Host "Skipping WSL updates as requested."
-    Write-Log "Skipping WSL updates."
+    # Now, attempt to update packages within the default WSL distro
+    Write-Host "Attempting to update packages within the default WSL distribution..."
+    # Check for passwordless sudo access by checking the exit code of an external command.
+    # A try/catch block will not work for this.
+    Write-Host "Checking for passwordless sudo access..."
+
+    # Removed -e flag as per instructions to ensure execution within default shell/profile
+    & wsl.exe sudo -n true 2>$null
+
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Passwordless sudo confirmed. Proceeding with package updates..." -ForegroundColor Green
+        & wsl.exe sudo apt-get update
+        & wsl.exe sudo apt-get upgrade -y
+        $updatedItems["WSL"] += "Updated packages in default WSL distro"
+    } else {
+        # This block is now correctly triggered if the sudo command fails.
+        Write-Warning "Could not run package updates with sudo automatically. This usually means you need to configure passwordless sudo for your user in WSL."
+        Write-Warning "To enable this, run 'wsl' to enter your Linux environment, then get your username with the 'whoami' command."
+        Write-Warning "Next, run 'sudo visudo' and add the following line at the end of the file, replacing 'your_linux_username' with the result from 'whoami':"
+        Write-Warning "your_linux_username ALL=(ALL) NOPASSWD: /usr/bin/apt-get"
+        $failedItems["WSL"] += "Package update failed (sudo configuration needed)"
+    }
 }
 
 # --- Update npm Packages ---
-if (-not $NoNpm -and !$OnlyWsl) {
-    Write-SectionHeader "Updating npm (Node Package Manager) Packages"
-    if (Get-Command npm -ErrorAction SilentlyContinue) {
-        Write-Host "Checking for outdated global npm packages..."
-        $outdatedNpmPackages = & npm outdated -g --parseable --depth=0
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "The 'npm outdated -g' command failed with exit code $LASTEXITCODE. Skipping npm updates."
-            $failedItems["npm"] += "npm outdated -g (Exit Code: $LASTEXITCODE)"
-        } else {
-            $npmToUpdate = @()
-            foreach ($line in ($outdatedNpmPackages -split [System.Environment]::NewLine)) {
-                if ($line) {
-                    $packageName = ($line.Split(':'))[2]
-                    if ($packageName) {
-                        $npmToUpdate += $packageName
-                    }
+Update-Section "npm (Node Package Manager) Packages" "npm" ($NoNpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command npm -ErrorAction SilentlyContinue } {
+    Write-Host "Checking for outdated global npm packages..."
+    $outdatedNpmPackages = & npm outdated -g --parseable --depth=0
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "The 'npm outdated -g' command failed with exit code $LASTEXITCODE. Skipping npm updates."
+        $failedItems["npm"] += "npm outdated -g (Exit Code: $LASTEXITCODE)"
+    } else {
+        $npmToUpdate = @()
+        foreach ($line in ($outdatedNpmPackages -split [System.Environment]::NewLine)) {
+            if ($line) {
+                $packageName = ($line.Split(':'))[2]
+                if ($packageName) {
+                    $npmToUpdate += $packageName
                 }
             }
-
-            if ($npmToUpdate.Count -gt 0) {
-                Write-Host "Found $($npmToUpdate.Count) outdated npm packages: $($npmToUpdate -join ', ')"
-                $updatedItems["npm"] += $npmToUpdate
-            } else {
-                Write-Host "No outdated global npm packages found."
-            }
-
-            # Run the update command
-            Write-Host "Updating all global npm packages..."
-            & npm update -g
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "The 'npm update -g' command failed with exit code $LASTEXITCODE."
-                $failedItems["npm"] += "npm update -g (Exit Code: $LASTEXITCODE)"
-            }
-
-            if ($updatedItems["npm"].Count -eq 0 -and $failedItems["npm"].Count -eq 0) {
-                $updatedItems["npm"] += "Ran 'npm update -g' (no outdated packages were detected beforehand)."
-            }
         }
-    } else {
-        Write-Host "npm is not installed or not in your PATH. Skipping."
+
+        if ($npmToUpdate.Count -gt 0) {
+            Write-Host "Found $($npmToUpdate.Count) outdated npm packages: $($npmToUpdate -join ', ')"
+            $updatedItems["npm"] += $npmToUpdate
+        } else {
+            Write-Host "No outdated global npm packages found."
+        }
+
+        # Run the update command
+        Write-Host "Updating all global npm packages..."
+        & npm update -g
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "The 'npm update -g' command failed with exit code $LASTEXITCODE."
+            $failedItems["npm"] += "npm update -g (Exit Code: $LASTEXITCODE)"
+        }
+
+        if ($updatedItems["npm"].Count -eq 0 -and $failedItems["npm"].Count -eq 0) {
+            $updatedItems["npm"] += "Ran 'npm update -g' (no outdated packages were detected beforehand)."
+        }
     }
-} else {
-    Write-Host "Skipping npm updates as requested."
 }
 
 
