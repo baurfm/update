@@ -682,7 +682,6 @@ foreach ($key in $failedItems.Keys) {
     }
 }
 
-# --- THIS IS THE FIX ---
 # Check the $hasFailures variable and report if everything was successful.
 if (-not $hasFailures) {
     Write-Host ""
