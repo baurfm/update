@@ -14,8 +14,8 @@
     - WSL (Windows Subsystem for Linux)
 
     The script is designed to be flexible. You can skip any section by providing its corresponding
-    '--No<Section>' parameter when you run the script. It also supports dry-run mode to preview updates
-    without executing them.
+    '--No<Section>' parameter when you run the script. Failed operations are automatically retried
+    up to 2 times before being marked as failed.
 
 .PARAMETER Help
     A switch to display this detailed help message and exit. Aliases: -h, -?
@@ -50,9 +50,6 @@
 .PARAMETER OnlyWslPackages
     A switch to only update WSL packages (apt-get) and skip other sections including WSL kernel.
 
-.PARAMETER DryRun
-    A switch to perform a dry run without making changes.
-
 .PARAMETER EnableVerbose
     A switch to enable verbose output.
 
@@ -80,24 +77,19 @@
     Displays this help message using the built-in PowerShell help system.
 
 .EXAMPLE
-    .\update.ps1 -DryRun
-
-    Performs a dry run to see what would be updated without making changes.
-
-.EXAMPLE
     .\update.ps1 -EnableVerbose -LogFile "myupdate.log"
 
     Runs updates with verbose output and logs to 'myupdate.log'.
 
 .EXAMPLE
-    .\update.ps1 -OnlyWslPackages -DryRun
+    .\update.ps1 -OnlyWslPackages
 
-    Performs a dry run of only the WSL package updates.
+    Updates only the WSL packages (apt-get), skipping WSL kernel and other sections.
 
 .NOTES
     Author: Your Name
-    Date: 2024-08-02
-    Version: 9.3 (Improved WSL updates with retry logic and better sudo handling)
+    Date: 2025-01-20
+    Version: 9.4 (Removed dry-run, added retry logic to all sections, proper exit codes)
 #>
 
 param(
@@ -115,9 +107,6 @@ param(
     [switch]$NoNpm,
     [switch]$OnlyWsl,
     [switch]$OnlyWslPackages,
-
-    [Parameter(HelpMessage = "Perform a dry run without making changes.")]
-    [switch]$DryRun,
 
     [Parameter(HelpMessage = "Enable verbose output.")]
     [switch]$EnableVerbose,
@@ -168,10 +157,6 @@ function Invoke-UpdateCommand {
     $retryCount = 0
     $fullCommand = "$Command $($Arguments -join ' ')"
     do {
-        if ($DryRun) {
-            Write-Log "DRY RUN: Would execute: $fullCommand" -Level "INFO"
-            return $true
-        }
         Write-Log "Executing: $fullCommand" -Level "DEBUG"
         $result = & $Command @Arguments 2>&1
         if ($LASTEXITCODE -eq 0) {
@@ -220,11 +205,43 @@ function Update-Section {
     }
 }
 
+# Function to execute a command with retry logic
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Action,
+        [Parameter(Mandatory = $true)]
+        [string]$ActionName,
+        [int]$MaxRetries = 2,
+        [int]$DelaySeconds = 5
+    )
+    $attempt = 0
+    $maxAttempts = $MaxRetries + 1
+    do {
+        $attempt++
+        Write-Log "Executing $ActionName (attempt $attempt of $maxAttempts)" -Level "DEBUG"
+        try {
+            & $Action
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "$ActionName succeeded." -Level "INFO"
+                return $true
+            } else {
+                Write-Log "$ActionName failed with exit code $LASTEXITCODE (attempt $attempt)" -Level "WARN"
+            }
+        } catch {
+            Write-Log "$ActionName threw exception (attempt $attempt): $_" -Level "WARN"
+        }
+        if ($attempt -lt $maxAttempts) {
+            Write-Host "Retrying $ActionName (attempt $($attempt + 1) of $maxAttempts)..." -ForegroundColor Yellow
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    } while ($attempt -lt $maxAttempts)
+    Write-Log "$ActionName failed after $maxAttempts attempts." -Level "ERROR"
+    return $false
+}
+
 # Initialize logging
 Write-Log "Starting update script."
-if ($DryRun) {
-    Write-Log "Dry run mode enabled. No changes will be made." -Level "WARN"
-}
 
 # Set error action preference for consistent error handling
 $ErrorActionPreference = 'Continue'
@@ -320,9 +337,7 @@ Update-Section "PowerShell Modules" "PowerShell Modules" ($NoPowerShell -or $Onl
         try {
             Write-Host "Updating module: $($module.Name)..."
             Write-Log "Updating module: $($module.Name)"
-            if (-not $DryRun) {
-                Update-Module -Name $module.Name -Force -ErrorAction Stop
-            }
+            Update-Module -Name $module.Name -Force -ErrorAction Stop
             $updatedItems["PowerShell Modules"] += $module.Name
             Write-Log "Successfully updated module: $($module.Name)"
         } catch {
@@ -362,17 +377,15 @@ Update-Section "Scoop and its packages" "Scoop" ($NoScoop -or $OnlyWsl -or $Only
         }
 
         Write-Host "Updating Scoop itself..."
-        & scoop update
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "The 'scoop update' command failed with exit code $LASTEXITCODE."
-            $failedItems["Scoop"] += "scoop update (Exit Code: $LASTEXITCODE)"
+        if (-not (Invoke-WithRetry -Action { & scoop update } -ActionName "scoop update")) {
+            Write-Warning "The 'scoop update' command failed after retries."
+            $failedItems["Scoop"] += "scoop update (failed after retries)"
         }
 
         Write-Host "Updating all installed packages via Scoop..."
-        & scoop update *
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "The 'scoop update *' command failed with exit code $LASTEXITCODE."
-            $failedItems["Scoop"] += "scoop update * (Exit Code: $LASTEXITCODE)"
+        if (-not (Invoke-WithRetry -Action { & scoop update * } -ActionName "scoop update *")) {
+            Write-Warning "The 'scoop update *' command failed after retries."
+            $failedItems["Scoop"] += "scoop update * (failed after retries)"
         }
 
         if ($updatedItems["Scoop"].Count -eq 0 -and $failedItems["Scoop"].Count -eq 0) {
@@ -424,10 +437,9 @@ Update-Section "Winget & Microsoft Store apps" "Winget" ($NoWinget -or $OnlyWsl 
 
         Write-Host "Running winget to upgrade all packages (including pinned and unknown)..."
         # Using the standard command-line tool directly. It will print its own progress.
-        & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-pinned --include-unknown
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "The 'winget upgrade --all' command failed with exit code $LASTEXITCODE."
-            $failedItems["Winget"] += "winget upgrade --all (Exit Code: $LASTEXITCODE)"
+        if (-not (Invoke-WithRetry -Action { & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-pinned --include-unknown } -ActionName "winget upgrade --all")) {
+            Write-Warning "The 'winget upgrade --all' command failed after retries."
+            $failedItems["Winget"] += "winget upgrade --all (failed after retries)"
         }
 
         # Add a generic message to the summary if no specific packages were found to be outdated.
@@ -490,24 +502,22 @@ Update-Section "Visual Studio Code Extensions" "VS Code Extensions" ($NoVsCode -
 # --- Update Miniconda ---
 Update-Section "Miniconda and 'ocr-azure' environment" "Conda" ($NoConda -or $OnlyWsl -or $OnlyWslPackages) { Get-Command conda -ErrorAction SilentlyContinue } {
     Write-Host "Updating the base conda environment..."
-    & conda update -n base -c defaults conda -y
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "The 'conda update -n base' command failed with exit code $LASTEXITCODE."
-        $failedItems["Conda"] += "conda update -n base (Exit Code: $LASTEXITCODE)"
-    } else {
+    if (Invoke-WithRetry -Action { & conda update -n base -c defaults conda -y } -ActionName "conda update -n base") {
         $updatedItems["Conda"] += "Miniconda (base)"
+    } else {
+        Write-Warning "The 'conda update -n base' command failed after retries."
+        $failedItems["Conda"] += "conda update -n base (failed after retries)"
     }
 
     # Check if 'ocr-azure' environment exists
     $condaEnvs = & conda env list
     if ($LASTEXITCODE -eq 0 -and ($condaEnvs -join ' ') -match 'ocr-azure') {
         Write-Host "Found 'ocr-azure' environment. Updating all packages within it..."
-        & conda update -n ocr-azure --all -y
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "The 'conda update -n ocr-azure' command failed with exit code $LASTEXITCODE."
-            $failedItems["Conda"] += "conda update -n ocr-azure (Exit Code: $LASTEXITCODE)"
-        } else {
+        if (Invoke-WithRetry -Action { & conda update -n ocr-azure --all -y } -ActionName "conda update -n ocr-azure") {
             $updatedItems["Conda"] += "Conda environment (ocr-azure)"
+        } else {
+            Write-Warning "The 'conda update -n ocr-azure' command failed after retries."
+            $failedItems["Conda"] += "conda update -n ocr-azure (failed after retries)"
         }
     } else {
         Write-Host "'ocr-azure' environment not found or 'conda env list' failed. Skipping."
@@ -520,12 +530,11 @@ Update-Section "Miniconda and 'ocr-azure' environment" "Conda" ($NoConda -or $On
 # --- Update TeX Live ---
 Update-Section "TeX Live" "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Command tlmgr -ErrorAction SilentlyContinue } {
     Write-Host "Updating TeX Live package manager (tlmgr) and all packages..."
-    & tlmgr update --self --all
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "The 'tlmgr update --self --all' command failed with exit code $LASTEXITCODE. Ensure you are running as an Administrator."
-        $failedItems["TeX Live"] += "tlmgr update (Exit Code: $LASTEXITCODE)"
-    } else {
+    if (Invoke-WithRetry -Action { & tlmgr update --self --all } -ActionName "tlmgr update --self --all") {
         $updatedItems["TeX Live"] += "All packages"
+    } else {
+        Write-Warning "The 'tlmgr update --self --all' command failed after retries. Ensure you are running as an Administrator."
+        $failedItems["TeX Live"] += "tlmgr update (failed after retries)"
     }
 }
 
@@ -597,10 +606,9 @@ Update-Section "npm (Node Package Manager) Packages" "npm" ($NoNpm -or $OnlyWsl 
 
         # Run the update command
         Write-Host "Updating all global npm packages..."
-        & npm update -g
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "The 'npm update -g' command failed with exit code $LASTEXITCODE."
-            $failedItems["npm"] += "npm update -g (Exit Code: $LASTEXITCODE)"
+        if (-not (Invoke-WithRetry -Action { & npm update -g } -ActionName "npm update -g")) {
+            Write-Warning "The 'npm update -g' command failed after retries."
+            $failedItems["npm"] += "npm update -g (failed after retries)"
         }
 
         if ($updatedItems["npm"].Count -eq 0 -and $failedItems["npm"].Count -eq 0) {
@@ -647,3 +655,11 @@ if (-not $hasFailures) {
 
 Write-Host ""
 Write-SectionHeader "All update tasks have been attempted."
+
+# Exit with appropriate code based on failures
+if ($hasFailures) {
+    Write-Log "Script completed with failures." -Level "ERROR"
+    exit 1
+}
+Write-Log "Script completed successfully."
+exit 0

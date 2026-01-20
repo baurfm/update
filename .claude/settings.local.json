@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -NoProfile -Command:*)",
+      "Bash(powershell -NoProfile -File \"c:\\\\Users\\\\baurf\\\\OneDrive\\\\apps\\\\update\\\\update.ps1\":*)"
+    ]
+  }
+}
