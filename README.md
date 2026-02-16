@@ -227,6 +227,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📈 Version History
 
+- **v9.5** - Fixed winget/scoop retry bug, removed dead code, cleanup
+- **v9.4** - Removed dry-run option, added retry logic to all sections, proper exit codes
 - **v9.3** - Improved WSL updates with retry logic and better sudo handling
 - **v9.2** - Added support for the new Windows `sudo` command.
 - **v9.1** - Fixed PSScriptAnalyzer warning for unused variable

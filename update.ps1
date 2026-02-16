@@ -89,7 +89,7 @@
 .NOTES
     Author: Your Name
     Date: 2025-01-20
-    Version: 9.4 (Removed dry-run, added retry logic to all sections, proper exit codes)
+    Version: 9.5 (Fixed batch-update retry logic, removed dead code, cleanup)
 #>
 
 param(
@@ -122,12 +122,34 @@ function Write-SectionHeader {
         [Parameter(Mandatory = $true)]
         [string]$Title
     )
+    $width = 60
+    $padding = $width - $Title.Length - 4
+    if ($padding -lt 2) { $padding = 2 }
+    $leftPad = [math]::Floor($padding / 2)
+    $rightPad = [math]::Ceiling($padding / 2)
 
     Write-Host ""
-    Write-Host "==================================================" -ForegroundColor Cyan
-    Write-Host "  $Title" -ForegroundColor White
-    Write-Host "==================================================" -ForegroundColor Cyan
+    Write-Host ("+" + ("-" * ($width - 2)) + "+") -ForegroundColor DarkCyan
+    Write-Host ("|" + (" " * $leftPad) + $Title + (" " * $rightPad) + "|") -ForegroundColor Cyan
+    Write-Host ("+" + ("-" * ($width - 2)) + "+") -ForegroundColor DarkCyan
     Write-Host ""
+}
+
+# Function to display a status message with a consistent prefix
+function Write-Status {
+    param(
+        [string]$Message,
+        [ValidateSet("Info", "Success", "Warning", "Error", "Skip", "Action")]
+        [string]$Type = "Info"
+    )
+    switch ($Type) {
+        "Info"    { Write-Host "  [.]  $Message" -ForegroundColor Gray }
+        "Success" { Write-Host "  [+]  $Message" -ForegroundColor Green }
+        "Warning" { Write-Host "  [!]  $Message" -ForegroundColor Yellow }
+        "Error"   { Write-Host "  [X]  $Message" -ForegroundColor Red }
+        "Skip"    { Write-Host "  [-]  $Message" -ForegroundColor DarkGray }
+        "Action"  { Write-Host "  [>]  $Message" -ForegroundColor White }
+    }
 }
 
 # Function to write log messages
@@ -146,32 +168,6 @@ function Write-Log {
     }
 }
 
-# Function to invoke update commands with retry logic
-function Invoke-UpdateCommand {
-    param(
-        [string]$Command,
-        [string[]]$Arguments = @(),
-        [int]$MaxRetries = 1,
-        [string]$Section
-    )
-    $retryCount = 0
-    $fullCommand = "$Command $($Arguments -join ' ')"
-    do {
-        Write-Log "Executing: $fullCommand" -Level "DEBUG"
-        $result = & $Command @Arguments 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Log "Command succeeded: $fullCommand" -Level "INFO"
-            return $true
-        } else {
-            $retryCount++
-            Write-Log "Command failed (attempt $retryCount): $fullCommand. Error: $result" -Level "ERROR"
-            if ($retryCount -lt $MaxRetries) {
-                Start-Sleep -Seconds 5
-            }
-        }
-    } while ($retryCount -lt $MaxRetries)
-    return $false
-}
 # Function to handle common update section logic
 function Update-Section {
     param(
@@ -183,7 +179,7 @@ function Update-Section {
     )
 
     if ($SkipCondition) {
-        Write-Host "Skipping $SectionName updates as requested."
+        Write-Status "Skipping $SectionName" -Type Skip
         Write-Log "Skipping $SectionName updates."
         return
     }
@@ -192,15 +188,19 @@ function Update-Section {
     Write-Log "Starting $SectionName updates."
 
     if (-not (& $ToolCheck)) {
-        Write-Host "$SectionName is not available. Skipping."
+        Write-Status "$SectionName not found on this system" -Type Skip
         return
     }
 
+    $sectionStart = Get-Date
     try {
         & $UpdateAction
+        $elapsed = (Get-Date) - $sectionStart
+        Write-Status "$SectionName completed in $($elapsed.ToString('mm\:ss'))" -Type Success
         Write-Log "$SectionName updates completed."
     } catch {
-        Write-Host "An error occurred while updating $SectionName. $_" -ForegroundColor Red
+        $elapsed = (Get-Date) - $sectionStart
+        Write-Status "$SectionName failed after $($elapsed.ToString('mm\:ss')): $_" -Type Error
         Write-Log "Error during $SectionName updates: $_" -Level "ERROR"
     }
 }
@@ -240,7 +240,12 @@ function Invoke-WithRetry {
     return $false
 }
 
-# Initialize logging
+# Initialize logging and display startup banner
+$scriptStartTime = Get-Date
+Write-Host ""
+Write-Host "  Windows Update Script v9.5" -ForegroundColor Cyan
+Write-Host "  Started: $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor DarkGray
+Write-Host ""
 Write-Log "Starting update script."
 
 # Set error action preference for consistent error handling
@@ -328,35 +333,34 @@ $failedItems = @{
 
 # --- Update PowerShell Modules ---
 Update-Section "PowerShell Modules" "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPackages) { $true } {
-    Write-Host "Checking for installed PowerShell modules and updating them..."
+    Write-Status "Retrieving installed modules..." -Type Action
     Write-Log "Retrieving installed modules."
     $installedModules = Get-InstalledModule
+    Write-Status "Found $($installedModules.Count) modules to check" -Type Info
     $progress = 0
     foreach ($module in $installedModules) {
         Write-Progress -Activity "Updating PowerShell Modules" -Status "Updating $($module.Name)" -PercentComplete (($progress / $installedModules.Count) * 100)
         try {
-            Write-Host "Updating module: $($module.Name)..."
             Write-Log "Updating module: $($module.Name)"
             Update-Module -Name $module.Name -Force -ErrorAction Stop
             $updatedItems["PowerShell Modules"] += $module.Name
             Write-Log "Successfully updated module: $($module.Name)"
         } catch {
-            Write-Host "--> Failed to update module: $($module.Name). Error: $_" -ForegroundColor Red
+            Write-Status "Failed: $($module.Name) - $_" -Type Error
             Write-Log "Failed to update module: $($module.Name). Error: $_" -Level "ERROR"
             $failedItems["PowerShell Modules"] += "$($module.Name) - $($_.Exception.Message)"
         }
         $progress++
     }
     Write-Progress -Activity "Updating PowerShell Modules" -Completed
-    Write-Host "PowerShell module update check completed."
 }
 
 # --- Update Scoop ---
 Update-Section "Scoop and its packages" "Scoop" ($NoScoop -or $OnlyWsl -or $OnlyWslPackages) { Get-Command scoop -ErrorAction SilentlyContinue } {
-    Write-Host "Checking for outdated Scoop packages..."
+    Write-Status "Checking for outdated packages..." -Type Action
     $scoopStatus = & scoop status
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "The 'scoop status' command failed with exit code $LASTEXITCODE. Skipping Scoop updates."
+        Write-Status "scoop status failed (exit code $LASTEXITCODE)" -Type Error
         $failedItems["Scoop"] += "scoop status (Exit Code: $LASTEXITCODE)"
     } else {
         $outdatedApps = @()
@@ -370,38 +374,36 @@ Update-Section "Scoop and its packages" "Scoop" ($NoScoop -or $OnlyWsl -or $Only
         }
 
         if ($outdatedApps.Count -gt 0) {
-            Write-Host "Found $($outdatedApps.Count) outdated packages: $($outdatedApps -join ', ')"
+            Write-Status "Found $($outdatedApps.Count) outdated: $($outdatedApps -join ', ')" -Type Info
             $updatedItems["Scoop"] += $outdatedApps
         } else {
-            Write-Host "No outdated Scoop packages found to update."
+            Write-Status "All packages up-to-date" -Type Success
         }
 
-        Write-Host "Updating Scoop itself..."
+        Write-Status "Updating Scoop itself..." -Type Action
         if (-not (Invoke-WithRetry -Action { & scoop update } -ActionName "scoop update")) {
-            Write-Warning "The 'scoop update' command failed after retries."
+            Write-Status "scoop update failed after retries" -Type Error
             $failedItems["Scoop"] += "scoop update (failed after retries)"
         }
 
-        Write-Host "Updating all installed packages via Scoop..."
-        if (-not (Invoke-WithRetry -Action { & scoop update * } -ActionName "scoop update *")) {
-            Write-Warning "The 'scoop update *' command failed after retries."
-            $failedItems["Scoop"] += "scoop update * (failed after retries)"
-        }
-
-        if ($updatedItems["Scoop"].Count -eq 0 -and $failedItems["Scoop"].Count -eq 0) {
-            $updatedItems["Scoop"] += "Ran 'scoop update *' (no outdated packages were detected beforehand)."
+        Write-Status "Updating all installed packages..." -Type Action
+        # No retry — scoop returns non-zero if ANY package fails.
+        # Retrying would re-run ALL updates unnecessarily.
+        & scoop update *
+        if ($LASTEXITCODE -ne 0) {
+            Write-Status "Some packages may have failed (exit code $LASTEXITCODE)" -Type Warning
+            Write-Log "scoop update * exited with code $LASTEXITCODE" -Level "WARN"
         }
     }
 }
 
 # --- Update Winget & Microsoft Store Apps ---
 Update-Section "Winget & Microsoft Store apps" "Winget" ($NoWinget -or $OnlyWsl -or $OnlyWslPackages) { Get-Command winget -ErrorAction SilentlyContinue } {
-    Write-Host "Checking for outdated Winget packages..."
+    Write-Status "Checking for outdated packages..." -Type Action
     # We run 'winget upgrade' to get the list of upgradable packages.
-    # We need to specify --include-unknown to match the upgrade command.
     $wingetUpgradeOutput = & winget upgrade --include-unknown
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "The 'winget upgrade' command failed with exit code $LASTEXITCODE. Skipping Winget updates."
+        Write-Status "winget upgrade check failed (exit code $LASTEXITCODE)" -Type Error
         $failedItems["Winget"] += "winget upgrade (check) (Exit Code: $LASTEXITCODE)"
     } else {
         $upgradablePackages = @()
@@ -418,7 +420,6 @@ Update-Section "Winget & Microsoft Store apps" "Winget" ($NoWinget -or $OnlyWsl 
                 for ($i = 2; $i -lt $lines.Length; $i++) {
                     $line = $lines[$i]
                     if ($line.Trim().Length -gt 0) {
-                        # Extract the Id based on the column position.
                         $packageId = $line.Substring($idColIndex, $versionColIndex - $idColIndex).Trim()
                         if (-not [string]::IsNullOrWhiteSpace($packageId)) {
                             $upgradablePackages += $packageId
@@ -429,22 +430,19 @@ Update-Section "Winget & Microsoft Store apps" "Winget" ($NoWinget -or $OnlyWsl 
         }
 
         if ($upgradablePackages.Count -gt 0) {
-            Write-Host "Found $($upgradablePackages.Count) upgradable packages."
+            Write-Status "Found $($upgradablePackages.Count) upgradable packages" -Type Info
             $updatedItems["Winget"] += $upgradablePackages
         } else {
-            Write-Host "No outdated Winget packages found to update."
+            Write-Status "All packages up-to-date" -Type Success
         }
 
-        Write-Host "Running winget to upgrade all packages (including pinned and unknown)..."
-        # Using the standard command-line tool directly. It will print its own progress.
-        if (-not (Invoke-WithRetry -Action { & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-pinned --include-unknown } -ActionName "winget upgrade --all")) {
-            Write-Warning "The 'winget upgrade --all' command failed after retries."
-            $failedItems["Winget"] += "winget upgrade --all (failed after retries)"
-        }
-
-        # Add a generic message to the summary if no specific packages were found to be outdated.
-        if ($updatedItems["Winget"].Count -eq 0 -and $failedItems["Winget"].Count -eq 0) {
-            $updatedItems["Winget"] += "Ran 'winget upgrade --all' (no outdated packages were detected beforehand)."
+        Write-Status "Upgrading all packages..." -Type Action
+        # No retry — winget returns non-zero if ANY package fails (e.g. Office).
+        # Retrying would re-run ALL upgrades unnecessarily.
+        & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-pinned --include-unknown
+        if ($LASTEXITCODE -ne 0) {
+            Write-Status "Some packages may have failed, e.g. Office (exit code $LASTEXITCODE)" -Type Warning
+            Write-Log "winget upgrade --all exited with code $LASTEXITCODE" -Level "WARN"
         }
     }
 }
@@ -452,75 +450,66 @@ Update-Section "Winget & Microsoft Store apps" "Winget" ($NoWinget -or $OnlyWsl 
 
 # --- Update Visual Studio Code Extensions ---
 Update-Section "Visual Studio Code Extensions" "VS Code Extensions" ($NoVsCode -or $OnlyWsl -or $OnlyWslPackages) { Get-Command code -ErrorAction SilentlyContinue } {
-    Write-Host "Listing installed VS Code extensions..."
+    Write-Status "Listing installed extensions..." -Type Action
     $installedExtensions = & code --list-extensions
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "The 'code --list-extensions' command failed with exit code $LASTEXITCODE. Skipping VS Code extension updates."
+        Write-Status "code --list-extensions failed (exit code $LASTEXITCODE)" -Type Error
         $failedItems["VS Code Extensions"] += "code --list-extensions (Exit Code: $LASTEXITCODE)"
     } else {
+        $validExtensions = $installedExtensions | Where-Object {
+            $_.Trim().Length -gt 0 -and $_ -match '^[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+$'
+        }
+        Write-Status "Checking $($validExtensions.Count) extensions for updates..." -Type Info
         $actuallyUpdated = @()
+        $progress = 0
 
-        foreach ($extensionId in $installedExtensions) {
-            if ($extensionId.Trim().Length -gt 0) {
-                # Security: Validate extension ID format to prevent injection
-                if ($extensionId -match '^[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+$') {
-                    Write-Host "Checking/updating extension: $extensionId..."
-                    # The '--force' flag ensures that the extension is updated if it's already installed. We capture stderr too.
-                    $updateOutput = & code --install-extension $extensionId --force 2>&1
+        foreach ($extensionId in $validExtensions) {
+            $progress++
+            Write-Progress -Activity "Checking VS Code Extensions" -Status "$extensionId ($progress/$($validExtensions.Count))" -PercentComplete (($progress / $validExtensions.Count) * 100)
+            # The '--force' flag ensures that the extension is updated if it's already installed.
+            $updateOutput = & code --install-extension $extensionId --force 2>&1
 
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Warning "Failed to update extension: $extensionId (Exit Code: $LASTEXITCODE)"
-                        $failedItems["VS Code Extensions"] += "$extensionId (Exit Code: $LASTEXITCODE)"
-                    } else {
-                        # We check the output to see if the extension was actually updated.
-                        # The message for a successful update/install is "Extension ... was successfully installed."
-                        # The message for no update is "Extension ... is already installed."
-                        if ($updateOutput -join ' ' -like '*successfully installed*') {
-                            Write-Host "--> Successfully updated $extensionId" -ForegroundColor Cyan
-                            $actuallyUpdated += $extensionId
-                        }
-                    }
-                } else {
-                    Write-Warning "Skipping invalid extension ID: $extensionId"
-                }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Status "Failed: $extensionId" -Type Error
+                $failedItems["VS Code Extensions"] += "$extensionId (Exit Code: $LASTEXITCODE)"
+            } elseif ($updateOutput -join ' ' -like '*successfully installed*') {
+                Write-Status "Updated: $extensionId" -Type Success
+                $actuallyUpdated += $extensionId
             }
         }
+        Write-Progress -Activity "Checking VS Code Extensions" -Completed
 
         if ($actuallyUpdated.Count -gt 0) {
-            Write-Host "$($actuallyUpdated.Count) extensions were updated." -ForegroundColor Green
+            Write-Status "$($actuallyUpdated.Count) extensions updated" -Type Success
             $updatedItems["VS Code Extensions"] += $actuallyUpdated
         } else {
-            Write-Host "All VS Code extensions were already up-to-date."
-        }
-
-        if ($updatedItems["VS Code Extensions"].Count -eq 0 -and $failedItems["VS Code Extensions"].Count -eq 0) {
-            $updatedItems["VS Code Extensions"] += "All extensions checked and were up-to-date."
+            Write-Status "All extensions already up-to-date" -Type Success
         }
     }
 }
 
 # --- Update Miniconda ---
 Update-Section "Miniconda and 'ocr-azure' environment" "Conda" ($NoConda -or $OnlyWsl -or $OnlyWslPackages) { Get-Command conda -ErrorAction SilentlyContinue } {
-    Write-Host "Updating the base conda environment..."
+    Write-Status "Updating base environment..." -Type Action
     if (Invoke-WithRetry -Action { & conda update -n base -c defaults conda -y } -ActionName "conda update -n base") {
         $updatedItems["Conda"] += "Miniconda (base)"
     } else {
-        Write-Warning "The 'conda update -n base' command failed after retries."
+        Write-Status "conda update -n base failed after retries" -Type Error
         $failedItems["Conda"] += "conda update -n base (failed after retries)"
     }
 
     # Check if 'ocr-azure' environment exists
     $condaEnvs = & conda env list
     if ($LASTEXITCODE -eq 0 -and ($condaEnvs -join ' ') -match 'ocr-azure') {
-        Write-Host "Found 'ocr-azure' environment. Updating all packages within it..."
+        Write-Status "Updating 'ocr-azure' environment..." -Type Action
         if (Invoke-WithRetry -Action { & conda update -n ocr-azure --all -y } -ActionName "conda update -n ocr-azure") {
             $updatedItems["Conda"] += "Conda environment (ocr-azure)"
         } else {
-            Write-Warning "The 'conda update -n ocr-azure' command failed after retries."
+            Write-Status "conda update -n ocr-azure failed after retries" -Type Error
             $failedItems["Conda"] += "conda update -n ocr-azure (failed after retries)"
         }
     } else {
-        Write-Host "'ocr-azure' environment not found or 'conda env list' failed. Skipping."
+        Write-Status "'ocr-azure' environment not found" -Type Skip
         if ($LASTEXITCODE -ne 0) {
             $failedItems["Conda"] += "conda env list (Exit Code: $LASTEXITCODE)"
         }
@@ -529,11 +518,11 @@ Update-Section "Miniconda and 'ocr-azure' environment" "Conda" ($NoConda -or $On
 
 # --- Update TeX Live ---
 Update-Section "TeX Live" "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Command tlmgr -ErrorAction SilentlyContinue } {
-    Write-Host "Updating TeX Live package manager (tlmgr) and all packages..."
+    Write-Status "Updating tlmgr and all packages..." -Type Action
     if (Invoke-WithRetry -Action { & tlmgr update --self --all } -ActionName "tlmgr update --self --all") {
         $updatedItems["TeX Live"] += "All packages"
     } else {
-        Write-Warning "The 'tlmgr update --self --all' command failed after retries. Ensure you are running as an Administrator."
+        Write-Status "tlmgr update failed after retries (admin required?)" -Type Error
         $failedItems["TeX Live"] += "tlmgr update (failed after retries)"
     }
 }
@@ -543,48 +532,47 @@ Update-Section "Windows Subsystem for Linux (WSL)" "WSL" ($NoWsl -and !$OnlyWsl 
     Write-Log "Starting WSL updates."
     # Since elevation is handled at the start, we can proceed directly.
     if (-not $OnlyWslPackages) {
-        Write-Host "Updating the WSL kernel..."
+        Write-Status "Updating WSL kernel..." -Type Action
         Write-Log "Updating WSL kernel."
-        if (Invoke-UpdateCommand "wsl" @("--update", "--web-download") 2 "WSL") {
+        if (Invoke-WithRetry -Action { & wsl --update --web-download } -ActionName "wsl --update" -MaxRetries 2) {
             $updatedItems["WSL"] += "WSL Kernel"
+        } else {
+            Write-Status "wsl --update failed after retries" -Type Error
+            $failedItems["WSL"] += "wsl --update (failed after retries)"
         }
 
-        Write-Host "Shutting down WSL to apply updates..."
+        Write-Status "Shutting down WSL to apply updates..." -Type Action
         Write-Log "Shutting down WSL."
-        Invoke-UpdateCommand "wsl" @("--shutdown") 1 "WSL"  # Shutdown might not need retry
+        Invoke-WithRetry -Action { & wsl --shutdown } -ActionName "wsl --shutdown" -MaxRetries 0 | Out-Null
     } else {
         Write-Log "Skipping WSL kernel update as requested."
     }
-    # Now, attempt to update packages within the default WSL distro
-    Write-Host "Attempting to update packages within the default WSL distribution..."
-    # Check for passwordless sudo access by checking the exit code of an external command.
-    # A try/catch block will not work for this.
-    Write-Host "Checking for passwordless sudo access..."
 
-    # Removed -e flag as per instructions to ensure execution within default shell/profile
+    Write-Status "Updating packages in default WSL distro..." -Type Action
+    # Check for passwordless sudo access by checking the exit code of an external command.
     & wsl.exe sudo -n true 2>$null
 
     if ($LASTEXITCODE -eq 0) {
-        Write-Host "Passwordless sudo confirmed. Proceeding with package updates..." -ForegroundColor Green
+        Write-Status "Passwordless sudo confirmed" -Type Success
         & wsl.exe sudo apt-get update
         & wsl.exe sudo apt-get upgrade -y
         $updatedItems["WSL"] += "Updated packages in default WSL distro"
     } else {
-        # This block is now correctly triggered if the sudo command fails.
-        Write-Warning "Could not run package updates with sudo automatically. This usually means you need to configure passwordless sudo for your user in WSL."
-        Write-Warning "To enable this, run 'wsl' to enter your Linux environment, then get your username with the 'whoami' command."
-        Write-Warning "Next, run 'sudo visudo' and add the following line at the end of the file, replacing 'your_linux_username' with the result from 'whoami':"
-        Write-Warning "your_linux_username ALL=(ALL) NOPASSWD: /usr/bin/apt-get"
+        Write-Status "Passwordless sudo not configured" -Type Error
+        Write-Host ""
+        Write-Host "  To fix: run 'wsl', then 'sudo visudo' and add:" -ForegroundColor DarkYellow
+        Write-Host "  your_username ALL=(ALL) NOPASSWD: /usr/bin/apt-get" -ForegroundColor DarkYellow
+        Write-Host ""
         $failedItems["WSL"] += "Package update failed (sudo configuration needed)"
     }
 }
 
 # --- Update npm Packages ---
 Update-Section "npm (Node Package Manager) Packages" "npm" ($NoNpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command npm -ErrorAction SilentlyContinue } {
-    Write-Host "Checking for outdated global npm packages..."
+    Write-Status "Checking for outdated global packages..." -Type Action
     $outdatedNpmPackages = & npm outdated -g --parseable --depth=0
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "The 'npm outdated -g' command failed with exit code $LASTEXITCODE. Skipping npm updates."
+        Write-Status "npm outdated -g failed (exit code $LASTEXITCODE)" -Type Error
         $failedItems["npm"] += "npm outdated -g (Exit Code: $LASTEXITCODE)"
     } else {
         $npmToUpdate = @()
@@ -598,63 +586,57 @@ Update-Section "npm (Node Package Manager) Packages" "npm" ($NoNpm -or $OnlyWsl 
         }
 
         if ($npmToUpdate.Count -gt 0) {
-            Write-Host "Found $($npmToUpdate.Count) outdated npm packages: $($npmToUpdate -join ', ')"
+            Write-Status "Found $($npmToUpdate.Count) outdated: $($npmToUpdate -join ', ')" -Type Info
             $updatedItems["npm"] += $npmToUpdate
         } else {
-            Write-Host "No outdated global npm packages found."
+            Write-Status "All global packages up-to-date" -Type Success
         }
 
-        # Run the update command
-        Write-Host "Updating all global npm packages..."
+        Write-Status "Updating all global packages..." -Type Action
         if (-not (Invoke-WithRetry -Action { & npm update -g } -ActionName "npm update -g")) {
-            Write-Warning "The 'npm update -g' command failed after retries."
+            Write-Status "npm update -g failed after retries" -Type Error
             $failedItems["npm"] += "npm update -g (failed after retries)"
-        }
-
-        if ($updatedItems["npm"].Count -eq 0 -and $failedItems["npm"].Count -eq 0) {
-            $updatedItems["npm"] += "Ran 'npm update -g' (no outdated packages were detected beforehand)."
         }
     }
 }
 
 
 # --- Final Summary ---
+$totalElapsed = (Get-Date) - $scriptStartTime
 Write-SectionHeader "Update Summary"
-Write-Host "The script has completed. Here is the summary of what was changed."
 
 $hasUpdates = $false
 foreach ($key in $updatedItems.Keys) {
     if ($updatedItems[$key].Count -gt 0) {
         $hasUpdates = $true
+        Write-Host "  $key" -ForegroundColor Green
+        $updatedItems[$key] | ForEach-Object { Write-Host "    - $_" -ForegroundColor Gray }
         Write-Host ""
-        Write-Host "--- Successfully Ran: $key ---" -ForegroundColor Green
-        $updatedItems[$key] | ForEach-Object { Write-Host "  - $_" }
     }
 }
 
 if (-not $hasUpdates) {
+    Write-Status "Nothing was updated" -Type Info
     Write-Host ""
-    Write-Host "No update sections were run." -ForegroundColor Yellow
 }
 
 $hasFailures = $false
 foreach ($key in $failedItems.Keys) {
     if ($failedItems[$key].Count -gt 0) {
         $hasFailures = $true
+        Write-Host "  FAILED: $key" -ForegroundColor Red
+        $failedItems[$key] | ForEach-Object { Write-Host "    - $_" -ForegroundColor DarkRed }
         Write-Host ""
-        Write-Host "--- Failed Sections: $key ---" -ForegroundColor Red
-        $failedItems[$key] | ForEach-Object { Write-Host "  - $_" }
     }
 }
 
-# Check the $hasFailures variable and report if everything was successful.
 if (-not $hasFailures) {
-    Write-Host ""
-    Write-Host "No failures were reported during this run." -ForegroundColor Green
+    Write-Status "No failures" -Type Success
 }
 
 Write-Host ""
-Write-SectionHeader "All update tasks have been attempted."
+Write-Host "  Total time: $($totalElapsed.ToString('mm\:ss'))" -ForegroundColor DarkGray
+Write-Host ""
 
 # Exit with appropriate code based on failures
 if ($hasFailures) {
