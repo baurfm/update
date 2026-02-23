@@ -227,6 +227,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📈 Version History
 
+- **v9.6** - Bug fixes (Conda regex, log path), skipped-sections in summary, PS version check, disk space warning
 - **v9.5** - Fixed winget/scoop retry bug, removed dead code, cleanup
 - **v9.4** - Removed dry-run option, added retry logic to all sections, proper exit codes
 - **v9.3** - Improved WSL updates with retry logic and better sudo handling

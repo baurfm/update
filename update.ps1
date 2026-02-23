@@ -89,7 +89,7 @@
 .NOTES
     Author: Your Name
     Date: 2025-01-20
-    Version: 9.5 (Fixed batch-update retry logic, removed dead code, cleanup)
+    Version: 9.6 (Bug fixes: Conda regex, log path; cleanup: SectionKey; UX: skipped summary, time format; robustness checks)
 #>
 
 param(
@@ -172,7 +172,6 @@ function Write-Log {
 function Update-Section {
     param(
         [string]$SectionName,
-        [string]$SectionKey,
         [bool]$SkipCondition,
         [scriptblock]$ToolCheck,
         [scriptblock]$UpdateAction
@@ -181,6 +180,7 @@ function Update-Section {
     if ($SkipCondition) {
         Write-Status "Skipping $SectionName" -Type Skip
         Write-Log "Skipping $SectionName updates."
+        $script:skippedSections += $SectionName
         return
     }
 
@@ -196,11 +196,11 @@ function Update-Section {
     try {
         & $UpdateAction
         $elapsed = (Get-Date) - $sectionStart
-        Write-Status "$SectionName completed in $($elapsed.ToString('mm\:ss'))" -Type Success
+        Write-Status "$SectionName completed in $($elapsed.ToString('hh\:mm\:ss'))" -Type Success
         Write-Log "$SectionName updates completed."
     } catch {
         $elapsed = (Get-Date) - $sectionStart
-        Write-Status "$SectionName failed after $($elapsed.ToString('mm\:ss')): $_" -Type Error
+        Write-Status "$SectionName failed after $($elapsed.ToString('hh\:mm\:ss')): $_" -Type Error
         Write-Log "Error during $SectionName updates: $_" -Level "ERROR"
     }
 }
@@ -243,9 +243,22 @@ function Invoke-WithRetry {
 # Initialize logging and display startup banner
 $scriptStartTime = Get-Date
 Write-Host ""
-Write-Host "  Windows Update Script v9.5" -ForegroundColor Cyan
+Write-Host "  Windows Update Script v9.6" -ForegroundColor Cyan
 Write-Host "  Started: $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor DarkGray
 Write-Host ""
+
+# PowerShell version check (5.0+ required for Get-InstalledModule, Update-Module, etc.)
+if ($PSVersionTable.PSVersion.Major -lt 5) {
+    Write-Host "  [X]  PowerShell 5.0+ required (found $($PSVersionTable.PSVersion))" -ForegroundColor Red
+    exit 1
+}
+
+# Disk space warning
+$freeGB = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
+if ($freeGB -lt 2) {
+    Write-Status "Low disk space: ${freeGB} GB free on C: — updates may fail" -Type Warning
+}
+
 Write-Log "Starting update script."
 
 # Set error action preference for consistent error handling
@@ -294,6 +307,10 @@ if (-not $NoWinget -or -not $NoWsl -or $OnlyWsl -or $OnlyWslPackages) {
 
 # Security: Require script to be run from the directory where it's located
 $ScriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
+# Resolve log file to absolute path now that $ScriptPath is known
+if (-not $PSBoundParameters.ContainsKey('LogFile')) {
+    $LogFile = Join-Path $ScriptPath "update.log"
+}
 if ((Get-Location).Path -ne $ScriptPath) {
     Write-Warning "Script should be run from its directory: $ScriptPath"
     Write-Host "Changing to script directory..." -ForegroundColor Yellow
@@ -331,8 +348,10 @@ $failedItems = @{
     "npm" = @()
 }
 
+$skippedSections = @()
+
 # --- Update PowerShell Modules ---
-Update-Section "PowerShell Modules" "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPackages) { $true } {
+Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPackages) { $true } {
     Write-Status "Retrieving installed modules..." -Type Action
     Write-Log "Retrieving installed modules."
     $installedModules = Get-InstalledModule
@@ -356,7 +375,7 @@ Update-Section "PowerShell Modules" "PowerShell Modules" ($NoPowerShell -or $Onl
 }
 
 # --- Update Scoop ---
-Update-Section "Scoop and its packages" "Scoop" ($NoScoop -or $OnlyWsl -or $OnlyWslPackages) { Get-Command scoop -ErrorAction SilentlyContinue } {
+Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPackages) { Get-Command scoop -ErrorAction SilentlyContinue } {
     Write-Status "Checking for outdated packages..." -Type Action
     $scoopStatus = & scoop status
     if ($LASTEXITCODE -ne 0) {
@@ -398,7 +417,7 @@ Update-Section "Scoop and its packages" "Scoop" ($NoScoop -or $OnlyWsl -or $Only
 }
 
 # --- Update Winget & Microsoft Store Apps ---
-Update-Section "Winget & Microsoft Store apps" "Winget" ($NoWinget -or $OnlyWsl -or $OnlyWslPackages) { Get-Command winget -ErrorAction SilentlyContinue } {
+Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $OnlyWslPackages) { Get-Command winget -ErrorAction SilentlyContinue } {
     Write-Status "Checking for outdated packages..." -Type Action
     # We run 'winget upgrade' to get the list of upgradable packages.
     $wingetUpgradeOutput = & winget upgrade --include-unknown
@@ -449,7 +468,7 @@ Update-Section "Winget & Microsoft Store apps" "Winget" ($NoWinget -or $OnlyWsl 
 
 
 # --- Update Visual Studio Code Extensions ---
-Update-Section "Visual Studio Code Extensions" "VS Code Extensions" ($NoVsCode -or $OnlyWsl -or $OnlyWslPackages) { Get-Command code -ErrorAction SilentlyContinue } {
+Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $OnlyWslPackages) { Get-Command code -ErrorAction SilentlyContinue } {
     Write-Status "Listing installed extensions..." -Type Action
     $installedExtensions = & code --list-extensions
     if ($LASTEXITCODE -ne 0) {
@@ -489,7 +508,7 @@ Update-Section "Visual Studio Code Extensions" "VS Code Extensions" ($NoVsCode -
 }
 
 # --- Update Miniconda ---
-Update-Section "Miniconda and 'ocr-azure' environment" "Conda" ($NoConda -or $OnlyWsl -or $OnlyWslPackages) { Get-Command conda -ErrorAction SilentlyContinue } {
+Update-Section "Miniconda and 'ocr-azure' environment" ($NoConda -or $OnlyWsl -or $OnlyWslPackages) { Get-Command conda -ErrorAction SilentlyContinue } {
     Write-Status "Updating base environment..." -Type Action
     if (Invoke-WithRetry -Action { & conda update -n base -c defaults conda -y } -ActionName "conda update -n base") {
         $updatedItems["Conda"] += "Miniconda (base)"
@@ -500,7 +519,7 @@ Update-Section "Miniconda and 'ocr-azure' environment" "Conda" ($NoConda -or $On
 
     # Check if 'ocr-azure' environment exists
     $condaEnvs = & conda env list
-    if ($LASTEXITCODE -eq 0 -and ($condaEnvs -join ' ') -match 'ocr-azure') {
+    if ($LASTEXITCODE -eq 0 -and ($condaEnvs | Where-Object { $_ -match '(?:^|\s)ocr-azure(?:\s|$)' })) {
         Write-Status "Updating 'ocr-azure' environment..." -Type Action
         if (Invoke-WithRetry -Action { & conda update -n ocr-azure --all -y } -ActionName "conda update -n ocr-azure") {
             $updatedItems["Conda"] += "Conda environment (ocr-azure)"
@@ -517,7 +536,7 @@ Update-Section "Miniconda and 'ocr-azure' environment" "Conda" ($NoConda -or $On
 }
 
 # --- Update TeX Live ---
-Update-Section "TeX Live" "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Command tlmgr -ErrorAction SilentlyContinue } {
+Update-Section "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Command tlmgr -ErrorAction SilentlyContinue } {
     Write-Status "Updating tlmgr and all packages..." -Type Action
     if (Invoke-WithRetry -Action { & tlmgr update --self --all } -ActionName "tlmgr update --self --all") {
         $updatedItems["TeX Live"] += "All packages"
@@ -528,7 +547,7 @@ Update-Section "TeX Live" "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) 
 }
 
 # --- Update WSL ---
-Update-Section "Windows Subsystem for Linux (WSL)" "WSL" ($NoWsl -and !$OnlyWsl -and !$OnlyWslPackages) { Get-Command wsl -ErrorAction SilentlyContinue } {
+Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !$OnlyWslPackages) { Get-Command wsl -ErrorAction SilentlyContinue } {
     Write-Log "Starting WSL updates."
     # Since elevation is handled at the start, we can proceed directly.
     if (-not $OnlyWslPackages) {
@@ -568,7 +587,7 @@ Update-Section "Windows Subsystem for Linux (WSL)" "WSL" ($NoWsl -and !$OnlyWsl 
 }
 
 # --- Update npm Packages ---
-Update-Section "npm (Node Package Manager) Packages" "npm" ($NoNpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command npm -ErrorAction SilentlyContinue } {
+Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command npm -ErrorAction SilentlyContinue } {
     Write-Status "Checking for outdated global packages..." -Type Action
     $outdatedNpmPackages = & npm outdated -g --parseable --depth=0
     if ($LASTEXITCODE -ne 0) {
@@ -634,8 +653,14 @@ if (-not $hasFailures) {
     Write-Status "No failures" -Type Success
 }
 
+if ($skippedSections.Count -gt 0) {
+    Write-Host ""
+    Write-Host "  Skipped" -ForegroundColor DarkGray
+    $skippedSections | ForEach-Object { Write-Host "    - $_" -ForegroundColor DarkGray }
+}
+
 Write-Host ""
-Write-Host "  Total time: $($totalElapsed.ToString('mm\:ss'))" -ForegroundColor DarkGray
+Write-Host "  Total time: $($totalElapsed.ToString('hh\:mm\:ss'))" -ForegroundColor DarkGray
 Write-Host ""
 
 # Exit with appropriate code based on failures
