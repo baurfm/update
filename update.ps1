@@ -89,7 +89,7 @@
 .NOTES
     Author: Your Name
     Date: 2025-01-20
-    Version: 9.6 (Bug fixes: Conda regex, log path; cleanup: SectionKey; UX: skipped summary, time format; robustness checks)
+    Version: 9.7 (Cleanup: hashtable refactor, retry style, return→exit; Add: winget source update, scoop cleanup, npm self-update, log rotation, structured logging; Bug: npm exit code + JSON parsing)
 #>
 
 param(
@@ -189,6 +189,8 @@ function Update-Section {
 
     if (-not (& $ToolCheck)) {
         Write-Status "$SectionName not found on this system" -Type Skip
+        Write-Log "$SectionName not found."
+        $script:skippedSections += "$SectionName (not installed)"
         return
     }
 
@@ -232,7 +234,7 @@ function Invoke-WithRetry {
             Write-Log "$ActionName threw exception (attempt $attempt): $_" -Level "WARN"
         }
         if ($attempt -lt $maxAttempts) {
-            Write-Host "Retrying $ActionName (attempt $($attempt + 1) of $maxAttempts)..." -ForegroundColor Yellow
+            Write-Status "Retrying $ActionName (attempt $($attempt + 1) of $maxAttempts)..." -Type Warning
             Start-Sleep -Seconds $DelaySeconds
         }
     } while ($attempt -lt $maxAttempts)
@@ -243,7 +245,7 @@ function Invoke-WithRetry {
 # Initialize logging and display startup banner
 $scriptStartTime = Get-Date
 Write-Host ""
-Write-Host "  Windows Update Script v9.6" -ForegroundColor Cyan
+Write-Host "  Windows Update Script v9.7" -ForegroundColor Cyan
 Write-Host "  Started: $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor DarkGray
 Write-Host ""
 
@@ -260,6 +262,13 @@ if ($freeGB -lt 2) {
 }
 
 Write-Log "Starting update script."
+Write-Log "OS: $([System.Environment]::OSVersion.VersionString)"
+Write-Log "PowerShell: $($PSVersionTable.PSVersion)"
+Write-Log "User: $([System.Environment]::UserName)"
+Write-Log "Free disk (C:): ${freeGB} GB"
+if ($PSBoundParameters.Count -gt 0) {
+    Write-Log "Parameters: $($PSBoundParameters.Keys -join ', ')"
+}
 
 # Set error action preference for consistent error handling
 $ErrorActionPreference = 'Continue'
@@ -311,6 +320,19 @@ $ScriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $PSBoundParameters.ContainsKey('LogFile')) {
     $LogFile = Join-Path $ScriptPath "update.log"
 }
+
+# Log rotation: rename existing log with timestamp, keep last 5 archives
+if (Test-Path $LogFile) {
+    $stamp       = $scriptStartTime.ToString('yyyy-MM-dd_HHmmss')
+    $logBase     = [System.IO.Path]::GetFileNameWithoutExtension($LogFile)
+    $logDir      = Split-Path $LogFile -Parent
+    $archivePath = Join-Path $logDir "$logBase-$stamp.log"
+    Rename-Item -Path $LogFile -NewName $archivePath -ErrorAction SilentlyContinue
+    Get-ChildItem -Path $logDir -Filter "$logBase-*.log" |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -Skip 5 |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
 if ((Get-Location).Path -ne $ScriptPath) {
     Write-Warning "Script should be run from its directory: $ScriptPath"
     Write-Host "Changing to script directory..." -ForegroundColor Yellow
@@ -321,33 +343,18 @@ if ((Get-Location).Path -ne $ScriptPath) {
 if ($Help) {
     # Use the built-in Get-Help command to display the comment-based help block from the top of this script.
     Get-Help $MyInvocation.MyCommand.Path -Full
-    return # Exit the script
+    exit 0
 }
 
 
 # Initialize hashtables to store results for the final summary
-$updatedItems = @{
-    "PowerShell Modules" = @()
-    "Scoop" = @()
-    "Winget" = @()
-    "VS Code Extensions" = @()
-    "Conda" = @()
-    "TeX Live" = @()
-    "WSL" = @()
-    "npm" = @()
+$sectionKeys = "PowerShell Modules", "Scoop", "Winget", "VS Code Extensions", "Conda", "TeX Live", "WSL", "npm"
+$updatedItems = @{}
+$failedItems  = @{}
+foreach ($k in $sectionKeys) {
+    $updatedItems[$k] = @()
+    $failedItems[$k]  = @()
 }
-
-$failedItems = @{
-    "PowerShell Modules" = @()
-    "Scoop" = @()
-    "Winget" = @()
-    "VS Code Extensions" = @()
-    "Conda" = @()
-    "TeX Live" = @()
-    "WSL" = @()
-    "npm" = @()
-}
-
 $skippedSections = @()
 
 # --- Update PowerShell Modules ---
@@ -413,6 +420,9 @@ Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPacka
             Write-Status "Some packages may have failed (exit code $LASTEXITCODE)" -Type Warning
             Write-Log "scoop update * exited with code $LASTEXITCODE" -Level "WARN"
         }
+
+        Write-Status "Removing old package versions..." -Type Action
+        & scoop cleanup *
     }
 }
 
@@ -454,6 +464,9 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
         } else {
             Write-Status "All packages up-to-date" -Type Success
         }
+
+        Write-Status "Refreshing winget sources..." -Type Action
+        & winget source update
 
         Write-Status "Upgrading all packages..." -Type Action
         # No retry — winget returns non-zero if ANY package fails (e.g. Office).
@@ -589,33 +602,29 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
 # --- Update npm Packages ---
 Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command npm -ErrorAction SilentlyContinue } {
     Write-Status "Checking for outdated global packages..." -Type Action
-    $outdatedNpmPackages = & npm outdated -g --parseable --depth=0
-    if ($LASTEXITCODE -ne 0) {
-        Write-Status "npm outdated -g failed (exit code $LASTEXITCODE)" -Type Error
-        $failedItems["npm"] += "npm outdated -g (Exit Code: $LASTEXITCODE)"
+    $outdatedNpmJson = & npm outdated -g --json 2>&1
+    # npm outdated exits 1 when packages ARE outdated (by design) — not an error condition.
+    # We parse JSON regardless of exit code.
+    $npmOutdated = $null
+    try { $npmOutdated = $outdatedNpmJson | ConvertFrom-Json -ErrorAction Stop } catch {}
+    $npmToUpdate = if ($npmOutdated) { @($npmOutdated.PSObject.Properties.Name) } else { @() }
+
+    if ($npmToUpdate.Count -gt 0) {
+        Write-Status "Found $($npmToUpdate.Count) outdated: $($npmToUpdate -join ', ')" -Type Info
+        $updatedItems["npm"] += $npmToUpdate
     } else {
-        $npmToUpdate = @()
-        foreach ($line in ($outdatedNpmPackages -split [System.Environment]::NewLine)) {
-            if ($line) {
-                $packageName = ($line.Split(':'))[2]
-                if ($packageName) {
-                    $npmToUpdate += $packageName
-                }
-            }
-        }
+        Write-Status "All global packages up-to-date" -Type Success
+    }
 
-        if ($npmToUpdate.Count -gt 0) {
-            Write-Status "Found $($npmToUpdate.Count) outdated: $($npmToUpdate -join ', ')" -Type Info
-            $updatedItems["npm"] += $npmToUpdate
-        } else {
-            Write-Status "All global packages up-to-date" -Type Success
-        }
+    Write-Status "Updating npm itself..." -Type Action
+    if (-not (Invoke-WithRetry -Action { & npm install -g npm } -ActionName "npm install -g npm")) {
+        Write-Status "npm self-update failed" -Type Warning
+    }
 
-        Write-Status "Updating all global packages..." -Type Action
-        if (-not (Invoke-WithRetry -Action { & npm update -g } -ActionName "npm update -g")) {
-            Write-Status "npm update -g failed after retries" -Type Error
-            $failedItems["npm"] += "npm update -g (failed after retries)"
-        }
+    Write-Status "Updating all global packages..." -Type Action
+    if (-not (Invoke-WithRetry -Action { & npm update -g } -ActionName "npm update -g")) {
+        Write-Status "npm update -g failed after retries" -Type Error
+        $failedItems["npm"] += "npm update -g (failed after retries)"
     }
 }
 
@@ -662,6 +671,24 @@ if ($skippedSections.Count -gt 0) {
 Write-Host ""
 Write-Host "  Total time: $($totalElapsed.ToString('hh\:mm\:ss'))" -ForegroundColor DarkGray
 Write-Host ""
+
+# Write structured summary to log
+Write-Log "=== RUN SUMMARY ==="
+foreach ($key in $updatedItems.Keys) {
+    if ($updatedItems[$key].Count -gt 0) {
+        Write-Log "  Updated [$key]: $($updatedItems[$key] -join ', ')"
+    }
+}
+foreach ($key in $failedItems.Keys) {
+    if ($failedItems[$key].Count -gt 0) {
+        Write-Log "  Failed  [$key]: $($failedItems[$key] -join ', ')" -Level "ERROR"
+    }
+}
+if ($skippedSections.Count -gt 0) {
+    Write-Log "  Skipped: $($skippedSections -join ', ')"
+}
+Write-Log "Total time: $($totalElapsed.ToString('hh\:mm\:ss'))"
+Write-Log "==================="
 
 # Exit with appropriate code based on failures
 if ($hasFailures) {

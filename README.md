@@ -225,8 +225,43 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Scoop community for the excellent package manager
 - All the developers of the tools this script helps maintain
 
+## 🌐 Running Globally as `update`
+
+To run the script from anywhere by simply typing `update` in PowerShell, add a function to your PowerShell profile.
+
+1. Open your profile file:
+
+   ```powershell
+   notepad $PROFILE
+   ```
+
+   If the file doesn't exist yet, create it first:
+
+   ```powershell
+   New-Item -ItemType File -Path $PROFILE -Force
+   ```
+
+2. Add the following function (replace the path with the actual location of `update.ps1`):
+
+   ```powershell
+   function update {
+       & "C:\path\to\your\update.ps1" @args
+   }
+   ```
+
+   The `@args` forwards any flags you pass (e.g. `update -NoTex -NoConda`).
+
+3. Save and reload your profile:
+
+   ```powershell
+   . $PROFILE
+   ```
+
+After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any directory.
+
 ## 📈 Version History
 
+- **v9.7** - Cleanup (hashtable refactor, retry style), bugfix (npm exit code + JSON parsing), add (winget source update, scoop cleanup, npm self-update, log rotation, structured logging)
 - **v9.6** - Bug fixes (Conda regex, log path), skipped-sections in summary, PS version check, disk space warning
 - **v9.5** - Fixed winget/scoop retry bug, removed dead code, cleanup
 - **v9.4** - Removed dry-run option, added retry logic to all sections, proper exit codes
