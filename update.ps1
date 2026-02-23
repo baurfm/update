@@ -296,17 +296,21 @@ if (-not $NoWinget -or -not $NoWsl -or $OnlyWsl -or $OnlyWslPackages) {
         }
 
         # Not running as admin, so attempt to re-launch with elevation.
+        # Use the current PowerShell executable (pwsh.exe for PS7, powershell.exe for PS5)
+        # so the elevated process runs the same version.
+        $psExe = (Get-Process -Id $PID).MainModule.FileName
         $sudoExists = Get-Command sudo -ErrorAction SilentlyContinue
         if ($sudoExists) {
             # Use the new Windows 'sudo' to re-launch.
             Write-Host "Administrator privileges are required. Re-launching with 'sudo'..." -ForegroundColor Yellow
-            & sudo powershell.exe -ExecutionPolicy Bypass -File $MyInvocation.MyCommand.Definition @argArray
+            & sudo $psExe -ExecutionPolicy Bypass -File $MyInvocation.MyCommand.Definition @argArray
             exit
         } else {
             # Fallback to the traditional self-elevation method.
             Write-Host "Administrator privileges are required. Re-launching as administrator..." -ForegroundColor Yellow
-            $newProcess = New-Object System.Diagnostics.ProcessStartInfo "PowerShell"
-            $newProcess.Arguments = "& '" + $MyInvocation.MyCommand.Definition + "' " + ($argArray -join ' ')
+            $argStr = if ($argArray.Count -gt 0) { $argArray -join ' ' } else { '' }
+            $newProcess = New-Object System.Diagnostics.ProcessStartInfo $psExe
+            $newProcess.Arguments = "-ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Definition)`" $argStr"
             $newProcess.Verb = "runas"
             [System.Diagnostics.Process]::Start($newProcess)
             exit
