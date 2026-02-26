@@ -8,7 +8,7 @@ A comprehensive PowerShell script that automates the update process for multiple
 
 ## 🚀 Features
 
-- **Comprehensive Coverage**: Updates 7 different development tool categories
+- **Comprehensive Coverage**: Updates 11 different development tool categories
 - **Selective Updates**: Skip specific sections using command-line parameters
 - **Error Handling**: Robust error handling with detailed reporting
 - **Centralized Logs**: Output and past logs are stored in a `logs/` subdirectory for easy review
@@ -28,6 +28,10 @@ A comprehensive PowerShell script that automates the update process for multiple
 | **npm** | All globally installed packages | `npm update -g` |
 | **TeX Live** | All TeX packages | `tlmgr update --self --all` |
 | **WSL** | WSL kernel + distro packages | `wsl --update`, `apt-get upgrade` |
+| **pipx** | All pipx-installed apps | `pipx upgrade-all` |
+| **Rust** | Rust toolchain | `rustup update` |
+| **Ruby Gems** | RubyGems system + all gems | `gem update --system && gem update` |
+| **Chocolatey** | All Chocolatey packages | `choco upgrade all -y` |
 
 ## 🛠️ Installation
 
@@ -82,6 +86,10 @@ Get-Help .\update.ps1 -Full
 | `-NoNpm` | - | Skip updating global npm packages |
 | `-NoTex` | - | Skip updating TeX Live |
 | `-NoWsl` | - | Skip updating Windows Subsystem for Linux (WSL) |
+| `-NoPipx` | - | Skip updating pipx packages |
+| `-NoRust` | - | Skip updating Rust toolchain via rustup |
+| `-NoGem` | - | Skip updating Ruby Gems |
+| `-NoChoco` | - | Skip updating Chocolatey packages |
 
 ## 📋 Prerequisites
 
@@ -270,8 +278,9 @@ After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any di
 
 ## 📈 Version History
 
-- **v9.8** - Add: winget ignores pinned packages, conda base environment `--all` update, log files saved in dedicated `logs/` folder (retains last 5 archives); fix inconsistent archive naming
+- **v10.0** - Add: pipx, Rust (rustup), Ruby Gems, Chocolatey update sections with `-NoPipx`/`-NoRust`/`-NoGem`/`-NoChoco` params; Fix: WSL circular sudo bug (use `wsl -u root` instead of `wsl sudo`), unconditional apt-get success tracking, re-verify sudo after auto-config; Refactor: WSL sudo logic into `Set-WslPasswordlessSudo` helper
 - **v9.9** - Automatically configure passwordless sudo for WSL `apt-get` without prompting; new `-SkipWslSudoConfig` switch
+- **v9.8** - Add: winget ignores pinned packages, conda base environment `--all` update, log files saved in dedicated `logs/` folder (retains last 5 archives); fix inconsistent archive naming
 
 - **v9.7** - Cleanup (hashtable refactor, retry style), bugfix (npm exit code + JSON parsing), add (winget source update, scoop cleanup, npm self-update, log rotation, structured logging)
 - **v9.6** - Bug fixes (Conda regex, log path), skipped-sections in summary, PS version check, disk space warning

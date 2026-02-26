@@ -44,6 +44,18 @@
 .PARAMETER NoNpm
     A switch to skip updating npm packages.
 
+.PARAMETER NoPipx
+    A switch to skip updating pipx packages.
+
+.PARAMETER NoRust
+    A switch to skip updating the Rust toolchain via rustup.
+
+.PARAMETER NoGem
+    A switch to skip updating Ruby Gems.
+
+.PARAMETER NoChoco
+    A switch to skip updating Chocolatey packages.
+
 .PARAMETER OnlyWsl
     A switch to only update WSL and skip other sections.
 
@@ -89,7 +101,7 @@
 .NOTES
     Author: Your Name
     Date: 2025-01-20
-    Version: 9.9 (Add: interactive WSL sudo configuration prompt and automated setup, new -SkipWslSudoConfig switch; previous 9.8 changes: winget ignores pinned packages; conda base environment --all update; log directory and folder for logs; Cleanup: hashtable refactor, retry style, return→exit; earlier additions: winget source update, scoop cleanup, npm self-update, log rotation, structured logging; Bug: npm exit code + JSON parsing)
+    Version: 10.0 (Add: pipx/rustup/gem/choco update sections, -NoPipx/-NoRust/-NoGem/-NoChoco params; Fix: WSL circular sudo bug (wsl -u root instead of wsl sudo), unconditional apt-get success tracking, re-verify sudo after auto-config; Refactor: WSL sudo logic into Set-WslPasswordlessSudo helper; previous 9.9: WSL sudo auto-config, -SkipWslSudoConfig; 9.8: winget pinned ignore, conda base --all, logs/ folder)
 #>
 
 param(
@@ -105,6 +117,10 @@ param(
     [switch]$NoTex,
     [switch]$NoWsl,
     [switch]$NoNpm,
+    [switch]$NoPipx,
+    [switch]$NoRust,
+    [switch]$NoGem,
+    [switch]$NoChoco,
     [switch]$OnlyWsl,
     [switch]$OnlyWslPackages,
 
@@ -245,10 +261,21 @@ function Invoke-WithRetry {
     return $false
 }
 
+# Helper: write a NOPASSWD sudoers entry for apt-get via wsl -u root, then verify sudo works.
+# Returns $true if passwordless sudo is confirmed after the operation.
+function Set-WslPasswordlessSudo {
+    param([string]$LinuxUser)
+    $cmd = "echo '$LinuxUser ALL=(ALL) NOPASSWD: /usr/bin/apt-get' > /etc/sudoers.d/update-apt-get && chmod 0440 /etc/sudoers.d/update-apt-get"
+    & wsl.exe -u root sh -c $cmd | Out-Null
+    if ($LASTEXITCODE -ne 0) { return $false }
+    & wsl.exe sudo -n true 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+
 # Initialize logging and display startup banner
 $scriptStartTime = Get-Date
 Write-Host ""
-Write-Host "  Windows Update Script v9.9" -ForegroundColor Cyan
+Write-Host "  Windows Update Script v10.0" -ForegroundColor Cyan
 Write-Host "  Started: $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor DarkGray
 Write-Host ""
 
@@ -382,7 +409,7 @@ if ($Help) {
 
 
 # Initialize hashtables to store results for the final summary
-$sectionKeys = "PowerShell Modules", "Scoop", "Winget", "VS Code Extensions", "Conda", "TeX Live", "WSL", "npm"
+$sectionKeys = "PowerShell Modules", "Scoop", "Winget", "VS Code Extensions", "Conda", "TeX Live", "WSL", "npm", "pipx", "Rust", "Ruby Gems", "Chocolatey"
 $updatedItems = @{}
 $failedItems  = @{}
 foreach ($k in $sectionKeys) {
@@ -628,47 +655,40 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
     }
 
     Write-Status "Updating packages in default WSL distro..." -Type Action
-    # Check for passwordless sudo access by checking the exit code of an external command.
     & wsl.exe sudo -n true 2>$null
+    $sudoOk = ($LASTEXITCODE -eq 0)
 
-    if ($LASTEXITCODE -eq 0) {
-        Write-Status "Passwordless sudo confirmed" -Type Success
-        & wsl.exe sudo apt-get update
-        & wsl.exe sudo apt-get upgrade -y
-        $updatedItems["WSL"] += "Updated packages in default WSL distro"
-    } else {
+    if (-not $sudoOk) {
         Write-Status "Passwordless sudo not configured" -Type Error
         if ($SkipWslSudoConfig) {
             Write-Status "Skipping automatic sudo configuration as requested" -Type Skip
-            $failedItems["WSL"] += "Package update failed (sudo configuration needed)"
+            $failedItems["WSL"] += "Package update skipped (passwordless sudo not configured)"
         } else {
-            Write-Status "Attempting automatic sudo configuration" -Type Action
-            # determine linux username
+            Write-Status "Attempting automatic sudo configuration..." -Type Action
             $linuxUser = & wsl.exe whoami 2>$null | ForEach-Object { $_.Trim() }
-            if ($linuxUser) {
-                Write-Status "Configuring sudoers for user $linuxUser" -Type Action
-                $cmd = "echo '$linuxUser ALL=(ALL) NOPASSWD: /usr/bin/apt-get' > /etc/sudoers.d/update-apt-get && chmod 0440 /etc/sudoers.d/update-apt-get"
-                & wsl.exe sudo sh -c $cmd
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Status "Passwordless sudo configured successfully" -Type Success
-                    Write-Status "Rerunning package updates..." -Type Action
-                    & wsl.exe sudo apt-get update
-                    & wsl.exe sudo apt-get upgrade -y
-                    if ($LASTEXITCODE -eq 0) {
-                        $updatedItems["WSL"] += "Updated packages in default WSL distro (post-config)"
-                        $failedItems["WSL"] = $failedItems["WSL"] | Where-Object { $_ -notmatch 'sudo' }
-                    } else {
-                        Write-Status "Package update failed even after configuring sudo" -Type Error
-                        $failedItems["WSL"] += "Package update failed after sudo configuration"
-                    }
-                } else {
-                    Write-Status "Failed to write sudoers file" -Type Error
-                    $failedItems["WSL"] += "sudoers configuration failed"
-                }
-            } else {
+            if (-not $linuxUser) {
                 Write-Status "Could not determine WSL username" -Type Error
                 $failedItems["WSL"] += "Unable to configure sudo (username unknown)"
+            } elseif (Set-WslPasswordlessSudo -LinuxUser $linuxUser) {
+                Write-Status "Passwordless sudo configured for $linuxUser" -Type Success
+                $sudoOk = $true
+            } else {
+                Write-Status "Failed to configure passwordless sudo" -Type Error
+                $failedItems["WSL"] += "sudoers configuration failed"
             }
+        }
+    }
+
+    if ($sudoOk) {
+        Write-Status "Running apt-get update and upgrade..." -Type Action
+        Write-Log "Running apt-get update and upgrade."
+        & wsl.exe sudo apt-get update
+        & wsl.exe sudo apt-get upgrade -y
+        if ($LASTEXITCODE -eq 0) {
+            $updatedItems["WSL"] += "Updated packages in default WSL distro"
+        } else {
+            Write-Status "apt-get upgrade failed" -Type Error
+            $failedItems["WSL"] += "apt-get upgrade failed"
         }
     }
 }
@@ -699,6 +719,58 @@ Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $O
     if (-not (Invoke-WithRetry -Action { & npm update -g } -ActionName "npm update -g")) {
         Write-Status "npm update -g failed after retries" -Type Error
         $failedItems["npm"] += "npm update -g (failed after retries)"
+    }
+}
+
+# --- Update pipx packages ---
+Update-Section "pipx packages" ($NoPipx -or $OnlyWsl -or $OnlyWslPackages) { Get-Command pipx -ErrorAction SilentlyContinue } {
+    Write-Status "Upgrading all pipx packages..." -Type Action
+    Write-Log "Upgrading pipx packages."
+    if (Invoke-WithRetry -Action { & pipx upgrade-all } -ActionName "pipx upgrade-all") {
+        $updatedItems["pipx"] += "All pipx packages"
+    } else {
+        Write-Status "pipx upgrade-all failed after retries" -Type Error
+        $failedItems["pipx"] += "pipx upgrade-all (failed after retries)"
+    }
+}
+
+# --- Update Rust toolchain ---
+Update-Section "Rust (rustup)" ($NoRust -or $OnlyWsl -or $OnlyWslPackages) { Get-Command rustup -ErrorAction SilentlyContinue } {
+    Write-Status "Updating Rust toolchain..." -Type Action
+    Write-Log "Updating Rust toolchain via rustup."
+    if (Invoke-WithRetry -Action { & rustup update } -ActionName "rustup update") {
+        $updatedItems["Rust"] += "Rust toolchain"
+    } else {
+        Write-Status "rustup update failed after retries" -Type Error
+        $failedItems["Rust"] += "rustup update (failed after retries)"
+    }
+}
+
+# --- Update Ruby Gems ---
+Update-Section "Ruby Gems" ($NoGem -or $OnlyWsl -or $OnlyWslPackages) { Get-Command gem -ErrorAction SilentlyContinue } {
+    Write-Status "Updating RubyGems system..." -Type Action
+    Write-Log "Updating Ruby Gems."
+    if (-not (Invoke-WithRetry -Action { & gem update --system } -ActionName "gem update --system")) {
+        Write-Status "gem update --system failed after retries" -Type Warning
+    }
+    Write-Status "Updating all gems..." -Type Action
+    if (Invoke-WithRetry -Action { & gem update } -ActionName "gem update") {
+        $updatedItems["Ruby Gems"] += "All gems"
+    } else {
+        Write-Status "gem update failed after retries" -Type Error
+        $failedItems["Ruby Gems"] += "gem update (failed after retries)"
+    }
+}
+
+# --- Update Chocolatey packages ---
+Update-Section "Chocolatey packages" ($NoChoco -or $OnlyWsl -or $OnlyWslPackages) { Get-Command choco -ErrorAction SilentlyContinue } {
+    Write-Status "Upgrading all Chocolatey packages..." -Type Action
+    Write-Log "Upgrading Chocolatey packages."
+    if (Invoke-WithRetry -Action { & choco upgrade all -y } -ActionName "choco upgrade all") {
+        $updatedItems["Chocolatey"] += "All Chocolatey packages"
+    } else {
+        Write-Status "choco upgrade failed after retries" -Type Error
+        $failedItems["Chocolatey"] += "choco upgrade all (failed after retries)"
     }
 }
 
