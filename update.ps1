@@ -245,7 +245,7 @@ function Invoke-WithRetry {
 # Initialize logging and display startup banner
 $scriptStartTime = Get-Date
 Write-Host ""
-Write-Host "  Windows Update Script v9.7" -ForegroundColor Cyan
+Write-Host "  Windows Update Script v9.8" -ForegroundColor Cyan
 Write-Host "  Started: $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor DarkGray
 Write-Host ""
 
