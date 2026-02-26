@@ -327,24 +327,27 @@ if ($PSBoundParameters.Count -gt 0) {
 $ErrorActionPreference = 'Continue'
 
 # --- Administrator Elevation Check ---
-# Winget upgrade --all and wsl --update both require admin. For winget, we first do a
-# non-elevated pre-check so we skip the UAC/sudo prompt entirely when nothing needs updating.
-$wslNeedsElevation    = -not $NoWsl -or $OnlyWsl -or $OnlyWslPackages
+# Only winget upgrade --all strictly requires admin. wsl --update also needs it, but we
+# handle that opportunistically: if already elevated (due to winget), the kernel update
+# runs; if not, it is skipped and only apt-get (which needs no Windows admin) runs.
+# This avoids a sudo prompt on every run when winget has nothing to update.
 $wingetNeedsElevation = $false
 if (-not $NoWinget -and (Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Status "Pre-checking winget for available updates..." -Type Action
     $wingetNeedsElevation = Test-WingetHasUpdates
     if (-not $wingetNeedsElevation) {
-        Write-Status "Winget: all packages up-to-date — no elevation needed for winget" -Type Success
+        Write-Status "Winget: all packages up-to-date — no elevation needed" -Type Success
     }
 }
 
-if ($wingetNeedsElevation -or $wslNeedsElevation) {
-    $myWindowsID = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    $myWindowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal($myWindowsID)
-    $adminRole = [System.Security.Principal.WindowsBuiltInRole]::Administrator
+# Compute admin status once; used later by the WSL section to gate wsl --update.
+$myWindowsID        = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$myWindowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal($myWindowsID)
+$adminRole          = [System.Security.Principal.WindowsBuiltInRole]::Administrator
+$script:isAdmin     = $myWindowsPrincipal.IsInRole($adminRole)
 
-    if (-not $myWindowsPrincipal.IsInRole($adminRole)) {
+if ($wingetNeedsElevation) {
+    if (-not $script:isAdmin) {
         # Build argument array from bound parameters
         $argArray = @()
         foreach ($key in $PSBoundParameters.Keys) {
@@ -676,18 +679,23 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
     Write-Log "Starting WSL updates."
     # Since elevation is handled at the start, we can proceed directly.
     if (-not $OnlyWslPackages) {
-        Write-Status "Updating WSL kernel..." -Type Action
-        Write-Log "Updating WSL kernel."
-        if (Invoke-WithRetry -Action { & wsl --update --web-download } -ActionName "wsl --update" -MaxRetries 2) {
-            $updatedItems["WSL"] += "WSL Kernel"
-        } else {
-            Write-Status "wsl --update failed after retries" -Type Error
-            $failedItems["WSL"] += "wsl --update (failed after retries)"
-        }
+        if ($script:isAdmin) {
+            Write-Status "Updating WSL kernel..." -Type Action
+            Write-Log "Updating WSL kernel."
+            if (Invoke-WithRetry -Action { & wsl --update --web-download } -ActionName "wsl --update" -MaxRetries 2) {
+                $updatedItems["WSL"] += "WSL Kernel"
+            } else {
+                Write-Status "wsl --update failed after retries" -Type Error
+                $failedItems["WSL"] += "wsl --update (failed after retries)"
+            }
 
-        Write-Status "Shutting down WSL to apply updates..." -Type Action
-        Write-Log "Shutting down WSL."
-        Invoke-WithRetry -Action { & wsl --shutdown } -ActionName "wsl --shutdown" -MaxRetries 0 | Out-Null
+            Write-Status "Shutting down WSL to apply updates..." -Type Action
+            Write-Log "Shutting down WSL."
+            Invoke-WithRetry -Action { & wsl --shutdown } -ActionName "wsl --shutdown" -MaxRetries 0 | Out-Null
+        } else {
+            Write-Status "WSL kernel update skipped (not running as admin)" -Type Skip
+            Write-Log "Skipping WSL kernel update — not elevated."
+        }
     } else {
         Write-Log "Skipping WSL kernel update as requested."
     }
