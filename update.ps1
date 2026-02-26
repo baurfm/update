@@ -352,9 +352,11 @@ if (-not $PSBoundParameters.ContainsKey('LogFile')) {
 
 # Log rotation: rename existing log with timestamp, keep last 5 archives
 if (Test-Path $LogFile) {
-    $stamp       = $scriptStartTime.ToString('yyyy-MM-dd_HHmmss')
-    $logBase     = [System.IO.Path]::GetFileNameWithoutExtension($LogFile)
-    $logDir      = Split-Path $LogFile -Parent
+    $stamp  = $scriptStartTime.ToString('yyyy-MM-dd_HHmmss')
+    # basename may sometimes be empty (e.g. malformed path); fall back to 'update'
+    $logBase = [System.IO.Path]::GetFileNameWithoutExtension($LogFile)
+    if ([string]::IsNullOrWhiteSpace($logBase)) { $logBase = 'update' }
+    $logDir = Split-Path $LogFile -Parent
     $archivePath = Join-Path $logDir "$logBase-$stamp.log"
     Rename-Item -Path $LogFile -NewName $archivePath -ErrorAction SilentlyContinue
     Get-ChildItem -Path $logDir -Filter "$logBase-*.log" |

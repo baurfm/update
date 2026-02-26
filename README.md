@@ -268,7 +268,7 @@ After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any di
 
 ## 📈 Version History
 
-- **v9.8** - Add: winget ignores pinned packages, conda base environment `--all` update, log files saved in dedicated `logs/` folder (retains last 5 archives)
+- **v9.8** - Add: winget ignores pinned packages, conda base environment `--all` update, log files saved in dedicated `logs/` folder (retains last 5 archives); fix inconsistent archive naming
 
 - **v9.7** - Cleanup (hashtable refactor, retry style), bugfix (npm exit code + JSON parsing), add (winget source update, scoop cleanup, npm self-update, log rotation, structured logging)
 - **v9.6** - Bug fixes (Conda regex, log path), skipped-sections in summary, PS version check, disk space warning
