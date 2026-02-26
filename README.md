@@ -121,7 +121,7 @@ The script provides:
 
 > **Logs** are now stored in a `logs/` subdirectory next to the script; the previous `update.log` text file is still written there by default and the last five archives are kept.
 
-If passwordless `sudo` is not configured for `apt-get`, the script will offer to add the necessary entry to `/etc/sudoers.d` automatically. You can still decline and configure it manually as shown below.
+If passwordless `sudo` is not configured for `apt-get`, the script will automatically add the necessary entry to `/etc/sudoers.d` (unless run with `-SkipWslSudoConfig`). No interactive confirmation is requested, making the script suitable for non‑interactive usage.
 
 
 The script now automatically updates packages within your default WSL distribution using `apt-get`. This requires `sudo` access. To allow the script to run `sudo` without a password prompt, you need to add a configuration file to your WSL instance.
@@ -271,6 +271,7 @@ After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any di
 ## 📈 Version History
 
 - **v9.8** - Add: winget ignores pinned packages, conda base environment `--all` update, log files saved in dedicated `logs/` folder (retains last 5 archives); fix inconsistent archive naming
+- **v9.9** - Automatically configure passwordless sudo for WSL `apt-get` without prompting; new `-SkipWslSudoConfig` switch
 
 - **v9.7** - Cleanup (hashtable refactor, retry style), bugfix (npm exit code + JSON parsing), add (winget source update, scoop cleanup, npm self-update, log rotation, structured logging)
 - **v9.6** - Bug fixes (Conda regex, log path), skipped-sections in summary, PS version check, disk space warning

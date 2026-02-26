@@ -89,7 +89,7 @@
 .NOTES
     Author: Your Name
     Date: 2025-01-20
-    Version: 9.8 (Add: winget ignores pinned packages; conda base environment --all update; log directory and folder for logs; Cleanup: hashtable refactor, retry style, return→exit; previous additions: winget source update, scoop cleanup, npm self-update, log rotation, structured logging; Bug: npm exit code + JSON parsing)
+    Version: 9.9 (Add: interactive WSL sudo configuration prompt and automated setup, new -SkipWslSudoConfig switch; previous 9.8 changes: winget ignores pinned packages; conda base environment --all update; log directory and folder for logs; Cleanup: hashtable refactor, retry style, return→exit; earlier additions: winget source update, scoop cleanup, npm self-update, log rotation, structured logging; Bug: npm exit code + JSON parsing)
 #>
 
 param(
@@ -110,6 +110,9 @@ param(
 
     [Parameter(HelpMessage = "Enable verbose output.")]
     [switch]$EnableVerbose,
+
+    [Parameter(HelpMessage = "If set, skip any automatic configuration of WSL sudo (passwordless apt-get).")]
+    [switch]$SkipWslSudoConfig,
 
     [Parameter(HelpMessage = "Path to log file. Defaults to 'logs/update.log' under script directory.")]
     [string]$LogFile = "update.log"
@@ -245,7 +248,7 @@ function Invoke-WithRetry {
 # Initialize logging and display startup banner
 $scriptStartTime = Get-Date
 Write-Host ""
-Write-Host "  Windows Update Script v9.8" -ForegroundColor Cyan
+Write-Host "  Windows Update Script v9.9" -ForegroundColor Cyan
 Write-Host "  Started: $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor DarkGray
 Write-Host ""
 
@@ -635,17 +638,15 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
         $updatedItems["WSL"] += "Updated packages in default WSL distro"
     } else {
         Write-Status "Passwordless sudo not configured" -Type Error
-        # offer to automatically configure passwordless apt-get
-        Write-Host "";
-        Write-Host "The script can attempt to set up passwordless sudo for apt-get" -ForegroundColor DarkYellow
-        Write-Host "in your WSL distro by adding an entry to /etc/sudoers.d." -ForegroundColor DarkYellow
-        $prompt = Read-Host "Would you like to proceed? [Y/n]"
-        if ($prompt -match '^[Yy]') {
+        if ($SkipWslSudoConfig) {
+            Write-Status "Skipping automatic sudo configuration as requested" -Type Skip
+            $failedItems["WSL"] += "Package update failed (sudo configuration needed)"
+        } else {
+            Write-Status "Attempting automatic sudo configuration" -Type Action
             # determine linux username
             $linuxUser = & wsl.exe whoami 2>$null | ForEach-Object { $_.Trim() }
             if ($linuxUser) {
                 Write-Status "Configuring sudoers for user $linuxUser" -Type Action
-                # create a sudoers.d file with the necessary rule
                 $cmd = "echo '$linuxUser ALL=(ALL) NOPASSWD: /usr/bin/apt-get' > /etc/sudoers.d/update-apt-get && chmod 0440 /etc/sudoers.d/update-apt-get"
                 & wsl.exe sudo sh -c $cmd
                 if ($LASTEXITCODE -eq 0) {
@@ -655,7 +656,6 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
                     & wsl.exe sudo apt-get upgrade -y
                     if ($LASTEXITCODE -eq 0) {
                         $updatedItems["WSL"] += "Updated packages in default WSL distro (post-config)"
-                        ;# clear any previous failure for this item
                         $failedItems["WSL"] = $failedItems["WSL"] | Where-Object { $_ -notmatch 'sudo' }
                     } else {
                         Write-Status "Package update failed even after configuring sudo" -Type Error
@@ -669,13 +669,6 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
                 Write-Status "Could not determine WSL username" -Type Error
                 $failedItems["WSL"] += "Unable to configure sudo (username unknown)"
             }
-        } else {
-            Write-Status "Skipped automatic sudo configuration" -Type Skip
-            Write-Host ""
-            Write-Host "  To fix manually: run 'wsl', then 'sudo visudo' and add:" -ForegroundColor DarkYellow
-            Write-Host "  your_username ALL=(ALL) NOPASSWD: /usr/bin/apt-get" -ForegroundColor DarkYellow
-            Write-Host ""
-            $failedItems["WSL"] += "Package update failed (sudo configuration needed)"
         }
     }
 }
