@@ -134,23 +134,22 @@ param(
     [string]$LogFile = "update.log"
 )
 
+# Helper: format a TimeSpan as "4m 12s" / "38s" / "1h 2m"
+function Format-Elapsed {
+    param([TimeSpan]$ts)
+    if ($ts.TotalHours -ge 1)   { return "$([int]$ts.TotalHours)h $($ts.Minutes)m" }
+    if ($ts.TotalMinutes -ge 1) { return "$([int]$ts.TotalMinutes)m $($ts.Seconds)s" }
+    return "$([int]$ts.TotalSeconds)s"
+}
+
 # Function to display a formatted section header
 function Write-SectionHeader {
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory = $true)]
-        [string]$Title
-    )
-    $width = 60
-    $padding = $width - $Title.Length - 4
-    if ($padding -lt 2) { $padding = 2 }
-    $leftPad = [math]::Floor($padding / 2)
-    $rightPad = [math]::Ceiling($padding / 2)
-
+    param([string]$Title)
+    $line = ([char]0x2500).ToString() * 58   # ──────────
     Write-Host ""
-    Write-Host ("+" + ("-" * ($width - 2)) + "+") -ForegroundColor DarkCyan
-    Write-Host ("|" + (" " * $leftPad) + $Title + (" " * $rightPad) + "|") -ForegroundColor Cyan
-    Write-Host ("+" + ("-" * ($width - 2)) + "+") -ForegroundColor DarkCyan
+    Write-Host "  $line" -ForegroundColor DarkGray
+    Write-Host "  $([char]0x25B6)  $Title" -ForegroundColor Cyan   # ▶  Title
+    Write-Host "  $line" -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -162,12 +161,12 @@ function Write-Status {
         [string]$Type = "Info"
     )
     switch ($Type) {
-        "Info"    { Write-Host "  [.]  $Message" -ForegroundColor Gray }
-        "Success" { Write-Host "  [+]  $Message" -ForegroundColor Green }
-        "Warning" { Write-Host "  [!]  $Message" -ForegroundColor Yellow }
-        "Error"   { Write-Host "  [X]  $Message" -ForegroundColor Red }
-        "Skip"    { Write-Host "  [-]  $Message" -ForegroundColor DarkGray }
-        "Action"  { Write-Host "  [>]  $Message" -ForegroundColor White }
+        "Info"    { Write-Host "  $([char]0x00B7)  $Message" -ForegroundColor Gray }      # ·
+        "Success" { Write-Host "  $([char]0x2713)  $Message" -ForegroundColor Green }     # ✓
+        "Warning" { Write-Host "  $([char]0x26A0)  $Message" -ForegroundColor Yellow }    # ⚠
+        "Error"   { Write-Host "  $([char]0x2717)  $Message" -ForegroundColor Red }       # ✗
+        "Skip"    { Write-Host "  $([char]0x25CB)  $Message" -ForegroundColor DarkGray }  # ○
+        "Action"  { Write-Host "  $([char]0x2192)  $Message" -ForegroundColor White }     # →
     }
 }
 
@@ -179,12 +178,17 @@ function Write-Log {
     )
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logMessage = "[$timestamp] [$Level] $Message"
-    if ($EnableVerbose -or $Level -ne "INFO") {
-        Write-Host $logMessage
+    # Always write to file
+    if ($LogFile) { Add-Content -Path $LogFile -Value $logMessage }
+    # Terminal: raw log lines only in verbose mode; WARN/ERROR shown via Write-Status otherwise
+    if ($EnableVerbose) {
+        Write-Host $logMessage -ForegroundColor DarkGray
+    } elseif ($Level -eq "WARN") {
+        Write-Status $Message -Type Warning
+    } elseif ($Level -eq "ERROR") {
+        Write-Status $Message -Type Error
     }
-    if ($LogFile) {
-        Add-Content -Path $LogFile -Value $logMessage
-    }
+    # INFO and DEBUG are silent in terminal unless -EnableVerbose
 }
 
 # Function to handle common update section logic
@@ -217,11 +221,11 @@ function Update-Section {
     try {
         & $UpdateAction
         $elapsed = (Get-Date) - $sectionStart
-        Write-Status "$SectionName completed in $($elapsed.ToString('hh\:mm\:ss'))" -Type Success
+        Write-Status "Done  $(Format-Elapsed $elapsed)" -Type Success
         Write-Log "$SectionName updates completed."
     } catch {
         $elapsed = (Get-Date) - $sectionStart
-        Write-Status "$SectionName failed after $($elapsed.ToString('hh\:mm\:ss')): $_" -Type Error
+        Write-Status "Failed after $(Format-Elapsed $elapsed): $_" -Type Error
         Write-Log "Error during $SectionName updates: $_" -Level "ERROR"
     }
 }
@@ -265,9 +269,11 @@ function Invoke-WithRetry {
 # packages. On any parse error or winget failure, returns $true (safe default: assume updates).
 function Test-WingetHasUpdates {
     $output = & winget upgrade --include-unknown 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $output) { return $true }
+    # NOTE: winget exits non-zero (0x8A150014) when there are NO updates — do NOT gate on
+    # $LASTEXITCODE here. We rely entirely on the output text and table content.
+    if (-not $output) { return $false }
 
-    # When nothing needs updating winget prints this message instead of a table.
+    # When nothing needs updating winget prints this message with no table.
     if (($output -join "`n") -match 'No applicable upgrades were found') { return $false }
 
     $lines = $output -split [System.Environment]::NewLine
@@ -339,9 +345,13 @@ function Set-WslPasswordlessSudo {
 
 # Initialize logging and display startup banner
 $scriptStartTime = Get-Date
+$_banner_line = ([char]0x2500).ToString() * 36
 Write-Host ""
-Write-Host "  Windows Update Script v10.0" -ForegroundColor Cyan
-Write-Host "  Started: $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor DarkGray
+Write-Host "  $_banner_line" -ForegroundColor DarkGray
+Write-Host "  $([char]0x25C6)  Windows Update Script  " -NoNewline -ForegroundColor DarkGray
+Write-Host "v10.0" -ForegroundColor Cyan
+Write-Host "  $([char]0x25C6)  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))" -ForegroundColor DarkGray
+Write-Host "  $_banner_line" -ForegroundColor DarkGray
 Write-Host ""
 
 # PowerShell version check (5.0+ required for Get-InstalledModule, Update-Module, etc.)
@@ -890,14 +900,14 @@ $hasUpdates = $false
 foreach ($key in $updatedItems.Keys) {
     if ($updatedItems[$key].Count -gt 0) {
         $hasUpdates = $true
-        Write-Host "  $key" -ForegroundColor Green
-        $updatedItems[$key] | ForEach-Object { Write-Host "    - $_" -ForegroundColor Gray }
+        Write-Host "  $([char]0x2713)  $key" -ForegroundColor Green
+        $updatedItems[$key] | ForEach-Object { Write-Host "       $([char]0x2022) $_" -ForegroundColor Gray }
         Write-Host ""
     }
 }
 
 if (-not $hasUpdates) {
-    Write-Status "Nothing was updated" -Type Info
+    Write-Status "Everything already up-to-date" -Type Info
     Write-Host ""
 }
 
@@ -905,8 +915,8 @@ $hasFailures = $false
 foreach ($key in $failedItems.Keys) {
     if ($failedItems[$key].Count -gt 0) {
         $hasFailures = $true
-        Write-Host "  FAILED: $key" -ForegroundColor Red
-        $failedItems[$key] | ForEach-Object { Write-Host "    - $_" -ForegroundColor DarkRed }
+        Write-Host "  $([char]0x2717)  $key" -ForegroundColor Red
+        $failedItems[$key] | ForEach-Object { Write-Host "       $([char]0x2022) $_" -ForegroundColor DarkRed }
         Write-Host ""
     }
 }
@@ -917,12 +927,12 @@ if (-not $hasFailures) {
 
 if ($skippedSections.Count -gt 0) {
     Write-Host ""
-    Write-Host "  Skipped" -ForegroundColor DarkGray
-    $skippedSections | ForEach-Object { Write-Host "    - $_" -ForegroundColor DarkGray }
+    Write-Host "  $([char]0x25CB)  Skipped" -ForegroundColor DarkGray
+    $skippedSections | ForEach-Object { Write-Host "       $([char]0x2022) $_" -ForegroundColor DarkGray }
 }
 
 Write-Host ""
-Write-Host "  Total time: $($totalElapsed.ToString('hh\:mm\:ss'))" -ForegroundColor DarkGray
+Write-Host "  $([char]0x25C6)  Total time: $(Format-Elapsed $totalElapsed)" -ForegroundColor DarkGray
 Write-Host ""
 
 # Write structured summary to log
@@ -940,7 +950,7 @@ foreach ($key in $failedItems.Keys) {
 if ($skippedSections.Count -gt 0) {
     Write-Log "  Skipped: $($skippedSections -join ', ')"
 }
-Write-Log "Total time: $($totalElapsed.ToString('hh\:mm\:ss'))"
+Write-Log "Total time: $(Format-Elapsed $totalElapsed)"
 Write-Log "==================="
 
 # Exit with appropriate code based on failures
