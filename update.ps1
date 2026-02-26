@@ -89,7 +89,7 @@
 .NOTES
     Author: Your Name
     Date: 2025-01-20
-    Version: 9.7 (Cleanup: hashtable refactor, retry style, return→exit; Add: winget source update, scoop cleanup, npm self-update, log rotation, structured logging; Bug: npm exit code + JSON parsing)
+    Version: 9.8 (Add: winget ignores pinned packages; conda base environment --all update; log directory and folder for logs; Cleanup: hashtable refactor, retry style, return→exit; previous additions: winget source update, scoop cleanup, npm self-update, log rotation, structured logging; Bug: npm exit code + JSON parsing)
 #>
 
 param(
@@ -111,7 +111,7 @@ param(
     [Parameter(HelpMessage = "Enable verbose output.")]
     [switch]$EnableVerbose,
 
-    [Parameter(HelpMessage = "Path to log file.")]
+    [Parameter(HelpMessage = "Path to log file. Defaults to 'logs/update.log' under script directory.")]
     [string]$LogFile = "update.log"
 )
 
@@ -320,9 +320,34 @@ if (-not $NoWinget -or -not $NoWsl -or $OnlyWsl -or $OnlyWslPackages) {
 
 # Security: Require script to be run from the directory where it's located
 $ScriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Ensure a dedicated log directory exists and adjust the default log file path
+$LogDir = Join-Path $ScriptPath "logs"
+if (-not (Test-Path $LogDir)) {
+    New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
+}
+
+# Move any existing log files from the script directory into the dedicated log folder
+Get-ChildItem -Path $ScriptPath -Filter "update*.log" -File -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $dest = Join-Path $LogDir $_.Name
+        if (-not (Test-Path $dest)) {
+            Move-Item -Path $_.FullName -Destination $dest -Force
+        } else {
+            $ts = Get-Date -Format "yyyy-MM-dd_HHmmss"
+            $newName = "${($_.BaseName)}-$ts$($_.Extension)"
+            Move-Item -Path $_.FullName -Destination (Join-Path $LogDir $newName) -Force
+        }
+    }
+
 # Resolve log file to absolute path now that $ScriptPath is known
 if (-not $PSBoundParameters.ContainsKey('LogFile')) {
-    $LogFile = Join-Path $ScriptPath "update.log"
+    $LogFile = Join-Path $LogDir "update.log"
+} else {
+    # if user provided a relative path, make it absolute relative to script path
+    if (-not ([System.IO.Path]::IsPathRooted($LogFile))) {
+        $LogFile = Join-Path $ScriptPath $LogFile
+    }
 }
 
 # Log rotation: rename existing log with timestamp, keep last 5 archives
@@ -453,6 +478,8 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
                 for ($i = 2; $i -lt $lines.Length; $i++) {
                     $line = $lines[$i]
                     if ($line.Trim().Length -gt 0) {
+                        # skip any line that indicates the package is pinned (last column)
+                        if ($line -match '\bPinned\b') { continue }
                         $packageId = $line.Substring($idColIndex, $versionColIndex - $idColIndex).Trim()
                         if (-not [string]::IsNullOrWhiteSpace($packageId)) {
                             $upgradablePackages += $packageId
@@ -475,7 +502,9 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
         Write-Status "Upgrading all packages..." -Type Action
         # No retry — winget returns non-zero if ANY package fails (e.g. Office).
         # Retrying would re-run ALL upgrades unnecessarily.
-        & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-pinned --include-unknown
+        # Pinned packages are excluded by default; we deliberately do not pass
+        # --include-pinned so user pins are preserved.
+        & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-unknown
         if ($LASTEXITCODE -ne 0) {
             Write-Status "Some packages may have failed, e.g. Office (exit code $LASTEXITCODE)" -Type Warning
             Write-Log "winget upgrade --all exited with code $LASTEXITCODE" -Level "WARN"
@@ -532,6 +561,15 @@ Update-Section "Miniconda and 'ocr-azure' environment" ($NoConda -or $OnlyWsl -o
     } else {
         Write-Status "conda update -n base failed after retries" -Type Error
         $failedItems["Conda"] += "conda update -n base (failed after retries)"
+    }
+
+    # After upgrading conda itself, update all packages in the base environment
+    Write-Status "Updating all packages in base environment..." -Type Action
+    if (Invoke-WithRetry -Action { & conda update -n base --all -y } -ActionName "conda update -n base --all") {
+        $updatedItems["Conda"] += "Conda packages (base)"
+    } else {
+        Write-Status "conda update -n base --all failed after retries" -Type Error
+        $failedItems["Conda"] += "conda update -n base --all (failed after retries)"
     }
 
     # Check if 'ocr-azure' environment exists

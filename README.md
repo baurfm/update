@@ -11,6 +11,7 @@ A comprehensive PowerShell script that automates the update process for multiple
 - **Comprehensive Coverage**: Updates 7 different development tool categories
 - **Selective Updates**: Skip specific sections using command-line parameters
 - **Error Handling**: Robust error handling with detailed reporting
+- **Centralized Logs**: Output and past logs are stored in a `logs/` subdirectory for easy review
 - **Progress Tracking**: Real-time progress updates and final summary
 - **Administrative Support**: Handles elevated privileges when needed, including the new Windows `sudo`.
 - **Cross-Platform Tools**: Supports both Windows-native and cross-platform tools
@@ -21,7 +22,7 @@ A comprehensive PowerShell script that automates the update process for multiple
 |----------|---------------|--------------|
 | **PowerShell** | All installed modules | `Update-Module` |
 | **Scoop** | Scoop itself + all packages | `scoop update` |
-| **Winget** | All Microsoft Store apps | `winget upgrade --all` |
+| **Winget** | All Microsoft Store apps (pinned packages are ignored) | `winget upgrade --all` |
 | **VS Code** | All installed extensions | `code --install-extension` |
 | **Conda** | Base environment + ocr-azure | `conda update` |
 | **npm** | All globally installed packages | `npm update -g` |
@@ -40,6 +41,9 @@ A comprehensive PowerShell script that automates the update process for multiple
 ## 📖 Usage
 
 ### Basic Usage
+
+> Logs are written to `logs/update.log` by default; you can override the path with `-LogFile`.
+
 
 ```powershell
 # Update all tools
@@ -114,6 +118,9 @@ The script provides:
 - **Color-coded output** for easy reading
 
 ### WSL Package Updates
+
+> **Logs** are now stored in a `logs/` subdirectory next to the script; the previous `update.log` text file is still written there by default and the last five archives are kept.
+
 
 The script now automatically updates packages within your default WSL distribution using `apt-get`. This requires `sudo` access. To allow the script to run `sudo` without a password prompt, you need to add a configuration file to your WSL instance.
 
@@ -260,6 +267,8 @@ To run the script from anywhere by simply typing `update` in PowerShell, add a f
 After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any directory.
 
 ## 📈 Version History
+
+- **v9.8** - Add: winget ignores pinned packages, conda base environment `--all` update, log files saved in dedicated `logs/` folder (retains last 5 archives)
 
 - **v9.7** - Cleanup (hashtable refactor, retry style), bugfix (npm exit code + JSON parsing), add (winget source update, scoop cleanup, npm self-update, log rotation, structured logging)
 - **v9.6** - Bug fixes (Conda regex, log path), skipped-sections in summary, PS version check, disk space warning
