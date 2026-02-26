@@ -261,6 +261,29 @@ function Invoke-WithRetry {
     return $false
 }
 
+# Helper: non-elevated pre-check — returns $true if winget reports any non-pinned upgradable
+# packages. On any parse error or winget failure, returns $true (safe default: assume updates).
+function Test-WingetHasUpdates {
+    $output = & winget upgrade --include-unknown 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $output) { return $true }
+
+    $lines  = $output -split [System.Environment]::NewLine
+    $header = $lines[0]
+    $idCol  = $header.IndexOf('Id')
+    $verCol = $header.IndexOf('Version')
+    if ($idCol -lt 0 -or $verCol -le $idCol) { return $true }   # can't parse → assume updates
+
+    for ($i = 2; $i -lt $lines.Length; $i++) {
+        $line = $lines[$i]
+        if ($line.Trim().Length -eq 0 -or $line -match '\bPinned\b') { continue }
+        if ($line.Length -le $idCol) { continue }
+        $pkg = $line.Substring($idCol, [Math]::Min($verCol - $idCol, $line.Length - $idCol)).Trim()
+        # Ignore summary lines like "2 upgrades available."
+        if ($pkg.Length -gt 0 -and $pkg -notmatch '^\d') { return $true }
+    }
+    return $false
+}
+
 # Helper: write a NOPASSWD sudoers entry for apt-get via wsl -u root, then verify sudo works.
 # Returns $true if passwordless sudo is confirmed after the operation.
 function Set-WslPasswordlessSudo {
@@ -304,9 +327,19 @@ if ($PSBoundParameters.Count -gt 0) {
 $ErrorActionPreference = 'Continue'
 
 # --- Administrator Elevation Check ---
-# If Winget or WSL updates are planned, the script needs to run as an administrator.
-# This block checks for the necessary permissions and re-launches the script with elevation if required.
-if (-not $NoWinget -or -not $NoWsl -or $OnlyWsl -or $OnlyWslPackages) {
+# Winget upgrade --all and wsl --update both require admin. For winget, we first do a
+# non-elevated pre-check so we skip the UAC/sudo prompt entirely when nothing needs updating.
+$wslNeedsElevation    = -not $NoWsl -or $OnlyWsl -or $OnlyWslPackages
+$wingetNeedsElevation = $false
+if (-not $NoWinget -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+    Write-Status "Pre-checking winget for available updates..." -Type Action
+    $wingetNeedsElevation = Test-WingetHasUpdates
+    if (-not $wingetNeedsElevation) {
+        Write-Status "Winget: all packages up-to-date — no elevation needed for winget" -Type Success
+    }
+}
+
+if ($wingetNeedsElevation -or $wslNeedsElevation) {
     $myWindowsID = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $myWindowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal($myWindowsID)
     $adminRole = [System.Security.Principal.WindowsBuiltInRole]::Administrator
@@ -620,6 +653,11 @@ Update-Section "Miniconda and 'ocr-azure' environment" ($NoConda -or $OnlyWsl -o
             $failedItems["Conda"] += "conda env list (Exit Code: $LASTEXITCODE)"
         }
     }
+
+    # Ensure base environment activates automatically in new shells so tools
+    # installed there (e.g. pipx) are available on PATH without manual activation.
+    Write-Status "Ensuring auto_activate_base is enabled..." -Type Action
+    & conda config --set auto_activate_base true
 }
 
 # --- Update TeX Live ---
@@ -723,10 +761,20 @@ Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $O
 }
 
 # --- Update pipx packages ---
-Update-Section "pipx packages" ($NoPipx -or $OnlyWsl -or $OnlyWslPackages) { Get-Command pipx -ErrorAction SilentlyContinue } {
+Update-Section "pipx packages" ($NoPipx -or $OnlyWsl -or $OnlyWslPackages) {
+    # pipx may live in conda base even when auto_activate_base is off; accept either
+    (Get-Command pipx -ErrorAction SilentlyContinue) -or (Get-Command conda -ErrorAction SilentlyContinue)
+} {
     Write-Status "Upgrading all pipx packages..." -Type Action
     Write-Log "Upgrading pipx packages."
-    if (Invoke-WithRetry -Action { & pipx upgrade-all } -ActionName "pipx upgrade-all") {
+    # Prefer direct pipx; fall back to conda run -n base if pipx is only in conda base
+    $pipxAction = if (Get-Command pipx -ErrorAction SilentlyContinue) {
+        { & pipx upgrade-all }
+    } else {
+        Write-Status "pipx not on PATH — running via conda base" -Type Info
+        { & conda run -n base pipx upgrade-all }
+    }
+    if (Invoke-WithRetry -Action $pipxAction -ActionName "pipx upgrade-all") {
         $updatedItems["pipx"] += "All pipx packages"
     } else {
         Write-Status "pipx upgrade-all failed after retries" -Type Error
