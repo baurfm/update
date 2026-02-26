@@ -267,44 +267,59 @@ function Test-WingetHasUpdates {
     $output = & winget upgrade --include-unknown 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $output) { return $true }
 
-    $lines  = $output -split [System.Environment]::NewLine
-    $header = $lines[0]
+    $lines = $output -split [System.Environment]::NewLine
+
+    # Winget sometimes emits a progress line before the table header; find the real
+    # header by locating the first line that contains both 'Id' and 'Version' columns.
+    $header = $lines | Where-Object { $_ -match '\bId\b' -and $_ -match '\bVersion\b' } |
+                       Select-Object -First 1
+    if (-not $header) { return $true }   # can't find header → assume updates
+
     $idCol  = $header.IndexOf('Id')
     $verCol = $header.IndexOf('Version')
-    if ($idCol -lt 0 -or $verCol -le $idCol) { return $true }   # can't parse → assume updates
+    if ($idCol -lt 0 -or $verCol -le $idCol) { return $true }
 
-    for ($i = 2; $i -lt $lines.Length; $i++) {
+    $headerIdx = [Array]::IndexOf($lines, $header)
+    for ($i = $headerIdx + 2; $i -lt $lines.Length; $i++) {
         $line = $lines[$i]
-        if ($line.Trim().Length -eq 0 -or $line -match '\bPinned\b') { continue }
-        if ($line.Length -le $idCol) { continue }
+        if ($line.Trim().Length -eq 0)      { continue }   # blank
+        if ($line -match '\bPinned\b')       { continue }   # user-pinned — skip
+        if ($line -match '^\s*-+\s*$')       { continue }   # separator row
+        if ($line.Length -le $idCol)         { continue }
         $pkg = $line.Substring($idCol, [Math]::Min($verCol - $idCol, $line.Length - $idCol)).Trim()
-        # Ignore summary lines like "2 upgrades available."
+        # Skip summary lines like "2 upgrades available."
         if ($pkg.Length -gt 0 -and $pkg -notmatch '^\d') { return $true }
     }
     return $false
 }
 
 # Helper: non-elevated WSL version check — returns $true if a newer WSL kernel is available
-# on GitHub. Safe default: $true on any error so wsl --update is never silently skipped.
+# on GitHub. Returns $false (skip elevation) on network errors rather than prompting blindly.
 function Test-WslHasUpdates {
     $verOutput = & wsl --version 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $verOutput) { return $true }
+    if ($LASTEXITCODE -ne 0 -or -not $verOutput) { return $false }
 
     $currentLine = $verOutput | Where-Object { $_ -match '^\s*WSL version:' } | Select-Object -First 1
-    if (-not $currentLine) { return $true }
+    if (-not $currentLine) { return $false }
     $current = ($currentLine -replace '.*:\s*', '').Trim()    # e.g. "2.3.26.0"
 
     try {
         $rel    = Invoke-RestMethod 'https://api.github.com/repos/microsoft/WSL/releases/latest' `
-                      -TimeoutSec 8 -ErrorAction Stop
+                      -TimeoutSec 5 -ErrorAction Stop
         $latest = $rel.tag_name -replace '^v', ''             # e.g. "2.3.26"
-        if (-not $latest) { return $true }
+        if (-not $latest) { return $false }
         # Normalise to Major.Minor.Patch (drop 4th segment if present)
         $cur3 = ($current -split '\.' | Select-Object -First 3) -join '.'
         $lat3 = ($latest  -split '\.' | Select-Object -First 3) -join '.'
-        return $cur3 -ne $lat3
+        if ($cur3 -ne $lat3) {
+            Write-Status "WSL update available: $cur3 → $lat3" -Type Info
+            return $true
+        }
+        Write-Status "WSL kernel current: $cur3" -Type Success
+        return $false
     } catch {
-        return $true    # network error → assume update available
+        Write-Status "WSL version check failed (offline?) — skipping WSL elevation" -Type Warning
+        return $false
     }
 }
 
