@@ -267,6 +267,9 @@ function Test-WingetHasUpdates {
     $output = & winget upgrade --include-unknown 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $output) { return $true }
 
+    # When nothing needs updating winget prints this message instead of a table.
+    if (($output -join "`n") -match 'No applicable upgrades were found') { return $false }
+
     $lines = $output -split [System.Environment]::NewLine
 
     # Winget sometimes emits a progress line before the table header; find the real
