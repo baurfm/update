@@ -284,6 +284,30 @@ function Test-WingetHasUpdates {
     return $false
 }
 
+# Helper: non-elevated WSL version check — returns $true if a newer WSL kernel is available
+# on GitHub. Safe default: $true on any error so wsl --update is never silently skipped.
+function Test-WslHasUpdates {
+    $verOutput = & wsl --version 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $verOutput) { return $true }
+
+    $currentLine = $verOutput | Where-Object { $_ -match '^\s*WSL version:' } | Select-Object -First 1
+    if (-not $currentLine) { return $true }
+    $current = ($currentLine -replace '.*:\s*', '').Trim()    # e.g. "2.3.26.0"
+
+    try {
+        $rel    = Invoke-RestMethod 'https://api.github.com/repos/microsoft/WSL/releases/latest' `
+                      -TimeoutSec 8 -ErrorAction Stop
+        $latest = $rel.tag_name -replace '^v', ''             # e.g. "2.3.26"
+        if (-not $latest) { return $true }
+        # Normalise to Major.Minor.Patch (drop 4th segment if present)
+        $cur3 = ($current -split '\.' | Select-Object -First 3) -join '.'
+        $lat3 = ($latest  -split '\.' | Select-Object -First 3) -join '.'
+        return $cur3 -ne $lat3
+    } catch {
+        return $true    # network error → assume update available
+    }
+}
+
 # Helper: write a NOPASSWD sudoers entry for apt-get via wsl -u root, then verify sudo works.
 # Returns $true if passwordless sudo is confirmed after the operation.
 function Set-WslPasswordlessSudo {
@@ -327,10 +351,8 @@ if ($PSBoundParameters.Count -gt 0) {
 $ErrorActionPreference = 'Continue'
 
 # --- Administrator Elevation Check ---
-# Only winget upgrade --all strictly requires admin. wsl --update also needs it, but we
-# handle that opportunistically: if already elevated (due to winget), the kernel update
-# runs; if not, it is skipped and only apt-get (which needs no Windows admin) runs.
-# This avoids a sudo prompt on every run when winget has nothing to update.
+# Both winget upgrade --all and wsl --update need admin. We pre-check each without
+# elevation so the UAC/sudo prompt is skipped entirely when nothing needs updating.
 $wingetNeedsElevation = $false
 if (-not $NoWinget -and (Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Status "Pre-checking winget for available updates..." -Type Action
@@ -340,13 +362,24 @@ if (-not $NoWinget -and (Get-Command winget -ErrorAction SilentlyContinue)) {
     }
 }
 
+$wslNeedsElevation = $false
+# Only wsl --update needs elevation; apt-get does not.
+# Skip when -NoWsl or -OnlyWslPackages is set (wsl --update won't run anyway).
+if (-not $NoWsl -and -not $OnlyWslPackages -and (Get-Command wsl -ErrorAction SilentlyContinue)) {
+    Write-Status "Pre-checking WSL for available kernel updates..." -Type Action
+    $wslNeedsElevation = Test-WslHasUpdates
+    if (-not $wslNeedsElevation) {
+        Write-Status "WSL kernel already up-to-date — no elevation needed for WSL" -Type Success
+    }
+}
+
 # Compute admin status once; used later by the WSL section to gate wsl --update.
 $myWindowsID        = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $myWindowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal($myWindowsID)
 $adminRole          = [System.Security.Principal.WindowsBuiltInRole]::Administrator
 $script:isAdmin     = $myWindowsPrincipal.IsInRole($adminRole)
 
-if ($wingetNeedsElevation) {
+if ($wingetNeedsElevation -or $wslNeedsElevation) {
     if (-not $script:isAdmin) {
         # Build argument array from bound parameters
         $argArray = @()
