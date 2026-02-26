@@ -635,11 +635,48 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
         $updatedItems["WSL"] += "Updated packages in default WSL distro"
     } else {
         Write-Status "Passwordless sudo not configured" -Type Error
-        Write-Host ""
-        Write-Host "  To fix: run 'wsl', then 'sudo visudo' and add:" -ForegroundColor DarkYellow
-        Write-Host "  your_username ALL=(ALL) NOPASSWD: /usr/bin/apt-get" -ForegroundColor DarkYellow
-        Write-Host ""
-        $failedItems["WSL"] += "Package update failed (sudo configuration needed)"
+        # offer to automatically configure passwordless apt-get
+        Write-Host "";
+        Write-Host "The script can attempt to set up passwordless sudo for apt-get" -ForegroundColor DarkYellow
+        Write-Host "in your WSL distro by adding an entry to /etc/sudoers.d." -ForegroundColor DarkYellow
+        $prompt = Read-Host "Would you like to proceed? [Y/n]"
+        if ($prompt -match '^[Yy]') {
+            # determine linux username
+            $linuxUser = & wsl.exe whoami 2>$null | ForEach-Object { $_.Trim() }
+            if ($linuxUser) {
+                Write-Status "Configuring sudoers for user $linuxUser" -Type Action
+                # create a sudoers.d file with the necessary rule
+                $cmd = "echo '$linuxUser ALL=(ALL) NOPASSWD: /usr/bin/apt-get' > /etc/sudoers.d/update-apt-get && chmod 0440 /etc/sudoers.d/update-apt-get"
+                & wsl.exe sudo sh -c $cmd
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Status "Passwordless sudo configured successfully" -Type Success
+                    Write-Status "Rerunning package updates..." -Type Action
+                    & wsl.exe sudo apt-get update
+                    & wsl.exe sudo apt-get upgrade -y
+                    if ($LASTEXITCODE -eq 0) {
+                        $updatedItems["WSL"] += "Updated packages in default WSL distro (post-config)"
+                        ;# clear any previous failure for this item
+                        $failedItems["WSL"] = $failedItems["WSL"] | Where-Object { $_ -notmatch 'sudo' }
+                    } else {
+                        Write-Status "Package update failed even after configuring sudo" -Type Error
+                        $failedItems["WSL"] += "Package update failed after sudo configuration"
+                    }
+                } else {
+                    Write-Status "Failed to write sudoers file" -Type Error
+                    $failedItems["WSL"] += "sudoers configuration failed"
+                }
+            } else {
+                Write-Status "Could not determine WSL username" -Type Error
+                $failedItems["WSL"] += "Unable to configure sudo (username unknown)"
+            }
+        } else {
+            Write-Status "Skipped automatic sudo configuration" -Type Skip
+            Write-Host ""
+            Write-Host "  To fix manually: run 'wsl', then 'sudo visudo' and add:" -ForegroundColor DarkYellow
+            Write-Host "  your_username ALL=(ALL) NOPASSWD: /usr/bin/apt-get" -ForegroundColor DarkYellow
+            Write-Host ""
+            $failedItems["WSL"] += "Package update failed (sudo configuration needed)"
+        }
     }
 }
 

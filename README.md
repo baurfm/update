@@ -121,6 +121,8 @@ The script provides:
 
 > **Logs** are now stored in a `logs/` subdirectory next to the script; the previous `update.log` text file is still written there by default and the last five archives are kept.
 
+If passwordless `sudo` is not configured for `apt-get`, the script will offer to add the necessary entry to `/etc/sudoers.d` automatically. You can still decline and configure it manually as shown below.
+
 
 The script now automatically updates packages within your default WSL distribution using `apt-get`. This requires `sudo` access. To allow the script to run `sudo` without a password prompt, you need to add a configuration file to your WSL instance.
 
