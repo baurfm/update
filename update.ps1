@@ -287,11 +287,14 @@ function Test-WingetHasUpdates {
     # header by locating the first line that contains both 'Id' and 'Version' columns.
     $header = $lines | Where-Object { $_ -match '\bId\b' -and $_ -match '\bVersion\b' } |
                        Select-Object -First 1
-    if (-not $header) { return $true }   # can't find header → assume updates
+    # No table → winget showed nothing upgradeable. The common case is "all upgradeable
+    # packages are pinned" which prints a pins message with no table. No table = no action.
+    if (-not $header) { return $false }
 
     $idCol  = $header.IndexOf('Id')
     $verCol = $header.IndexOf('Version')
-    if ($idCol -lt 0 -or $verCol -le $idCol) { return $true }
+    # Malformed header = can't parse = treat as no updates (avoid false elevation)
+    if ($idCol -lt 0 -or $verCol -le $idCol) { return $false }
 
     $headerIdx = [Array]::IndexOf($lines, $header)
     for ($i = $headerIdx + 2; $i -lt $lines.Length; $i++) {
