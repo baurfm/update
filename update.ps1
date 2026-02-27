@@ -268,9 +268,14 @@ function Invoke-WithRetry {
 # Helper: non-elevated pre-check — returns $true if winget reports any non-pinned upgradable
 # packages. On any parse error or winget failure, returns $true (safe default: assume updates).
 function Test-WingetHasUpdates {
-    $output = & winget upgrade --include-unknown 2>$null
+    # Refresh sources first — stale cache can show phantom updates that disappear after refresh.
+    & winget source update 2>$null | Out-Null
+
+    # Omit --include-unknown: "unknown-version" packages appear upgradeable but winget upgrade
+    # --all cannot actually install them ("No installed package found matching input criteria").
     # NOTE: winget exits non-zero (0x8A150014) when there are NO updates — do NOT gate on
     # $LASTEXITCODE here. We rely entirely on the output text and table content.
+    $output = & winget upgrade 2>$null
     if (-not $output) { return $false }
 
     # When nothing needs updating winget prints this message with no table.
@@ -339,7 +344,9 @@ function Set-WslPasswordlessSudo {
     $cmd = "echo '$LinuxUser ALL=(ALL) NOPASSWD: /usr/bin/apt-get' > /etc/sudoers.d/update-apt-get && chmod 0440 /etc/sudoers.d/update-apt-get"
     & wsl.exe -u root sh -c $cmd | Out-Null
     if ($LASTEXITCODE -ne 0) { return $false }
-    & wsl.exe sudo -n true 2>$null | Out-Null
+    # Verify by running the exact allowed command — sudo -n true would fail because
+    # the sudoers rule only covers /usr/bin/apt-get, not /usr/bin/true.
+    & wsl.exe sudo -n apt-get --version 2>$null | Out-Null
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -762,7 +769,9 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
     }
 
     Write-Status "Updating packages in default WSL distro..." -Type Action
-    & wsl.exe sudo -n true 2>$null
+    # Use the exact allowed command for the passwordless-sudo check (not 'true',
+    # which isn't in the sudoers rule and would always require a password).
+    & wsl.exe sudo -n apt-get --version 2>$null | Out-Null
     $sudoOk = ($LASTEXITCODE -eq 0)
 
     if (-not $sudoOk) {
@@ -836,6 +845,9 @@ Update-Section "pipx packages" ($NoPipx -or $OnlyWsl -or $OnlyWslPackages) {
 } {
     Write-Status "Upgrading all pipx packages..." -Type Action
     Write-Log "Upgrading pipx packages."
+    # Force Python UTF-8 mode so pipx can print emoji in its output without crashing
+    # on Windows consoles with cp1252 or other narrow code pages.
+    $env:PYTHONUTF8 = '1'
     # Prefer direct pipx; fall back to conda run -n base if pipx is only in conda base
     $pipxAction = if (Get-Command pipx -ErrorAction SilentlyContinue) {
         { & pipx upgrade-all }
