@@ -305,10 +305,7 @@ function Test-WingetHasUpdates {
         if ($line.Length -le $idCol)         { continue }
         $pkg = $line.Substring($idCol, [Math]::Min($verCol - $idCol, $line.Length - $idCol)).Trim()
         # Skip summary lines like "2 upgrades available."
-        if ($pkg.Length -gt 0 -and $pkg -notmatch '^\d') {
-            Write-Status "Winget: update found for '$pkg' — elevation required" -Type Info
-            return $true
-        }
+        if ($pkg.Length -gt 0 -and $pkg -notmatch '^\d') { return $true }
     }
     return $false
 }
