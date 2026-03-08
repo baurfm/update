@@ -424,7 +424,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.6"
+$_version = "v10.7"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -496,53 +496,59 @@ $ErrorActionPreference = 'Continue'
 # --- Administrator Elevation Check ---
 # winget upgrade --all, wsl --update, and npm install -g all need admin when npm's
 # global prefix is in a protected directory. Pre-check each so UAC is skipped when nothing needs updating.
+# -Sudo bypasses all pre-checks and forces immediate elevation.
 $wingetNeedsElevation = $false
-if (-not $NoWinget -and (Get-Command winget -ErrorAction SilentlyContinue)) {
-    Write-Status "Pre-checking winget for available updates..." -Type Action
-    $wingetNeedsElevation = Test-WingetHasUpdates
-    if (-not $wingetNeedsElevation) {
-        Write-Status "Winget: all packages up-to-date — no elevation needed" -Type Success
+$wslNeedsElevation    = $false
+$npmNeedsElevation    = $false
+
+if ($Sudo) {
+    Write-Status "Sudo flag set — skipping pre-checks, will elevate immediately" -Type Info
+} else {
+    if (-not $NoWinget -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Status "Pre-checking winget for available updates..." -Type Action
+        $wingetNeedsElevation = Test-WingetHasUpdates
+        if (-not $wingetNeedsElevation) {
+            Write-Status "Winget: all packages up-to-date — no elevation needed" -Type Success
+        }
     }
-}
 
-$wslNeedsElevation = $false
-# Only wsl --update needs elevation; apt-get does not.
-# Skip when -NoWsl or -OnlyWslPackages is set (wsl --update won't run anyway).
-if (-not $NoWsl -and -not $OnlyWslPackages -and (Get-Command wsl -ErrorAction SilentlyContinue)) {
-    Write-Status "Pre-checking WSL for available kernel updates..." -Type Action
-    $wslNeedsElevation = Test-WslHasUpdates
-    if (-not $wslNeedsElevation) {
-        Write-Status "WSL kernel already up-to-date — no elevation needed for WSL" -Type Success
+    # Only wsl --update needs elevation; apt-get does not.
+    # Skip when -NoWsl or -OnlyWslPackages is set (wsl --update won't run anyway).
+    if (-not $NoWsl -and -not $OnlyWslPackages -and (Get-Command wsl -ErrorAction SilentlyContinue)) {
+        Write-Status "Pre-checking WSL for available kernel updates..." -Type Action
+        $wslNeedsElevation = Test-WslHasUpdates
+        if (-not $wslNeedsElevation) {
+            Write-Status "WSL kernel already up-to-date — no elevation needed for WSL" -Type Success
+        }
     }
-}
 
-$npmNeedsElevation = $false
-if (-not $NoNpm -and -not $OnlyWsl -and -not $OnlyWslPackages -and (Get-Command npm -ErrorAction SilentlyContinue)) {
-    Write-Status "Pre-checking npm for available updates..." -Type Action
-    $npmPrefix = (& npm config get prefix 2>&1).Trim()
-    $npmWriteTest = Join-Path $npmPrefix ".write-test-$([System.Guid]::NewGuid().ToString('N'))"
-    $npmPrefixWritable = $false
-    try {
-        [System.IO.File]::WriteAllText($npmWriteTest, '')
-        Remove-Item $npmWriteTest -ErrorAction SilentlyContinue
-        $npmPrefixWritable = $true
-    } catch { }
+    if (-not $NoNpm -and -not $OnlyWsl -and -not $OnlyWslPackages -and (Get-Command npm -ErrorAction SilentlyContinue)) {
+        Write-Status "Pre-checking npm for available updates..." -Type Action
+        $npmPrefix = (& npm config get prefix 2>&1).Trim()
+        $npmWriteTest = Join-Path $npmPrefix ".write-test-$([System.Guid]::NewGuid().ToString('N'))"
+        $npmPrefixWritable = $false
+        try {
+            [System.IO.File]::WriteAllText($npmWriteTest, '')
+            Remove-Item $npmWriteTest -ErrorAction SilentlyContinue
+            $npmPrefixWritable = $true
+        } catch { }
 
-    if ($npmPrefixWritable) {
-        Write-Status "npm: prefix writable — no elevation needed" -Type Success
-    } else {
-        # Prefix is protected — only elevate if there are actual updates to install.
-        # npm outdated -g --json exits 1 when outdated, 0 when current; always emits JSON (empty {} = no updates).
-        $npmOutdatedJson = & npm outdated -g --json 2>&1
-        $npmOutdatedParsed = $npmOutdatedJson | ConvertFrom-Json -ErrorAction SilentlyContinue
-        # An empty {} parses to a non-null PSCustomObject with no properties — that means no updates.
-        $npmHasUpdates = $null -ne $npmOutdatedParsed -and
-            ($npmOutdatedParsed | Get-Member -MemberType NoteProperty -ErrorAction SilentlyContinue).Count -gt 0
-        if ($npmHasUpdates) {
-            $npmNeedsElevation = $true
-            Write-Status "npm: updates available + prefix '$npmPrefix' requires elevation" -Type Warning
+        if ($npmPrefixWritable) {
+            Write-Status "npm: prefix writable — no elevation needed" -Type Success
         } else {
-            Write-Status "npm: all packages up-to-date — no elevation needed" -Type Success
+            # Prefix is protected — only elevate if there are actual updates to install.
+            # npm outdated -g --json exits 1 when outdated, 0 when current; always emits JSON (empty {} = no updates).
+            $npmOutdatedJson = & npm outdated -g --json 2>&1
+            $npmOutdatedParsed = $npmOutdatedJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+            # An empty {} parses to a non-null PSCustomObject with no properties — that means no updates.
+            $npmHasUpdates = $null -ne $npmOutdatedParsed -and
+                ($npmOutdatedParsed | Get-Member -MemberType NoteProperty -ErrorAction SilentlyContinue).Count -gt 0
+            if ($npmHasUpdates) {
+                $npmNeedsElevation = $true
+                Write-Status "npm: updates available + prefix '$npmPrefix' requires elevation" -Type Warning
+            } else {
+                Write-Status "npm: all packages up-to-date — no elevation needed" -Type Success
+            }
         }
     }
 }
