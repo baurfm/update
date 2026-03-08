@@ -24,7 +24,7 @@ A comprehensive PowerShell script that automates the update process for multiple
 | **Scoop** | Scoop itself + all packages | `scoop update` |
 | **Winget** | All Microsoft Store apps (pinned packages are ignored) | `winget upgrade --all` |
 | **VS Code** | All installed extensions | `code --install-extension` |
-| **Conda** | Base environment + ocr-azure | `conda update` |
+| **Conda** | Base environment + all named environments | `conda update` |
 | **npm** | All globally installed packages | `npm update -g` |
 | **TeX Live** | All TeX packages | `tlmgr update --self --all` |
 | **WSL** | WSL kernel + distro packages | `wsl --update`, `apt-get full-upgrade` |
@@ -35,6 +35,7 @@ A comprehensive PowerShell script that automates the update process for multiple
 | **Google Cloud SDK** | All gcloud components | `gcloud components update --quiet` |
 | **GitHub CLI Extensions** | All gh extensions | `gh extension upgrade --all` |
 | **.NET Global Tools** | All dotnet global tools | `dotnet tool update -g` |
+| **Android SDK** | All installed SDK components | `sdkmanager --update` |
 
 ## 🛠️ Installation
 
@@ -96,6 +97,7 @@ Get-Help .\update.ps1 -Full
 | `-NoGCloud` | - | Skip updating Google Cloud SDK components |
 | `-NoGhExt` | - | Skip updating GitHub CLI extensions |
 | `-NoDotnet` | - | Skip updating .NET global tools |
+| `-NoAndroid` | - | Skip updating Android SDK components |
 
 ## 📋 Prerequisites
 
@@ -284,6 +286,9 @@ After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any di
 
 ## 📈 Version History
 
+- **v10.5** - Add: GitHub self-update check at startup (`-NoSelfUpdate` to skip); PS modules now skips already-current modules via batch `Find-Module` pre-check; npm detects non-writable prefix (EPERM) and skips gracefully instead of retrying 3×
+- **v10.4** - Add: Android SDK via `sdkmanager --update` with `-NoAndroid`; Conda now updates all named environments dynamically (was hardcoded to `ocr-azure`)
+- **v10.3** - Perf: VS Code extensions now updated in parallel on PS7+ (`ForEach-Object -Parallel`, ThrottleLimit 6); sequential fallback for PS5
 - **v10.2** - Add: Google Cloud SDK components (`gcloud components update`), GitHub CLI extensions (`gh extension upgrade --all`), .NET global tools (`dotnet tool update -g`) with `-NoGCloud`/`-NoGhExt`/`-NoDotnet` flags
 - **v10.1** - Fix: TeX Live cross-release auto-upgrade (downloads `update-tlmgr-latest.exe` automatically), WSL `full-upgrade` for kept-back packages, conda `auto_activate` key (was deprecated `auto_activate_base`), PowerShell module false-success for in-use modules, npm packages only tracked after successful update; UI: box-drawing banner, colored section headers, per-type status colors, colored summary footer
 - **v10.0** - Add: pipx, Rust (rustup), Ruby Gems, Chocolatey update sections with `-NoPipx`/`-NoRust`/`-NoGem`/`-NoChoco` params; Fix: WSL circular sudo bug (use `wsl -u root` instead of `wsl sudo`), unconditional apt-get success tracking, re-verify sudo after auto-config; Refactor: WSL sudo logic into `Set-WslPasswordlessSudo` helper

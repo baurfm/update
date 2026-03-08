@@ -56,6 +56,17 @@
 .PARAMETER NoChoco
     A switch to skip updating Chocolatey packages.
 
+.PARAMETER NoAndroid
+    A switch to skip updating Android SDK components via sdkmanager.
+
+.PARAMETER NoSelfUpdate
+    A switch to skip the GitHub self-update check at startup.
+
+.PARAMETER Sudo
+    Re-launch the script as administrator immediately, bypassing the pre-checks that normally
+    trigger elevation. Useful when you know elevation is needed (e.g. after a long gap since
+    the last run) and want to skip the pre-check overhead.
+
 .PARAMETER OnlyWsl
     A switch to only update WSL and skip other sections.
 
@@ -101,7 +112,7 @@
 .NOTES
     Author: Your Name
     Date: 2025-01-20
-    Version: 10.2 (Add: Google Cloud SDK components, GitHub CLI extensions, .NET global tools update sections with -NoGCloud/-NoGhExt/-NoDotnet flags; previous 10.1: TeX Live cross-release auto-upgrade, WSL full-upgrade, conda auto_activate key, PS module subprocess retry, npm premature tracking fix, box-drawing UI)
+    Version: 10.5 (Add: GitHub self-update check at startup with -NoSelfUpdate; PS modules: skip modules already at latest version via Find-Module pre-check; npm: detect EPERM/non-writable prefix and skip gracefully; previous 10.4: Android SDK, dynamic conda envs)
 #>
 
 param(
@@ -124,6 +135,9 @@ param(
     [switch]$NoGCloud,
     [switch]$NoGhExt,
     [switch]$NoDotnet,
+    [switch]$NoAndroid,
+    [switch]$NoSelfUpdate,
+    [switch]$Sudo,          # Re-launch as administrator immediately, skipping pre-checks
     [switch]$OnlyWsl,
     [switch]$OnlyWslPackages,
 
@@ -410,7 +424,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.2"
+$_version = "v10.6"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -425,6 +439,35 @@ Write-Host (" " * [Math]::Max(0, $_bw - $_dateStr.Length)) -NoNewline
 Write-Host "$_bBar" -ForegroundColor DarkGray
 Write-Host $_bBot -ForegroundColor DarkGray
 Write-Host ""
+
+# --- Self-update via git pull ---
+if (-not $NoSelfUpdate) {
+    $scriptDir = Split-Path $PSCommandPath -Parent
+    if ((Get-Command git -ErrorAction SilentlyContinue) -and (Test-Path (Join-Path $scriptDir ".git"))) {
+        Write-Status "Checking for script updates (git pull)..." -Type Action
+        try {
+            $pullOut = & git -C $scriptDir pull 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Status "git pull failed: $($pullOut -join ' ')" -Type Warning
+            } elseif (($pullOut -join ' ') -match 'Already up[ -]to[ -]date') {
+                Write-Status "Script is up to date ($_version)" -Type Success
+            } else {
+                # Repo changed — check if the script file itself was updated
+                $newVerMatch = Select-String '^\$_version\s*=\s*"(v[\d.]+)"' $PSCommandPath
+                $newVer = if ($newVerMatch) { $newVerMatch.Matches[0].Groups[1].Value } else { $null }
+                if ($newVer -and $newVer -ne $_version) {
+                    Write-Status "Script updated: $_version → $newVer. Re-running..." -Type Success
+                    & $PSCommandPath @PSBoundParameters -NoSelfUpdate
+                    exit $LASTEXITCODE
+                } else {
+                    Write-Status "Repo updated (non-script files only)" -Type Info
+                }
+            }
+        } catch {
+            Write-Status "git pull failed: $($_.Exception.Message)" -Type Warning
+        }
+    }
+}
 
 # PowerShell version check (5.0+ required for Get-InstalledModule, Update-Module, etc.)
 if ($PSVersionTable.PSVersion.Major -lt 5) {
@@ -451,8 +494,8 @@ if ($PSBoundParameters.Count -gt 0) {
 $ErrorActionPreference = 'Continue'
 
 # --- Administrator Elevation Check ---
-# Both winget upgrade --all and wsl --update need admin. We pre-check each without
-# elevation so the UAC/sudo prompt is skipped entirely when nothing needs updating.
+# winget upgrade --all, wsl --update, and npm install -g all need admin when npm's
+# global prefix is in a protected directory. Pre-check each so UAC is skipped when nothing needs updating.
 $wingetNeedsElevation = $false
 if (-not $NoWinget -and (Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Status "Pre-checking winget for available updates..." -Type Action
@@ -473,13 +516,44 @@ if (-not $NoWsl -and -not $OnlyWslPackages -and (Get-Command wsl -ErrorAction Si
     }
 }
 
+$npmNeedsElevation = $false
+if (-not $NoNpm -and -not $OnlyWsl -and -not $OnlyWslPackages -and (Get-Command npm -ErrorAction SilentlyContinue)) {
+    Write-Status "Pre-checking npm for available updates..." -Type Action
+    $npmPrefix = (& npm config get prefix 2>&1).Trim()
+    $npmWriteTest = Join-Path $npmPrefix ".write-test-$([System.Guid]::NewGuid().ToString('N'))"
+    $npmPrefixWritable = $false
+    try {
+        [System.IO.File]::WriteAllText($npmWriteTest, '')
+        Remove-Item $npmWriteTest -ErrorAction SilentlyContinue
+        $npmPrefixWritable = $true
+    } catch { }
+
+    if ($npmPrefixWritable) {
+        Write-Status "npm: prefix writable — no elevation needed" -Type Success
+    } else {
+        # Prefix is protected — only elevate if there are actual updates to install.
+        # npm outdated -g --json exits 1 when outdated, 0 when current; always emits JSON (empty {} = no updates).
+        $npmOutdatedJson = & npm outdated -g --json 2>&1
+        $npmOutdatedParsed = $npmOutdatedJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+        # An empty {} parses to a non-null PSCustomObject with no properties — that means no updates.
+        $npmHasUpdates = $null -ne $npmOutdatedParsed -and
+            ($npmOutdatedParsed | Get-Member -MemberType NoteProperty -ErrorAction SilentlyContinue).Count -gt 0
+        if ($npmHasUpdates) {
+            $npmNeedsElevation = $true
+            Write-Status "npm: updates available + prefix '$npmPrefix' requires elevation" -Type Warning
+        } else {
+            Write-Status "npm: all packages up-to-date — no elevation needed" -Type Success
+        }
+    }
+}
+
 # Compute admin status once; used later by the WSL section to gate wsl --update.
 $myWindowsID        = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $myWindowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal($myWindowsID)
 $adminRole          = [System.Security.Principal.WindowsBuiltInRole]::Administrator
 $script:isAdmin     = $myWindowsPrincipal.IsInRole($adminRole)
 
-if ($wingetNeedsElevation -or $wslNeedsElevation) {
+if ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -or $npmNeedsElevation) {
     if (-not $script:isAdmin) {
         # Build argument array from bound parameters
         $argArray = @()
@@ -578,7 +652,7 @@ if ($Help) {
 
 
 # Initialize hashtables to store results for the final summary
-$sectionKeys = "PowerShell Modules", "Scoop", "Winget", "Google Cloud SDK", "VS Code Extensions", "GitHub CLI Extensions", "Conda", "TeX Live", "WSL", "npm", "pipx", ".NET Global Tools", "Rust", "Ruby Gems", "Chocolatey"
+$sectionKeys = "PowerShell Modules", "Scoop", "Winget", "Google Cloud SDK", "Android SDK", "VS Code Extensions", "GitHub CLI Extensions", "Conda", "TeX Live", "WSL", "npm", "pipx", ".NET Global Tools", "Rust", "Ruby Gems", "Chocolatey"
 $updatedItems = @{}
 $failedItems  = @{}
 foreach ($k in $sectionKeys) {
@@ -593,34 +667,49 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
     Write-Log "Retrieving installed modules."
     $installedModules = Get-InstalledModule
     Write-Status "Found $($installedModules.Count) modules to check" -Type Info
+
+    # Batch-check latest versions from PSGallery — skip modules already at latest
+    Write-Status "Checking PSGallery for available updates..." -Type Action
+    $latestInGallery = @{}
+    try {
+        Find-Module -Name ($installedModules.Name) -ErrorAction SilentlyContinue |
+            ForEach-Object { $latestInGallery[$_.Name] = $_.Version }
+    } catch {}
+    $modulesToUpdate = @($installedModules | Where-Object {
+        $latest = $latestInGallery[$_.Name]
+        $latest -and ([version]$latest -gt [version]$_.Version)
+    })
+    if ($modulesToUpdate.Count -eq 0) {
+        Write-Status "All $($installedModules.Count) modules already at latest version" -Type Success
+        return
+    }
+    Write-Status "$($modulesToUpdate.Count) of $($installedModules.Count) modules have updates available" -Type Info
+
+    # Update modules sequentially (Update-Module isn't parallel-safe on shared module store).
+    # When a module is detected as in-use, immediately launch a subprocess so it runs in
+    # parallel with any remaining sequential Update-Module calls.
+    $psExe   = (Get-Process -Id $PID).MainModule.FileName
+    $subprocs = [System.Collections.Generic.List[PSCustomObject]]::new()
     $progress = 0
-    foreach ($module in $installedModules) {
-        Write-Progress -Activity "Updating PowerShell Modules" -Status "Updating $($module.Name)" -PercentComplete (($progress / $installedModules.Count) * 100)
+    foreach ($module in $modulesToUpdate) {
+        Write-Progress -Activity "Updating PowerShell Modules" -Status "Updating $($module.Name)" -PercentComplete (($progress / $modulesToUpdate.Count) * 100)
         try {
             Write-Log "Updating module: $($module.Name)"
             $warnMsgs = @()
             Update-Module -Name $module.Name -Force -ErrorAction Stop -WarningVariable warnMsgs -WarningAction SilentlyContinue
             if ($warnMsgs | Where-Object { $_ -like "*currently in use*" }) {
-                # Module is loaded in this session — retry in a fresh subprocess that won't have it imported
-                Write-Status "In use: $($module.Name) — retrying in subprocess..." -Type Warning
+                Write-Status "In use: $($module.Name) — starting subprocess..." -Type Warning
                 Write-Log "Module $($module.Name) is in use — spawning subprocess." -Level "INFO"
-                $psExe     = (Get-Process -Id $PID).MainModule.FileName
                 $tmpScript = [System.IO.Path]::GetTempFileName() + ".ps1"
                 $safeName  = $module.Name -replace "'", "''"
                 Set-Content $tmpScript -Encoding UTF8 -Value "Update-Module -Name '$safeName' -Force -ErrorAction Stop"
-                $proc = Start-Process $psExe `
-                    -ArgumentList "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $tmpScript `
-                    -Wait -PassThru -WindowStyle Hidden
-                Remove-Item $tmpScript -ErrorAction SilentlyContinue
-                if ($proc.ExitCode -eq 0) {
-                    Write-Status "Updated via subprocess: $($module.Name)" -Type Success
-                    $updatedItems["PowerShell Modules"] += $module.Name
-                    Write-Log "Successfully updated module via subprocess: $($module.Name)"
-                } else {
-                    Write-Status "Subprocess update failed: $($module.Name) (exit $($proc.ExitCode))" -Type Warning
-                    Write-Log "Subprocess update failed for $($module.Name), exit $($proc.ExitCode)" -Level "INFO"
-                    $failedItems["PowerShell Modules"] += "$($module.Name) (subprocess failed)"
-                }
+                $subprocs.Add([PSCustomObject]@{
+                    Name      = $module.Name
+                    TmpScript = $tmpScript
+                    Process   = Start-Process $psExe `
+                        -ArgumentList "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $tmpScript `
+                        -PassThru -WindowStyle Hidden
+                })
             } else {
                 $updatedItems["PowerShell Modules"] += $module.Name
                 Write-Log "Successfully updated module: $($module.Name)"
@@ -633,6 +722,24 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
         $progress++
     }
     Write-Progress -Activity "Updating PowerShell Modules" -Completed
+
+    # Wait for any in-use subprocesses (already running since they were launched during the loop)
+    if ($subprocs.Count -gt 0) {
+        Write-Status "Waiting for $($subprocs.Count) in-use subprocess(es)..." -Type Action
+        foreach ($sp in $subprocs) {
+            $sp.Process.WaitForExit()
+            Remove-Item $sp.TmpScript -ErrorAction SilentlyContinue
+            if ($sp.Process.ExitCode -eq 0) {
+                Write-Status "Updated via subprocess: $($sp.Name)" -Type Success
+                $updatedItems["PowerShell Modules"] += $sp.Name
+                Write-Log "Successfully updated module via subprocess: $($sp.Name)"
+            } else {
+                Write-Status "Subprocess update failed: $($sp.Name) (exit $($sp.Process.ExitCode))" -Type Warning
+                Write-Log "Subprocess update failed for $($sp.Name), exit $($sp.Process.ExitCode)" -Level "INFO"
+                $failedItems["PowerShell Modules"] += "$($sp.Name) (subprocess failed)"
+            }
+        }
+    }
 }
 
 # --- Update Scoop ---
@@ -677,6 +784,10 @@ Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPacka
 
         Write-Status "Removing old package versions..." -Type Action
         & scoop cleanup *
+        if ($LASTEXITCODE -ne 0) {
+            Write-Status "scoop cleanup failed (exit $LASTEXITCODE)" -Type Warning
+            $failedItems["Scoop"] += "scoop cleanup (Exit Code: $LASTEXITCODE)"
+        }
     }
 }
 
@@ -723,6 +834,10 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
 
         Write-Status "Refreshing winget sources..." -Type Action
         & winget source update
+        if ($LASTEXITCODE -ne 0) {
+            Write-Status "winget source update failed (exit $LASTEXITCODE) — package list may be stale" -Type Warning
+            Write-Log "winget source update exited $LASTEXITCODE" -Level "WARN"
+        }
 
         Write-Status "Upgrading all packages..." -Type Action
         # No retry — winget returns non-zero if ANY package fails (e.g. Office).
@@ -749,6 +864,25 @@ Update-Section "Google Cloud SDK" ($NoGCloud -or $OnlyWsl -or $OnlyWslPackages) 
     }
 }
 
+# --- Update Android SDK Components ---
+Update-Section "Android SDK" ($NoAndroid -or $OnlyWsl -or $OnlyWslPackages) { Get-Command sdkmanager -ErrorAction SilentlyContinue } {
+    # sdkmanager requires Java — skip gracefully if JAVA_HOME isn't set and java isn't in PATH
+    if (-not (Get-Command java -ErrorAction SilentlyContinue) -and -not $env:JAVA_HOME) {
+        Write-Status "Java not found (JAVA_HOME not set, java not in PATH) — skipping" -Type Warning
+        $script:skippedSections += "Android SDK (Java not configured)"
+        return
+    }
+    Write-Status "Updating Android SDK components..." -Type Action
+    $sdkOut = & sdkmanager --update 2>&1
+    $sdkOut | ForEach-Object { Write-Log "  [sdkmanager] $_" -Level "DEBUG" }
+    if ($LASTEXITCODE -eq 0) {
+        $updatedItems["Android SDK"] += "All SDK components"
+    } else {
+        Write-Status "sdkmanager --update failed (exit $LASTEXITCODE)" -Type Error
+        $failedItems["Android SDK"] += "sdkmanager --update (Exit Code: $LASTEXITCODE)"
+    }
+}
+
 # --- Update Visual Studio Code Extensions ---
 Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $OnlyWslPackages) { Get-Command code -ErrorAction SilentlyContinue } {
     Write-Status "Listing installed extensions..." -Type Action
@@ -760,25 +894,41 @@ Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $Only
         $validExtensions = $installedExtensions | Where-Object {
             $_.Trim().Length -gt 0 -and $_ -match '^[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+$'
         }
-        Write-Status "Checking $($validExtensions.Count) extensions for updates..." -Type Info
         $actuallyUpdated = @()
-        $progress = 0
 
-        foreach ($extensionId in $validExtensions) {
-            $progress++
-            Write-Progress -Activity "Checking VS Code Extensions" -Status "$extensionId ($progress/$($validExtensions.Count))" -PercentComplete (($progress / $validExtensions.Count) * 100)
-            # The '--force' flag ensures that the extension is updated if it's already installed.
-            $updateOutput = & code --install-extension $extensionId --force 2>&1
+        if ($PSVersionTable.PSVersion.Major -ge 7) {
+            Write-Status "Updating $($validExtensions.Count) extensions (parallel, limit 6)..." -Type Info
+            $results = $validExtensions | ForEach-Object -Parallel {
+                $out = & code --install-extension $_ --force 2>&1
+                [PSCustomObject]@{ Id = $_; Output = ($out -join ' '); ExitCode = $LASTEXITCODE }
+            } -ThrottleLimit 6
 
-            if ($LASTEXITCODE -ne 0) {
-                Write-Status "Failed: $extensionId" -Type Error
-                $failedItems["VS Code Extensions"] += "$extensionId (Exit Code: $LASTEXITCODE)"
-            } elseif ($updateOutput -join ' ' -like '*successfully installed*') {
-                Write-Status "Updated: $extensionId" -Type Success
-                $actuallyUpdated += $extensionId
+            foreach ($r in $results) {
+                if ($r.ExitCode -ne 0) {
+                    Write-Status "Failed: $($r.Id)" -Type Error
+                    $failedItems["VS Code Extensions"] += "$($r.Id) (Exit Code: $($r.ExitCode))"
+                } elseif ($r.Output -like '*successfully installed*') {
+                    Write-Status "Updated: $($r.Id)" -Type Success
+                    $actuallyUpdated += $r.Id
+                }
             }
+        } else {
+            Write-Status "Checking $($validExtensions.Count) extensions for updates..." -Type Info
+            $progress = 0
+            foreach ($extensionId in $validExtensions) {
+                $progress++
+                Write-Progress -Activity "Checking VS Code Extensions" -Status "$extensionId ($progress/$($validExtensions.Count))" -PercentComplete (($progress / $validExtensions.Count) * 100)
+                $updateOutput = & code --install-extension $extensionId --force 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Status "Failed: $extensionId" -Type Error
+                    $failedItems["VS Code Extensions"] += "$extensionId (Exit Code: $LASTEXITCODE)"
+                } elseif ($updateOutput -join ' ' -like '*successfully installed*') {
+                    Write-Status "Updated: $extensionId" -Type Success
+                    $actuallyUpdated += $extensionId
+                }
+            }
+            Write-Progress -Activity "Checking VS Code Extensions" -Completed
         }
-        Write-Progress -Activity "Checking VS Code Extensions" -Completed
 
         if ($actuallyUpdated.Count -gt 0) {
             Write-Status "$($actuallyUpdated.Count) extensions updated" -Type Success
@@ -791,6 +941,12 @@ Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $Only
 
 # --- Update GitHub CLI Extensions ---
 Update-Section "GitHub CLI Extensions" ($NoGhExt -or $OnlyWsl -or $OnlyWslPackages) { Get-Command gh -ErrorAction SilentlyContinue } {
+    & gh auth status 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "gh not authenticated — run 'gh auth login' to enable extension updates" -Type Warning
+        $script:skippedSections += "GitHub CLI Extensions (not authenticated)"
+        return
+    }
     $extList = & gh extension list 2>&1
     if (-not $extList -or ($extList | Select-String "no extensions installed" -Quiet)) {
         Write-Status "No GitHub CLI extensions installed" -Type Info
@@ -806,7 +962,7 @@ Update-Section "GitHub CLI Extensions" ($NoGhExt -or $OnlyWsl -or $OnlyWslPackag
 }
 
 # --- Update Miniconda ---
-Update-Section "Miniconda and 'ocr-azure' environment" ($NoConda -or $OnlyWsl -or $OnlyWslPackages) { Get-Command conda -ErrorAction SilentlyContinue } {
+Update-Section "Miniconda and conda environments" ($NoConda -or $OnlyWsl -or $OnlyWslPackages) { Get-Command conda -ErrorAction SilentlyContinue } {
     Write-Status "Updating base environment..." -Type Action
     if (Invoke-WithRetry -Action { & conda update -n base -c defaults conda -y } -ActionName "conda update -n base") {
         $updatedItems["Conda"] += "Miniconda (base)"
@@ -824,20 +980,28 @@ Update-Section "Miniconda and 'ocr-azure' environment" ($NoConda -or $OnlyWsl -o
         $failedItems["Conda"] += "conda update -n base --all (failed after retries)"
     }
 
-    # Check if 'ocr-azure' environment exists
-    $condaEnvs = & conda env list
-    if ($LASTEXITCODE -eq 0 -and ($condaEnvs | Where-Object { $_ -match '(?:^|\s)ocr-azure(?:\s|$)' })) {
-        Write-Status "Updating 'ocr-azure' environment..." -Type Action
-        if (Invoke-WithRetry -Action { & conda update -n ocr-azure --all -y } -ActionName "conda update -n ocr-azure") {
-            $updatedItems["Conda"] += "Conda environment (ocr-azure)"
-        } else {
-            Write-Status "conda update -n ocr-azure failed after retries" -Type Error
-            $failedItems["Conda"] += "conda update -n ocr-azure (failed after retries)"
-        }
+    # Enumerate all non-base environments and update each
+    $condaEnvList = & conda env list 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "conda env list failed" -Type Error
+        $failedItems["Conda"] += "conda env list (Exit Code: $LASTEXITCODE)"
     } else {
-        Write-Status "'ocr-azure' environment not found" -Type Skip
-        if ($LASTEXITCODE -ne 0) {
-            $failedItems["Conda"] += "conda env list (Exit Code: $LASTEXITCODE)"
+        $nonBaseEnvs = $condaEnvList |
+            Where-Object { $_ -notmatch '^\s*#' -and $_ -match '^\S' -and $_ -notmatch '^base\s' } |
+            ForEach-Object { ($_ -split '\s+')[0] } |
+            Where-Object { $_ -and $_ -ne 'base' }
+        if ($nonBaseEnvs) {
+            foreach ($envName in $nonBaseEnvs) {
+                Write-Status "Updating '$envName' environment..." -Type Action
+                if (Invoke-WithRetry -Action { & conda update -n $envName --all -y } -ActionName "conda update -n $envName") {
+                    $updatedItems["Conda"] += "Conda environment ($envName)"
+                } else {
+                    Write-Status "conda update -n $envName failed after retries" -Type Error
+                    $failedItems["Conda"] += "conda update -n $envName (failed)"
+                }
+            }
+        } else {
+            Write-Status "No additional conda environments found" -Type Info
         }
     }
 
@@ -846,6 +1010,10 @@ Update-Section "Miniconda and 'ocr-azure' environment" ($NoConda -or $OnlyWsl -o
     # Note: auto_activate_base was renamed to auto_activate in recent conda versions.
     Write-Status "Ensuring auto_activate is enabled..." -Type Action
     & conda config --set auto_activate true
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "conda config --set auto_activate failed (exit $LASTEXITCODE)" -Type Warning
+        Write-Log "conda config --set auto_activate failed (exit $LASTEXITCODE)" -Level "WARN"
+    }
 }
 
 # --- Update TeX Live ---
@@ -944,7 +1112,7 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
             $failedItems["WSL"] += "Package update skipped (passwordless sudo not configured)"
         } else {
             Write-Status "Attempting automatic sudo configuration..." -Type Action
-            $linuxUser = & wsl.exe whoami 2>$null | ForEach-Object { $_.Trim() }
+            $linuxUser = (& wsl.exe whoami 2>$null | Select-Object -First 1).Trim()
             if (-not $linuxUser) {
                 Write-Status "Could not determine WSL username" -Type Error
                 $failedItems["WSL"] += "Unable to configure sudo (username unknown)"
@@ -962,13 +1130,23 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
         Write-Status "Running apt-get update and upgrade..." -Type Action
         Write-Log "Running apt-get update and upgrade."
         & wsl.exe sudo apt-get update
-        & wsl.exe sudo apt-get full-upgrade -y
-        if ($LASTEXITCODE -eq 0) {
-            $updatedItems["WSL"] += "Updated packages in default WSL distro"
-            & wsl.exe sudo apt-get autoremove -y | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Status "apt-get update failed (exit $LASTEXITCODE)" -Type Error
+            $failedItems["WSL"] += "apt-get update failed"
         } else {
-            Write-Status "apt-get full-upgrade failed" -Type Error
-            $failedItems["WSL"] += "apt-get full-upgrade failed"
+            & wsl.exe sudo apt-get full-upgrade -y
+            if ($LASTEXITCODE -eq 0) {
+                $updatedItems["WSL"] += "Updated packages in default WSL distro"
+                $autoremoveOut = & wsl.exe sudo apt-get autoremove -y 2>&1
+                $autoremoveOut | ForEach-Object { Write-Log "  [autoremove] $_" -Level "DEBUG" }
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Status "apt-get autoremove failed (exit $LASTEXITCODE)" -Type Warning
+                    Write-Log "apt-get autoremove exited $LASTEXITCODE" -Level "WARN"
+                }
+            } else {
+                Write-Status "apt-get full-upgrade failed (exit $LASTEXITCODE)" -Type Error
+                $failedItems["WSL"] += "apt-get full-upgrade failed"
+            }
         }
     }
 }
@@ -983,22 +1161,37 @@ Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $O
     try { $npmOutdated = $outdatedNpmJson | ConvertFrom-Json -ErrorAction Stop } catch {}
     $npmToUpdate = if ($npmOutdated) { @($npmOutdated.PSObject.Properties.Name) } else { @() }
 
-    if ($npmToUpdate.Count -gt 0) {
-        Write-Status "Found $($npmToUpdate.Count) outdated: $($npmToUpdate -join ', ')" -Type Info
-    } else {
+    if ($npmToUpdate.Count -eq 0) {
         Write-Status "All global packages up-to-date" -Type Success
+        return
+    }
+
+    Write-Status "Found $($npmToUpdate.Count) outdated: $($npmToUpdate -join ', ')" -Type Info
+
+    # Verify npm's global prefix is writable — EPERM (-4048) is non-retryable, skip early
+    $npmPrefix = (& npm config get prefix 2>&1).Trim()
+    $npmWriteTest = Join-Path $npmPrefix ".write-test-$([System.Guid]::NewGuid().ToString('N'))"
+    $npmWritable = $false
+    try {
+        [System.IO.File]::WriteAllText($npmWriteTest, '')
+        Remove-Item $npmWriteTest -ErrorAction SilentlyContinue
+        $npmWritable = $true
+    } catch { }
+    if (-not $npmWritable) {
+        Write-Status "npm prefix '$npmPrefix' is not writable — run as Administrator to update npm" -Type Warning
+        $script:skippedSections += "npm (prefix not writable, needs elevation)"
+        return
     }
 
     Write-Status "Updating npm itself..." -Type Action
     if (-not (Invoke-WithRetry -Action { & npm install -g npm } -ActionName "npm install -g npm")) {
         Write-Status "npm self-update failed" -Type Warning
+        $failedItems["npm"] += "npm install -g npm (failed after retries)"
     }
 
     Write-Status "Updating all global packages..." -Type Action
     if (Invoke-WithRetry -Action { & npm update -g } -ActionName "npm update -g") {
-        if ($npmToUpdate.Count -gt 0) {
-            $updatedItems["npm"] += $npmToUpdate
-        }
+        $updatedItems["npm"] += $npmToUpdate
     } else {
         Write-Status "npm update -g failed after retries" -Type Error
         $failedItems["npm"] += "npm update -g (failed after retries)"
@@ -1033,20 +1226,44 @@ Update-Section "pipx packages" ($NoPipx -or $OnlyWsl -or $OnlyWslPackages) {
 # --- Update .NET Global Tools ---
 Update-Section ".NET Global Tools" ($NoDotnet -or $OnlyWsl -or $OnlyWslPackages) { Get-Command dotnet -ErrorAction SilentlyContinue } {
     Write-Status "Listing installed .NET global tools..." -Type Action
-    $toolLines = & dotnet tool list -g 2>&1 | Select-Object -Skip 2 | Where-Object { $_ -match '\S' }
+    $toolListOut = & dotnet tool list -g 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "dotnet tool list failed (exit $LASTEXITCODE)" -Type Error
+        $failedItems[".NET Global Tools"] += "dotnet tool list (Exit Code: $LASTEXITCODE)"
+        return
+    }
+    $toolLines = $toolListOut | Select-Object -Skip 2 | Where-Object { $_ -match '\S' }
     if (-not $toolLines) {
         Write-Status "No .NET global tools installed" -Type Info
         return
     }
-    foreach ($line in $toolLines) {
-        $toolId = ($line -split '\s+')[0]
-        if ([string]::IsNullOrWhiteSpace($toolId)) { continue }
-        Write-Status "Updating: $toolId..." -Type Action
-        & dotnet tool update -g $toolId 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            $updatedItems[".NET Global Tools"] += $toolId
-        } else {
-            $failedItems[".NET Global Tools"] += $toolId
+    $toolIds = $toolLines | ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        Write-Status "Updating $($toolIds.Count) tool(s) in parallel..." -Type Action
+        $results = $toolIds | ForEach-Object -Parallel {
+            & dotnet tool update -g $_ 2>&1 | Out-Null
+            [PSCustomObject]@{ Id = $_; ExitCode = $LASTEXITCODE }
+        } -ThrottleLimit 4
+
+        foreach ($r in $results) {
+            if ($r.ExitCode -eq 0) {
+                Write-Status "Updated: $($r.Id)" -Type Success
+                $updatedItems[".NET Global Tools"] += $r.Id
+            } else {
+                Write-Status "Failed: $($r.Id)" -Type Error
+                $failedItems[".NET Global Tools"] += $r.Id
+            }
+        }
+    } else {
+        foreach ($toolId in $toolIds) {
+            Write-Status "Updating: $toolId..." -Type Action
+            & dotnet tool update -g $toolId 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $updatedItems[".NET Global Tools"] += $toolId
+            } else {
+                $failedItems[".NET Global Tools"] += $toolId
+            }
         }
     }
 }
