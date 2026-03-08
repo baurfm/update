@@ -101,7 +101,7 @@
 .NOTES
     Author: Your Name
     Date: 2025-01-20
-    Version: 10.0 (Add: pipx/rustup/gem/choco update sections, -NoPipx/-NoRust/-NoGem/-NoChoco params; Fix: WSL circular sudo bug (wsl -u root instead of wsl sudo), unconditional apt-get success tracking, re-verify sudo after auto-config; Refactor: WSL sudo logic into Set-WslPasswordlessSudo helper; previous 9.9: WSL sudo auto-config, -SkipWslSudoConfig; 9.8: winget pinned ignore, conda base --all, logs/ folder)
+    Version: 10.2 (Add: Google Cloud SDK components, GitHub CLI extensions, .NET global tools update sections with -NoGCloud/-NoGhExt/-NoDotnet flags; previous 10.1: TeX Live cross-release auto-upgrade, WSL full-upgrade, conda auto_activate key, PS module subprocess retry, npm premature tracking fix, box-drawing UI)
 #>
 
 param(
@@ -121,6 +121,9 @@ param(
     [switch]$NoRust,
     [switch]$NoGem,
     [switch]$NoChoco,
+    [switch]$NoGCloud,
+    [switch]$NoGhExt,
+    [switch]$NoDotnet,
     [switch]$OnlyWsl,
     [switch]$OnlyWslPackages,
 
@@ -133,6 +136,12 @@ param(
     [Parameter(HelpMessage = "Path to log file. Defaults to 'logs/update.log' under script directory.")]
     [string]$LogFile = "update.log"
 )
+
+# ── Configurable constants ─────────────────────────────────────────────────
+$script:TexLiveTimeoutSec  = 1800   # max seconds to wait for tlmgr (30 min)
+$script:TexLiveLogAgeMins  = 10     # minutes back to scan for TeX Live log files
+$script:DownloadTimeoutSec = 120    # seconds for Invoke-WebRequest calls
+# ───────────────────────────────────────────────────────────────────────────
 
 # Helper: format a TimeSpan as "4m 12s" / "38s" / "1h 2m"
 function Format-Elapsed {
@@ -148,7 +157,8 @@ function Write-SectionHeader {
     $line = ([char]0x2500).ToString() * 58   # ──────────
     Write-Host ""
     Write-Host "  $line" -ForegroundColor DarkGray
-    Write-Host "  $([char]0x25B6)  $Title" -ForegroundColor Cyan   # ▶  Title
+    Write-Host "  $([char]0x25B6)  " -NoNewline -ForegroundColor DarkCyan   # ▶
+    Write-Host $Title -ForegroundColor Cyan
     Write-Host "  $line" -ForegroundColor DarkGray
     Write-Host ""
 }
@@ -161,12 +171,15 @@ function Write-Status {
         [string]$Type = "Info"
     )
     switch ($Type) {
-        "Info"    { Write-Host "  $([char]0x00B7)  $Message" -ForegroundColor Gray }      # ·
+        "Info"    { Write-Host "  $([char]0x00B7)  $Message" -ForegroundColor DarkGray }  # ·
         "Success" { Write-Host "  $([char]0x2713)  $Message" -ForegroundColor Green }     # ✓
         "Warning" { Write-Host "  $([char]0x26A0)  $Message" -ForegroundColor Yellow }    # ⚠
         "Error"   { Write-Host "  $([char]0x2717)  $Message" -ForegroundColor Red }       # ✗
         "Skip"    { Write-Host "  $([char]0x25CB)  $Message" -ForegroundColor DarkGray }  # ○
-        "Action"  { Write-Host "  $([char]0x2192)  $Message" -ForegroundColor White }     # →
+        "Action"  {
+            Write-Host "  $([char]0x2192)  " -NoNewline -ForegroundColor DarkCyan         # →
+            Write-Host $Message -ForegroundColor White
+        }
     }
 }
 
@@ -207,15 +220,15 @@ function Update-Section {
         return
     }
 
-    Write-SectionHeader "Updating $SectionName"
-    Write-Log "Starting $SectionName updates."
-
     if (-not (& $ToolCheck)) {
         Write-Status "$SectionName not found on this system" -Type Skip
         Write-Log "$SectionName not found."
         $script:skippedSections += "$SectionName (not installed)"
         return
     }
+
+    Write-SectionHeader "Updating $SectionName"
+    Write-Log "Starting $SectionName updates."
 
     $sectionStart = Get-Date
     try {
@@ -353,15 +366,64 @@ function Set-WslPasswordlessSudo {
     return ($LASTEXITCODE -eq 0)
 }
 
+# Helper: find TeX Live log files modified recently and append them to our update log.
+# Called after any tlmgr or update-tlmgr-latest.exe operation for full diagnostics.
+function Write-TexLiveLog {
+    param([int]$AgeMinutes = $script:TexLiveLogAgeMins)
+    $logs = Get-ChildItem "C:\texlive\*\temp\*.log" -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-$AgeMinutes) } |
+            Sort-Object LastWriteTime -Descending
+    foreach ($log in $logs) {
+        Write-Log "--- TeX Live log: $($log.FullName) ---" -Level "INFO"
+        Get-Content $log.FullName -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Log "  $_" -Level "INFO" }
+    }
+}
+
+# Runs 'tlmgr update --self --all' in a background job with a 30-minute timeout.
+# Returns [PSCustomObject]@{ Lines=[string[]]; ExitCode=[int] }  (ExitCode -2 = timed out)
+function Invoke-TlMgrUpdate {
+    param([int]$TimeoutSeconds = $script:TexLiveTimeoutSec)
+    $envPath = $env:PATH
+    $job = Start-Job -ScriptBlock {
+        $env:PATH = $using:envPath
+        $out = tlmgr update --self --all 2>&1
+        [PSCustomObject]@{ Lines = $out; ExitCode = $LASTEXITCODE }
+    }
+    $completed = $job | Wait-Job -Timeout $TimeoutSeconds
+    if ($null -eq $completed) {
+        $job | Stop-Job
+        $job | Remove-Job -Force
+        $mins = [Math]::Round($TimeoutSeconds / 60)
+        return [PSCustomObject]@{ Lines = @("TIMEOUT: tlmgr killed after $mins minutes"); ExitCode = -2 }
+    }
+    $result = $job | Receive-Job
+    $job | Remove-Job -Force
+    return $result
+}
+
 # Initialize logging and display startup banner
 $scriptStartTime = Get-Date
-$_banner_line = ([char]0x2500).ToString() * 36
+$_bw      = 40
+$_bTop    = "  $([char]0x256D)$(([char]0x2500).ToString() * $_bw)$([char]0x256E)"
+$_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)"
+$_bBar    = [char]0x2502
+$_gem     = [char]0x25C6
+$_title   = "  $_gem  Windows Update Script  "
+$_version = "v10.2"
+$_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
-Write-Host "  $_banner_line" -ForegroundColor DarkGray
-Write-Host "  $([char]0x25C6)  Windows Update Script  " -NoNewline -ForegroundColor DarkGray
-Write-Host "v10.0" -ForegroundColor Cyan
-Write-Host "  $([char]0x25C6)  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))" -ForegroundColor DarkGray
-Write-Host "  $_banner_line" -ForegroundColor DarkGray
+Write-Host $_bTop -ForegroundColor DarkGray
+Write-Host "  $_bBar" -NoNewline -ForegroundColor DarkGray
+Write-Host $_title -NoNewline -ForegroundColor DarkGray
+Write-Host $_version -NoNewline -ForegroundColor Cyan
+Write-Host (" " * [Math]::Max(0, $_bw - $_title.Length - $_version.Length)) -NoNewline
+Write-Host "$_bBar" -ForegroundColor DarkGray
+Write-Host "  $_bBar" -NoNewline -ForegroundColor DarkGray
+Write-Host $_dateStr -NoNewline -ForegroundColor DarkGray
+Write-Host (" " * [Math]::Max(0, $_bw - $_dateStr.Length)) -NoNewline
+Write-Host "$_bBar" -ForegroundColor DarkGray
+Write-Host $_bBot -ForegroundColor DarkGray
 Write-Host ""
 
 # PowerShell version check (5.0+ required for Get-InstalledModule, Update-Module, etc.)
@@ -516,7 +578,7 @@ if ($Help) {
 
 
 # Initialize hashtables to store results for the final summary
-$sectionKeys = "PowerShell Modules", "Scoop", "Winget", "VS Code Extensions", "Conda", "TeX Live", "WSL", "npm", "pipx", "Rust", "Ruby Gems", "Chocolatey"
+$sectionKeys = "PowerShell Modules", "Scoop", "Winget", "Google Cloud SDK", "VS Code Extensions", "GitHub CLI Extensions", "Conda", "TeX Live", "WSL", "npm", "pipx", ".NET Global Tools", "Rust", "Ruby Gems", "Chocolatey"
 $updatedItems = @{}
 $failedItems  = @{}
 foreach ($k in $sectionKeys) {
@@ -536,9 +598,33 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
         Write-Progress -Activity "Updating PowerShell Modules" -Status "Updating $($module.Name)" -PercentComplete (($progress / $installedModules.Count) * 100)
         try {
             Write-Log "Updating module: $($module.Name)"
-            Update-Module -Name $module.Name -Force -ErrorAction Stop
-            $updatedItems["PowerShell Modules"] += $module.Name
-            Write-Log "Successfully updated module: $($module.Name)"
+            $warnMsgs = @()
+            Update-Module -Name $module.Name -Force -ErrorAction Stop -WarningVariable warnMsgs -WarningAction SilentlyContinue
+            if ($warnMsgs | Where-Object { $_ -like "*currently in use*" }) {
+                # Module is loaded in this session — retry in a fresh subprocess that won't have it imported
+                Write-Status "In use: $($module.Name) — retrying in subprocess..." -Type Warning
+                Write-Log "Module $($module.Name) is in use — spawning subprocess." -Level "INFO"
+                $psExe     = (Get-Process -Id $PID).MainModule.FileName
+                $tmpScript = [System.IO.Path]::GetTempFileName() + ".ps1"
+                $safeName  = $module.Name -replace "'", "''"
+                Set-Content $tmpScript -Encoding UTF8 -Value "Update-Module -Name '$safeName' -Force -ErrorAction Stop"
+                $proc = Start-Process $psExe `
+                    -ArgumentList "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $tmpScript `
+                    -Wait -PassThru -WindowStyle Hidden
+                Remove-Item $tmpScript -ErrorAction SilentlyContinue
+                if ($proc.ExitCode -eq 0) {
+                    Write-Status "Updated via subprocess: $($module.Name)" -Type Success
+                    $updatedItems["PowerShell Modules"] += $module.Name
+                    Write-Log "Successfully updated module via subprocess: $($module.Name)"
+                } else {
+                    Write-Status "Subprocess update failed: $($module.Name) (exit $($proc.ExitCode))" -Type Warning
+                    Write-Log "Subprocess update failed for $($module.Name), exit $($proc.ExitCode)" -Level "INFO"
+                    $failedItems["PowerShell Modules"] += "$($module.Name) (subprocess failed)"
+                }
+            } else {
+                $updatedItems["PowerShell Modules"] += $module.Name
+                Write-Log "Successfully updated module: $($module.Name)"
+            }
         } catch {
             Write-Status "Failed: $($module.Name) - $_" -Type Error
             Write-Log "Failed to update module: $($module.Name). Error: $_" -Level "ERROR"
@@ -652,6 +738,17 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
 }
 
 
+# --- Update Google Cloud SDK ---
+Update-Section "Google Cloud SDK" ($NoGCloud -or $OnlyWsl -or $OnlyWslPackages) { Get-Command gcloud -ErrorAction SilentlyContinue } {
+    Write-Status "Updating gcloud components..." -Type Action
+    if (Invoke-WithRetry -Action { & gcloud components update --quiet 2>&1 | Out-Null } -ActionName "gcloud components update") {
+        $updatedItems["Google Cloud SDK"] += "All components"
+    } else {
+        Write-Status "gcloud components update failed" -Type Error
+        $failedItems["Google Cloud SDK"] += "gcloud components update failed"
+    }
+}
+
 # --- Update Visual Studio Code Extensions ---
 Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $OnlyWslPackages) { Get-Command code -ErrorAction SilentlyContinue } {
     Write-Status "Listing installed extensions..." -Type Action
@@ -689,6 +786,22 @@ Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $Only
         } else {
             Write-Status "All extensions already up-to-date" -Type Success
         }
+    }
+}
+
+# --- Update GitHub CLI Extensions ---
+Update-Section "GitHub CLI Extensions" ($NoGhExt -or $OnlyWsl -or $OnlyWslPackages) { Get-Command gh -ErrorAction SilentlyContinue } {
+    $extList = & gh extension list 2>&1
+    if (-not $extList -or ($extList | Select-String "no extensions installed" -Quiet)) {
+        Write-Status "No GitHub CLI extensions installed" -Type Info
+        return
+    }
+    Write-Status "Upgrading all GitHub CLI extensions..." -Type Action
+    if (Invoke-WithRetry -Action { & gh extension upgrade --all } -ActionName "gh extension upgrade --all") {
+        $updatedItems["GitHub CLI Extensions"] += "All extensions"
+    } else {
+        Write-Status "gh extension upgrade failed" -Type Error
+        $failedItems["GitHub CLI Extensions"] += "gh extension upgrade failed"
     }
 }
 
@@ -730,18 +843,65 @@ Update-Section "Miniconda and 'ocr-azure' environment" ($NoConda -or $OnlyWsl -o
 
     # Ensure base environment activates automatically in new shells so tools
     # installed there (e.g. pipx) are available on PATH without manual activation.
-    Write-Status "Ensuring auto_activate_base is enabled..." -Type Action
-    & conda config --set auto_activate_base true
+    # Note: auto_activate_base was renamed to auto_activate in recent conda versions.
+    Write-Status "Ensuring auto_activate is enabled..." -Type Action
+    & conda config --set auto_activate true
 }
 
 # --- Update TeX Live ---
 Update-Section "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Command tlmgr -ErrorAction SilentlyContinue } {
-    Write-Status "Updating tlmgr and all packages..." -Type Action
-    if (Invoke-WithRetry -Action { & tlmgr update --self --all } -ActionName "tlmgr update --self --all") {
+    Write-Status "Updating tlmgr and all packages (30 min timeout)..." -Type Action
+    # Run in a background job so we can enforce a timeout (tlmgr can hang indefinitely).
+    $tl1 = Invoke-TlMgrUpdate
+    $tl1.Lines | ForEach-Object { Write-Log "  [tlmgr] $_" -Level "DEBUG" }
+    Write-TexLiveLog
+    if ($tl1.ExitCode -eq -2) {
+        Write-Status "tlmgr timed out after 30 min — run tlmgr manually" -Type Error
+        $failedItems["TeX Live"] += "tlmgr update timed out (30 min limit)"
+    } elseif ($tl1.Lines | Select-String "Cross release" -Quiet) {
+        Write-Status "TeX Live cross-release: local version older than remote — attempting auto-upgrade..." -Type Warning
+        Write-Log "TeX Live cross-release detected — downloading update-tlmgr-latest.exe." -Level "INFO"
+        $updaterPath = "$env:TEMP\update-tlmgr-latest.exe"
+        try {
+            Invoke-WebRequest -Uri "https://mirror.ctan.org/systems/texlive/tlnet/update-tlmgr-latest.exe" `
+                -OutFile $updaterPath -UseBasicParsing -ErrorAction Stop -TimeoutSec $script:DownloadTimeoutSec
+            Write-Log "Downloaded update-tlmgr-latest.exe to $updaterPath." -Level "INFO"
+            Write-Status "Running update-tlmgr-latest.exe --update..." -Type Action
+            $updaterOutput = & $updaterPath --update 2>&1
+            $updaterOutput | ForEach-Object { Write-Log "  [updater] $_" -Level "DEBUG" }
+            Write-TexLiveLog
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "update-tlmgr-latest.exe succeeded. Retrying tlmgr update." -Level "INFO"
+                Write-Status "tlmgr upgraded — retrying full update (30 min timeout)..." -Type Action
+                $tl2 = Invoke-TlMgrUpdate
+                $tl2.Lines | ForEach-Object { Write-Log "  [tlmgr] $_" -Level "DEBUG" }
+                Write-TexLiveLog
+                if ($tl2.ExitCode -eq -2) {
+                    Write-Status "tlmgr timed out after 30 min on retry — run tlmgr manually" -Type Error
+                    $failedItems["TeX Live"] += "tlmgr update timed out on retry after cross-release upgrade"
+                } elseif ($tl2.ExitCode -eq 0) {
+                    Write-Log "tlmgr update succeeded after cross-release upgrade." -Level "INFO"
+                    $updatedItems["TeX Live"] += "All packages (cross-release upgrade)"
+                } else {
+                    Write-Log "tlmgr update failed after cross-release upgrade (exit $($tl2.ExitCode))." -Level "ERROR"
+                    Write-Status "tlmgr update failed after cross-release upgrade" -Type Error
+                    $failedItems["TeX Live"] += "tlmgr update failed after cross-release upgrade"
+                }
+            } else {
+                Write-Log "update-tlmgr-latest.exe failed (exit $LASTEXITCODE)." -Level "ERROR"
+                Write-Status "update-tlmgr-latest.exe failed (exit $LASTEXITCODE)" -Type Error
+                $failedItems["TeX Live"] += "update-tlmgr-latest.exe failed — run manually"
+            }
+        } catch {
+            Write-Log "Failed to download update-tlmgr-latest.exe: $_" -Level "ERROR"
+            Write-Status "Could not download updater: $_" -Type Error
+            $failedItems["TeX Live"] += "Cross-release: download failed — run update-tlmgr-latest.exe --update manually"
+        }
+    } elseif ($tl1.ExitCode -eq 0) {
         $updatedItems["TeX Live"] += "All packages"
     } else {
-        Write-Status "tlmgr update failed after retries (admin required?)" -Type Error
-        $failedItems["TeX Live"] += "tlmgr update (failed after retries)"
+        Write-Status "tlmgr update failed (admin required?)" -Type Error
+        $failedItems["TeX Live"] += "tlmgr update failed"
     }
 }
 
@@ -802,12 +962,13 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
         Write-Status "Running apt-get update and upgrade..." -Type Action
         Write-Log "Running apt-get update and upgrade."
         & wsl.exe sudo apt-get update
-        & wsl.exe sudo apt-get upgrade -y
+        & wsl.exe sudo apt-get full-upgrade -y
         if ($LASTEXITCODE -eq 0) {
             $updatedItems["WSL"] += "Updated packages in default WSL distro"
+            & wsl.exe sudo apt-get autoremove -y | Out-Null
         } else {
-            Write-Status "apt-get upgrade failed" -Type Error
-            $failedItems["WSL"] += "apt-get upgrade failed"
+            Write-Status "apt-get full-upgrade failed" -Type Error
+            $failedItems["WSL"] += "apt-get full-upgrade failed"
         }
     }
 }
@@ -824,7 +985,6 @@ Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $O
 
     if ($npmToUpdate.Count -gt 0) {
         Write-Status "Found $($npmToUpdate.Count) outdated: $($npmToUpdate -join ', ')" -Type Info
-        $updatedItems["npm"] += $npmToUpdate
     } else {
         Write-Status "All global packages up-to-date" -Type Success
     }
@@ -835,7 +995,11 @@ Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $O
     }
 
     Write-Status "Updating all global packages..." -Type Action
-    if (-not (Invoke-WithRetry -Action { & npm update -g } -ActionName "npm update -g")) {
+    if (Invoke-WithRetry -Action { & npm update -g } -ActionName "npm update -g") {
+        if ($npmToUpdate.Count -gt 0) {
+            $updatedItems["npm"] += $npmToUpdate
+        }
+    } else {
         Write-Status "npm update -g failed after retries" -Type Error
         $failedItems["npm"] += "npm update -g (failed after retries)"
     }
@@ -863,6 +1027,27 @@ Update-Section "pipx packages" ($NoPipx -or $OnlyWsl -or $OnlyWslPackages) {
     } else {
         Write-Status "pipx upgrade-all failed after retries" -Type Error
         $failedItems["pipx"] += "pipx upgrade-all (failed after retries)"
+    }
+}
+
+# --- Update .NET Global Tools ---
+Update-Section ".NET Global Tools" ($NoDotnet -or $OnlyWsl -or $OnlyWslPackages) { Get-Command dotnet -ErrorAction SilentlyContinue } {
+    Write-Status "Listing installed .NET global tools..." -Type Action
+    $toolLines = & dotnet tool list -g 2>&1 | Select-Object -Skip 2 | Where-Object { $_ -match '\S' }
+    if (-not $toolLines) {
+        Write-Status "No .NET global tools installed" -Type Info
+        return
+    }
+    foreach ($line in $toolLines) {
+        $toolId = ($line -split '\s+')[0]
+        if ([string]::IsNullOrWhiteSpace($toolId)) { continue }
+        Write-Status "Updating: $toolId..." -Type Action
+        & dotnet tool update -g $toolId 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $updatedItems[".NET Global Tools"] += $toolId
+        } else {
+            $failedItems[".NET Global Tools"] += $toolId
+        }
     }
 }
 
@@ -947,7 +1132,11 @@ if ($skippedSections.Count -gt 0) {
 }
 
 Write-Host ""
-Write-Host "  $([char]0x25C6)  Total time: $(Format-Elapsed $totalElapsed)" -ForegroundColor DarkGray
+if ($hasFailures) {
+    Write-Host "  $([char]0x2570)$([char]0x2500)  $([char]0x2717)  Completed with failures in $(Format-Elapsed $totalElapsed)  $([char]0x2500)$([char]0x256F)" -ForegroundColor Red
+} else {
+    Write-Host "  $([char]0x2570)$([char]0x2500)  $([char]0x2713)  All done in $(Format-Elapsed $totalElapsed)  $([char]0x2500)$([char]0x256F)" -ForegroundColor Green
+}
 Write-Host ""
 
 # Write structured summary to log

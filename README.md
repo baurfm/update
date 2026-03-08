@@ -27,11 +27,14 @@ A comprehensive PowerShell script that automates the update process for multiple
 | **Conda** | Base environment + ocr-azure | `conda update` |
 | **npm** | All globally installed packages | `npm update -g` |
 | **TeX Live** | All TeX packages | `tlmgr update --self --all` |
-| **WSL** | WSL kernel + distro packages | `wsl --update`, `apt-get upgrade` |
+| **WSL** | WSL kernel + distro packages | `wsl --update`, `apt-get full-upgrade` |
 | **pipx** | All pipx-installed apps | `pipx upgrade-all` |
 | **Rust** | Rust toolchain | `rustup update` |
 | **Ruby Gems** | RubyGems system + all gems | `gem update --system && gem update` |
 | **Chocolatey** | All Chocolatey packages | `choco upgrade all -y` |
+| **Google Cloud SDK** | All gcloud components | `gcloud components update --quiet` |
+| **GitHub CLI Extensions** | All gh extensions | `gh extension upgrade --all` |
+| **.NET Global Tools** | All dotnet global tools | `dotnet tool update -g` |
 
 ## 🛠️ Installation
 
@@ -90,6 +93,9 @@ Get-Help .\update.ps1 -Full
 | `-NoRust` | - | Skip updating Rust toolchain via rustup |
 | `-NoGem` | - | Skip updating Ruby Gems |
 | `-NoChoco` | - | Skip updating Chocolatey packages |
+| `-NoGCloud` | - | Skip updating Google Cloud SDK components |
+| `-NoGhExt` | - | Skip updating GitHub CLI extensions |
+| `-NoDotnet` | - | Skip updating .NET global tools |
 
 ## 📋 Prerequisites
 
@@ -278,6 +284,8 @@ After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any di
 
 ## 📈 Version History
 
+- **v10.2** - Add: Google Cloud SDK components (`gcloud components update`), GitHub CLI extensions (`gh extension upgrade --all`), .NET global tools (`dotnet tool update -g`) with `-NoGCloud`/`-NoGhExt`/`-NoDotnet` flags
+- **v10.1** - Fix: TeX Live cross-release auto-upgrade (downloads `update-tlmgr-latest.exe` automatically), WSL `full-upgrade` for kept-back packages, conda `auto_activate` key (was deprecated `auto_activate_base`), PowerShell module false-success for in-use modules, npm packages only tracked after successful update; UI: box-drawing banner, colored section headers, per-type status colors, colored summary footer
 - **v10.0** - Add: pipx, Rust (rustup), Ruby Gems, Chocolatey update sections with `-NoPipx`/`-NoRust`/`-NoGem`/`-NoChoco` params; Fix: WSL circular sudo bug (use `wsl -u root` instead of `wsl sudo`), unconditional apt-get success tracking, re-verify sudo after auto-config; Refactor: WSL sudo logic into `Set-WslPasswordlessSudo` helper
 - **v9.9** - Automatically configure passwordless sudo for WSL `apt-get` without prompting; new `-SkipWslSudoConfig` switch
 - **v9.8** - Add: winget ignores pinned packages, conda base environment `--all` update, log files saved in dedicated `logs/` folder (retains last 5 archives); fix inconsistent archive naming
