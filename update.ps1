@@ -175,23 +175,23 @@ function Format-Elapsed {
     return "$([int]$ts.TotalSeconds)s"
 }
 
-# Function to display a formatted section header
+# Function to display a formatted section header (secondary level — within a group)
 function Write-SectionHeader {
     param([string]$Title)
-    $line = ([char]0x2500).ToString() * 58   # ──────────
     Write-Host ""
-    Write-Host "  $line" -ForegroundColor DarkGray
     Write-Host "  $([char]0x25B6)  " -NoNewline -ForegroundColor DarkCyan   # ▶
     Write-Host $Title -ForegroundColor Cyan
-    Write-Host "  $line" -ForegroundColor DarkGray
     Write-Host ""
 }
 
-# Function to display a group header separating logical categories
+# Function to display a group header (primary level — separates logical categories)
 function Write-GroupHeader {
     param([string]$Title)
+    $line = ([char]0x2550).ToString() * 58   # ══════════ (double rule — visually heavier)
     Write-Host ""
-    Write-Host "  $([char]0x25AA) $Title" -ForegroundColor DarkYellow
+    Write-Host "  $line" -ForegroundColor DarkGray
+    Write-Host "  $([char]0x25AA) " -NoNewline -ForegroundColor DarkYellow   # ▪
+    Write-Host $Title -ForegroundColor Yellow
 }
 
 # Function to display a status message with a consistent prefix
@@ -245,14 +245,14 @@ function Update-Section {
     )
 
     if ($SkipCondition) {
-        Write-Status "Skipping $SectionName" -Type Skip
+        Write-Status "$SectionName — skipped" -Type Skip
         Write-Log "Skipping $SectionName updates."
         $script:skippedSections += $SectionName
         return
     }
 
     if (-not (& $ToolCheck)) {
-        Write-Status "$SectionName not found on this system" -Type Skip
+        Write-Status "$SectionName — not installed" -Type Skip
         Write-Log "$SectionName not found."
         $script:skippedSections += "$SectionName (not installed)"
         return
@@ -467,7 +467,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.14"
+$_version = "v10.16"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -652,7 +652,17 @@ if ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -or $npmNeedsElevatio
         } else {
             # Fallback to the traditional self-elevation method.
             Write-Host "Administrator privileges are required. Re-launching as administrator..." -ForegroundColor Yellow
-            $argStr = if ($argArray.Count -gt 0) { $argArray -join ' ' } else { '' }
+            # Build a properly-quoted string for the runas path (sudo path uses @argArray directly).
+            $argStrParts = @()
+            foreach ($key in $PSBoundParameters.Keys) {
+                $val = $PSBoundParameters[$key]
+                if ($val -is [switch]) {
+                    if ($val) { $argStrParts += "-$key" }
+                } else {
+                    $argStrParts += "-$key `"$val`""
+                }
+            }
+            $argStr = $argStrParts -join ' '
             $newProcess = New-Object System.Diagnostics.ProcessStartInfo $psExe
             $newProcess.Arguments = "-ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Definition)`" $argStr"
             $newProcess.Verb = "runas"
@@ -763,18 +773,22 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
 
         if ($wingetUpgradeOutput -and $wingetUpgradeOutput.Length -gt 2) {
             $lines = $wingetUpgradeOutput -split [System.Environment]::NewLine
-            # The first line is the header, which we can use to find column positions.
-            $headerLine = $lines[0]
-            $idColIndex = $headerLine.IndexOf('Id')
-            $versionColIndex = $headerLine.IndexOf('Version')
+            # Winget may emit progress lines before the table; find the real header.
+            # Same robust approach as Test-WingetHasUpdates.
+            $headerLine = $lines | Where-Object { $_ -match '\bId\b' -and $_ -match '\bVersion\b' } |
+                                   Select-Object -First 1
+            if ($headerLine) {
+                $idColIndex      = $headerLine.IndexOf('Id')
+                $versionColIndex = $headerLine.IndexOf('Version')
+                $headerIdx       = [Array]::IndexOf($lines, $headerLine)
 
-            if ($idColIndex -ge 0 -and $versionColIndex -gt $idColIndex) {
-                # Start processing from the third line (index 2) to skip header and separator.
-                for ($i = 2; $i -lt $lines.Length; $i++) {
-                    $line = $lines[$i]
-                    if ($line.Trim().Length -gt 0) {
-                        # skip any line that indicates the package is pinned (last column)
-                        if ($line -match '\bPinned\b') { continue }
+                if ($idColIndex -ge 0 -and $versionColIndex -gt $idColIndex) {
+                    for ($i = $headerIdx + 2; $i -lt $lines.Length; $i++) {
+                        $line = $lines[$i]
+                        if ($line.Trim().Length -eq 0)  { continue }
+                        if ($line -match '\bPinned\b')  { continue }
+                        if ($line -match '^\s*-+\s*$')  { continue }  # separator row
+                        if ($line.Length -le $versionColIndex) { continue }  # bounds guard
                         $packageId = $line.Substring($idColIndex, $versionColIndex - $idColIndex).Trim()
                         if (-not [string]::IsNullOrWhiteSpace($packageId)) {
                             $upgradablePackages += $packageId
@@ -866,7 +880,7 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
             Write-Log "Updating module: $($module.Name)"
             $warnMsgs = @()
             Update-Module -Name $module.Name -Force -ErrorAction Stop -WarningVariable warnMsgs -WarningAction SilentlyContinue
-            if ($warnMsgs | Where-Object { $_ -like "*currently in use*" }) {
+            if ($warnMsgs | Where-Object { $_.Message -like "*currently in use*" }) {
                 Write-Status "In use: $($module.Name) — starting subprocess..." -Type Warning
                 Write-Log "Module $($module.Name) is in use — spawning subprocess." -Level "INFO"
                 $tmpScript = [System.IO.Path]::GetTempFileName() + ".ps1"
@@ -944,7 +958,10 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
 
             Write-Status "Shutting down WSL to apply updates..." -Type Action
             Write-Log "Shutting down WSL."
-            Invoke-WithRetry -Action { & wsl --shutdown } -ActionName "wsl --shutdown" -MaxRetries 0 | Out-Null
+            $shutdownOk = Invoke-WithRetry -Action { & wsl --shutdown } -ActionName "wsl --shutdown" -MaxRetries 0
+            if (-not $shutdownOk) {
+                Write-Status "wsl --shutdown failed — package updates may not apply correctly" -Type Warning
+            }
         } else {
             Write-Status "WSL kernel update skipped (not running as admin)" -Type Skip
             Write-Log "Skipping WSL kernel update — not elevated."
@@ -1013,7 +1030,7 @@ Write-GroupHeader "JavaScript"
 # --- Update npm Packages ---
 Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command npm -ErrorAction SilentlyContinue } {
     Write-Status "Checking for outdated global packages..." -Type Action
-    $outdatedNpmJson = & npm outdated -g --json 2>&1
+    $outdatedNpmJson = & npm outdated -g --json 2>$null
     # npm outdated exits 1 when packages ARE outdated (by design) — not an error condition.
     # We parse JSON regardless of exit code.
     $npmOutdated = $null
@@ -1329,7 +1346,7 @@ Update-Section "Google Cloud SDK" ($NoGCloud -or $OnlyWsl -or $OnlyWslPackages) 
 Update-Section "Android SDK" ($NoAndroid -or $OnlyWsl -or $OnlyWslPackages) { Get-Command sdkmanager -ErrorAction SilentlyContinue } {
     # sdkmanager requires Java — skip gracefully if JAVA_HOME isn't set and java isn't in PATH
     if (-not (Get-Command java -ErrorAction SilentlyContinue) -and -not $env:JAVA_HOME) {
-        Write-Status "Java not found (JAVA_HOME not set, java not in PATH) — skipping" -Type Warning
+        Write-Status "Android SDK — Java not installed" -Type Skip
         $script:skippedSections += "Android SDK (Java not configured)"
         return
     }
@@ -1369,7 +1386,7 @@ Update-Section "Helm plugins" ($NoHelm -or $OnlyWsl -or $OnlyWslPackages) { Get-
 Update-Section "krew plugins" ($NoKrew -or $OnlyWsl -or $OnlyWslPackages) { Get-Command kubectl -ErrorAction SilentlyContinue } {
     & kubectl krew version 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Write-Status "krew not installed — skipping" -Type Skip
+        Write-Status "krew plugins — krew not installed" -Type Skip
         $script:skippedSections += "krew plugins (krew not installed)"
         return
     }
@@ -1522,7 +1539,7 @@ Update-Section "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Comma
             $failedItems["TeX Live"] += "Cross-release: download failed — run update-tlmgr-latest.exe --update manually"
         }
     } elseif ($tl1.ExitCode -eq 0) {
-        if ($tl1.Lines | Select-String "no updates available" -Quiet) {
+        if ($tl1.Lines | Select-String "no updates available" -Quiet -CaseSensitive:$false) {
             Write-Status "All packages already up-to-date" -Type Success
             Write-Log "TeX Live: no updates available." -Level "INFO"
         } else {
