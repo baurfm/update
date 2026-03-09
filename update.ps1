@@ -467,7 +467,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.13"
+$_version = "v10.14"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -1522,7 +1522,12 @@ Update-Section "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Comma
             $failedItems["TeX Live"] += "Cross-release: download failed — run update-tlmgr-latest.exe --update manually"
         }
     } elseif ($tl1.ExitCode -eq 0) {
-        $updatedItems["TeX Live"] += "All packages"
+        if ($tl1.Lines | Select-String "no updates available" -Quiet) {
+            Write-Status "All packages already up-to-date" -Type Success
+            Write-Log "TeX Live: no updates available." -Level "INFO"
+        } else {
+            $updatedItems["TeX Live"] += "All packages"
+        }
     } else {
         Write-Status "tlmgr update failed (admin required?)" -Type Error
         $failedItems["TeX Live"] += "tlmgr update failed"
