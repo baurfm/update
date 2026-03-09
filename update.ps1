@@ -187,6 +187,13 @@ function Write-SectionHeader {
     Write-Host ""
 }
 
+# Function to display a group header separating logical categories
+function Write-GroupHeader {
+    param([string]$Title)
+    Write-Host ""
+    Write-Host "  $([char]0x25AA) $Title" -ForegroundColor DarkYellow
+}
+
 # Function to display a status message with a consistent prefix
 function Write-Status {
     param(
@@ -460,7 +467,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.12"
+$_version = "v10.13"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -690,6 +697,7 @@ $skippedSections = @()
 # ══════════════════════════════════════════════════════
 # PACKAGE MANAGERS  (update foundations first)
 # ══════════════════════════════════════════════════════
+Write-GroupHeader "Package Managers"
 
 # --- Update Scoop ---
 Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPackages) { Get-Command scoop -ErrorAction SilentlyContinue } {
@@ -820,6 +828,7 @@ Update-Section "Chocolatey packages" ($NoChoco -or $OnlyWsl -or $OnlyWslPackages
 # ══════════════════════════════════════════════════════
 # SHELL / TERMINAL
 # ══════════════════════════════════════════════════════
+Write-GroupHeader "Shell / Terminal"
 
 # --- Update PowerShell Modules ---
 Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPackages) { $true } {
@@ -916,6 +925,7 @@ Update-Section "Oh My Posh" ($NoOhMyPosh -or $OnlyWsl -or $OnlyWslPackages) { Ge
 # ══════════════════════════════════════════════════════
 # SYSTEM
 # ══════════════════════════════════════════════════════
+Write-GroupHeader "System"
 
 # --- Update WSL ---
 Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !$OnlyWslPackages) { Get-Command wsl -ErrorAction SilentlyContinue } {
@@ -998,6 +1008,7 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
 # ══════════════════════════════════════════════════════
 # JAVASCRIPT ECOSYSTEM
 # ══════════════════════════════════════════════════════
+Write-GroupHeader "JavaScript"
 
 # --- Update npm Packages ---
 Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command npm -ErrorAction SilentlyContinue } {
@@ -1085,6 +1096,7 @@ Update-Section "Deno" ($NoDeno -or $OnlyWsl -or $OnlyWslPackages) { Get-Command 
 # ══════════════════════════════════════════════════════
 # PYTHON ECOSYSTEM
 # ══════════════════════════════════════════════════════
+Write-GroupHeader "Python"
 
 # --- Update Miniconda ---
 Update-Section "Miniconda and conda environments" ($NoConda -or $OnlyWsl -or $OnlyWslPackages) { Get-Command conda -ErrorAction SilentlyContinue } {
@@ -1211,6 +1223,7 @@ Update-Section "Rye" ($NoRye -or $OnlyWsl -or $OnlyWslPackages) { Get-Command ry
 # ══════════════════════════════════════════════════════
 # OTHER LANGUAGES
 # ══════════════════════════════════════════════════════
+Write-GroupHeader "Other Languages"
 
 # --- Update .NET Global Tools ---
 Update-Section ".NET Global Tools" ($NoDotnet -or $OnlyWsl -or $OnlyWslPackages) { Get-Command dotnet -ErrorAction SilentlyContinue } {
@@ -1299,6 +1312,7 @@ Update-Section "Composer" ($NoComposer -or $OnlyWsl -or $OnlyWslPackages) { Get-
 # ══════════════════════════════════════════════════════
 # CLOUD / DEVOPS
 # ══════════════════════════════════════════════════════
+Write-GroupHeader "Cloud / DevOps"
 
 # --- Update Google Cloud SDK ---
 Update-Section "Google Cloud SDK" ($NoGCloud -or $OnlyWsl -or $OnlyWslPackages) { Get-Command gcloud -ErrorAction SilentlyContinue } {
@@ -1371,6 +1385,7 @@ Update-Section "krew plugins" ($NoKrew -or $OnlyWsl -or $OnlyWslPackages) { Get-
 # ══════════════════════════════════════════════════════
 # DEV TOOLING
 # ══════════════════════════════════════════════════════
+Write-GroupHeader "Dev Tooling"
 
 # --- Update Visual Studio Code Extensions ---
 Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $OnlyWslPackages) { Get-Command code -ErrorAction SilentlyContinue } {
@@ -1455,6 +1470,7 @@ Update-Section "GitHub CLI Extensions" ($NoGhExt -or $OnlyWsl -or $OnlyWslPackag
 # ══════════════════════════════════════════════════════
 # TYPESETTING
 # ══════════════════════════════════════════════════════
+Write-GroupHeader "Typesetting"
 
 # --- Update TeX Live ---
 Update-Section "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Command tlmgr -ErrorAction SilentlyContinue } {
