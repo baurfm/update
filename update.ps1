@@ -460,7 +460,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.10"
+$_version = "v10.11"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -670,9 +670,15 @@ if ($Help) {
 
 
 # Initialize hashtables to store results for the final summary
-$sectionKeys = "PowerShell Modules", "Scoop", "Winget", "Google Cloud SDK", "Android SDK", "VS Code Extensions", "GitHub CLI Extensions", "Conda", "TeX Live", "WSL", "npm", "pipx", ".NET Global Tools",
-              "Oh My Posh", "uv", "pnpm", "Bun", "Deno", "Helm plugins", "Poetry", "Rye", "Composer", "krew plugins",
-              "Rust", "Ruby Gems", "Chocolatey"
+$sectionKeys = "Scoop", "Winget", "Chocolatey",
+              "PowerShell Modules", "Oh My Posh",
+              "WSL",
+              "npm", "pnpm", "Bun", "Deno",
+              "Conda", "pipx", "uv", "Poetry", "Rye",
+              ".NET Global Tools", "Rust", "Ruby Gems", "Composer",
+              "Google Cloud SDK", "Android SDK", "Helm plugins", "krew plugins",
+              "VS Code Extensions", "GitHub CLI Extensions",
+              "TeX Live"
 $updatedItems = @{}
 $failedItems  = @{}
 foreach ($k in $sectionKeys) {
@@ -681,86 +687,9 @@ foreach ($k in $sectionKeys) {
 }
 $skippedSections = @()
 
-# --- Update PowerShell Modules ---
-Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPackages) { $true } {
-    Write-Status "Retrieving installed modules..." -Type Action
-    Write-Log "Retrieving installed modules."
-    $installedModules = Get-InstalledModule
-    Write-Status "Found $($installedModules.Count) modules to check" -Type Info
-
-    # Batch-check latest versions from PSGallery — skip modules already at latest
-    Write-Status "Checking PSGallery for available updates..." -Type Action
-    $latestInGallery = @{}
-    try {
-        Find-Module -Name ($installedModules.Name) -ErrorAction SilentlyContinue |
-            ForEach-Object { $latestInGallery[$_.Name] = $_.Version }
-    } catch {}
-    $modulesToUpdate = @($installedModules | Where-Object {
-        $latest = $latestInGallery[$_.Name]
-        $latest -and ([version]$latest -gt [version]$_.Version)
-    })
-    if ($modulesToUpdate.Count -eq 0) {
-        Write-Status "All $($installedModules.Count) modules already at latest version" -Type Success
-        return
-    }
-    Write-Status "$($modulesToUpdate.Count) of $($installedModules.Count) modules have updates available" -Type Info
-
-    # Update modules sequentially (Update-Module isn't parallel-safe on shared module store).
-    # When a module is detected as in-use, immediately launch a subprocess so it runs in
-    # parallel with any remaining sequential Update-Module calls.
-    $psExe   = (Get-Process -Id $PID).MainModule.FileName
-    $subprocs = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $progress = 0
-    foreach ($module in $modulesToUpdate) {
-        Write-Progress -Activity "Updating PowerShell Modules" -Status "Updating $($module.Name)" -PercentComplete (($progress / $modulesToUpdate.Count) * 100)
-        try {
-            Write-Log "Updating module: $($module.Name)"
-            $warnMsgs = @()
-            Update-Module -Name $module.Name -Force -ErrorAction Stop -WarningVariable warnMsgs -WarningAction SilentlyContinue
-            if ($warnMsgs | Where-Object { $_ -like "*currently in use*" }) {
-                Write-Status "In use: $($module.Name) — starting subprocess..." -Type Warning
-                Write-Log "Module $($module.Name) is in use — spawning subprocess." -Level "INFO"
-                $tmpScript = [System.IO.Path]::GetTempFileName() + ".ps1"
-                $safeName  = $module.Name -replace "'", "''"
-                Set-Content $tmpScript -Encoding UTF8 -Value "Update-Module -Name '$safeName' -Force -ErrorAction Stop"
-                $subprocs.Add([PSCustomObject]@{
-                    Name      = $module.Name
-                    TmpScript = $tmpScript
-                    Process   = Start-Process $psExe `
-                        -ArgumentList "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $tmpScript `
-                        -PassThru -WindowStyle Hidden
-                })
-            } else {
-                $updatedItems["PowerShell Modules"] += $module.Name
-                Write-Log "Successfully updated module: $($module.Name)"
-            }
-        } catch {
-            Write-Status "Failed: $($module.Name) - $_" -Type Error
-            Write-Log "Failed to update module: $($module.Name). Error: $_" -Level "ERROR"
-            $failedItems["PowerShell Modules"] += "$($module.Name) - $($_.Exception.Message)"
-        }
-        $progress++
-    }
-    Write-Progress -Activity "Updating PowerShell Modules" -Completed
-
-    # Wait for any in-use subprocesses (already running since they were launched during the loop)
-    if ($subprocs.Count -gt 0) {
-        Write-Status "Waiting for $($subprocs.Count) in-use subprocess(es)..." -Type Action
-        foreach ($sp in $subprocs) {
-            $sp.Process.WaitForExit()
-            Remove-Item $sp.TmpScript -ErrorAction SilentlyContinue
-            if ($sp.Process.ExitCode -eq 0) {
-                Write-Status "Updated via subprocess: $($sp.Name)" -Type Success
-                $updatedItems["PowerShell Modules"] += $sp.Name
-                Write-Log "Successfully updated module via subprocess: $($sp.Name)"
-            } else {
-                Write-Status "Subprocess update failed: $($sp.Name) (exit $($sp.Process.ExitCode))" -Type Warning
-                Write-Log "Subprocess update failed for $($sp.Name), exit $($sp.Process.ExitCode)" -Level "INFO"
-                $failedItems["PowerShell Modules"] += "$($sp.Name) (subprocess failed)"
-            }
-        }
-    }
-}
+# ══════════════════════════════════════════════════════
+# PACKAGE MANAGERS  (update foundations first)
+# ══════════════════════════════════════════════════════
 
 # --- Update Scoop ---
 Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPackages) { Get-Command scoop -ErrorAction SilentlyContinue } {
@@ -876,6 +805,493 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
     }
 }
 
+# --- Update Chocolatey packages ---
+Update-Section "Chocolatey packages" ($NoChoco -or $OnlyWsl -or $OnlyWslPackages) { Get-Command choco -ErrorAction SilentlyContinue } {
+    Write-Status "Upgrading all Chocolatey packages..." -Type Action
+    Write-Log "Upgrading Chocolatey packages."
+    if (Invoke-WithRetry -Action { & choco upgrade all -y } -ActionName "choco upgrade all") {
+        $updatedItems["Chocolatey"] += "All Chocolatey packages"
+    } else {
+        Write-Status "choco upgrade failed after retries" -Type Error
+        $failedItems["Chocolatey"] += "choco upgrade all (failed after retries)"
+    }
+}
+
+# ══════════════════════════════════════════════════════
+# SHELL / TERMINAL
+# ══════════════════════════════════════════════════════
+
+# --- Update PowerShell Modules ---
+Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPackages) { $true } {
+    Write-Status "Retrieving installed modules..." -Type Action
+    Write-Log "Retrieving installed modules."
+    $installedModules = Get-InstalledModule
+    Write-Status "Found $($installedModules.Count) modules to check" -Type Info
+
+    # Batch-check latest versions from PSGallery — skip modules already at latest
+    Write-Status "Checking PSGallery for available updates..." -Type Action
+    $latestInGallery = @{}
+    try {
+        Find-Module -Name ($installedModules.Name) -ErrorAction SilentlyContinue |
+            ForEach-Object { $latestInGallery[$_.Name] = $_.Version }
+    } catch {}
+    $modulesToUpdate = @($installedModules | Where-Object {
+        $latest = $latestInGallery[$_.Name]
+        $latest -and ([version]$latest -gt [version]$_.Version)
+    })
+    if ($modulesToUpdate.Count -eq 0) {
+        Write-Status "All $($installedModules.Count) modules already at latest version" -Type Success
+        return
+    }
+    Write-Status "$($modulesToUpdate.Count) of $($installedModules.Count) modules have updates available" -Type Info
+
+    # Update modules sequentially (Update-Module isn't parallel-safe on shared module store).
+    # When a module is detected as in-use, immediately launch a subprocess so it runs in
+    # parallel with any remaining sequential Update-Module calls.
+    $psExe   = (Get-Process -Id $PID).MainModule.FileName
+    $subprocs = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $progress = 0
+    foreach ($module in $modulesToUpdate) {
+        Write-Progress -Activity "Updating PowerShell Modules" -Status "Updating $($module.Name)" -PercentComplete (($progress / $modulesToUpdate.Count) * 100)
+        try {
+            Write-Log "Updating module: $($module.Name)"
+            $warnMsgs = @()
+            Update-Module -Name $module.Name -Force -ErrorAction Stop -WarningVariable warnMsgs -WarningAction SilentlyContinue
+            if ($warnMsgs | Where-Object { $_ -like "*currently in use*" }) {
+                Write-Status "In use: $($module.Name) — starting subprocess..." -Type Warning
+                Write-Log "Module $($module.Name) is in use — spawning subprocess." -Level "INFO"
+                $tmpScript = [System.IO.Path]::GetTempFileName() + ".ps1"
+                $safeName  = $module.Name -replace "'", "''"
+                Set-Content $tmpScript -Encoding UTF8 -Value "Update-Module -Name '$safeName' -Force -ErrorAction Stop"
+                $subprocs.Add([PSCustomObject]@{
+                    Name      = $module.Name
+                    TmpScript = $tmpScript
+                    Process   = Start-Process $psExe `
+                        -ArgumentList "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $tmpScript `
+                        -PassThru -WindowStyle Hidden
+                })
+            } else {
+                $updatedItems["PowerShell Modules"] += $module.Name
+                Write-Log "Successfully updated module: $($module.Name)"
+            }
+        } catch {
+            Write-Status "Failed: $($module.Name) - $_" -Type Error
+            Write-Log "Failed to update module: $($module.Name). Error: $_" -Level "ERROR"
+            $failedItems["PowerShell Modules"] += "$($module.Name) - $($_.Exception.Message)"
+        }
+        $progress++
+    }
+    Write-Progress -Activity "Updating PowerShell Modules" -Completed
+
+    # Wait for any in-use subprocesses (already running since they were launched during the loop)
+    if ($subprocs.Count -gt 0) {
+        Write-Status "Waiting for $($subprocs.Count) in-use subprocess(es)..." -Type Action
+        foreach ($sp in $subprocs) {
+            $sp.Process.WaitForExit()
+            Remove-Item $sp.TmpScript -ErrorAction SilentlyContinue
+            if ($sp.Process.ExitCode -eq 0) {
+                Write-Status "Updated via subprocess: $($sp.Name)" -Type Success
+                $updatedItems["PowerShell Modules"] += $sp.Name
+                Write-Log "Successfully updated module via subprocess: $($sp.Name)"
+            } else {
+                Write-Status "Subprocess update failed: $($sp.Name) (exit $($sp.Process.ExitCode))" -Type Warning
+                Write-Log "Subprocess update failed for $($sp.Name), exit $($sp.Process.ExitCode)" -Level "INFO"
+                $failedItems["PowerShell Modules"] += "$($sp.Name) (subprocess failed)"
+            }
+        }
+    }
+}
+
+# --- Update Oh My Posh ---
+Update-Section "Oh My Posh" ($NoOhMyPosh -or $OnlyWsl -or $OnlyWslPackages) { Get-Command oh-my-posh -ErrorAction SilentlyContinue } {
+    Write-Status "Upgrading Oh My Posh..." -Type Action
+    if (Invoke-WithRetry -Action { & oh-my-posh upgrade 2>&1 | Out-Null } -ActionName "oh-my-posh upgrade") {
+        $updatedItems["Oh My Posh"] += "Oh My Posh"
+    } else {
+        Write-Status "oh-my-posh upgrade failed" -Type Error
+        $failedItems["Oh My Posh"] += "oh-my-posh upgrade (failed)"
+    }
+}
+
+# ══════════════════════════════════════════════════════
+# SYSTEM
+# ══════════════════════════════════════════════════════
+
+# --- Update WSL ---
+Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !$OnlyWslPackages) { Get-Command wsl -ErrorAction SilentlyContinue } {
+    Write-Log "Starting WSL updates."
+    # Since elevation is handled at the start, we can proceed directly.
+    if (-not $OnlyWslPackages) {
+        if ($script:isAdmin) {
+            Write-Status "Updating WSL kernel..." -Type Action
+            Write-Log "Updating WSL kernel."
+            if (Invoke-WithRetry -Action { & wsl --update --web-download } -ActionName "wsl --update" -MaxRetries 2) {
+                $updatedItems["WSL"] += "WSL Kernel"
+            } else {
+                Write-Status "wsl --update failed after retries" -Type Error
+                $failedItems["WSL"] += "wsl --update (failed after retries)"
+            }
+
+            Write-Status "Shutting down WSL to apply updates..." -Type Action
+            Write-Log "Shutting down WSL."
+            Invoke-WithRetry -Action { & wsl --shutdown } -ActionName "wsl --shutdown" -MaxRetries 0 | Out-Null
+        } else {
+            Write-Status "WSL kernel update skipped (not running as admin)" -Type Skip
+            Write-Log "Skipping WSL kernel update — not elevated."
+        }
+    } else {
+        Write-Log "Skipping WSL kernel update as requested."
+    }
+
+    Write-Status "Updating packages in default WSL distro..." -Type Action
+    # Use the exact allowed command for the passwordless-sudo check (not 'true',
+    # which isn't in the sudoers rule and would always require a password).
+    & wsl.exe sudo -n apt-get --version 2>$null | Out-Null
+    $sudoOk = ($LASTEXITCODE -eq 0)
+
+    if (-not $sudoOk) {
+        Write-Status "Passwordless sudo not configured" -Type Error
+        if ($SkipWslSudoConfig) {
+            Write-Status "Skipping automatic sudo configuration as requested" -Type Skip
+            $failedItems["WSL"] += "Package update skipped (passwordless sudo not configured)"
+        } else {
+            Write-Status "Attempting automatic sudo configuration..." -Type Action
+            $linuxUser = (& wsl.exe whoami 2>$null | Select-Object -First 1).Trim()
+            if (-not $linuxUser) {
+                Write-Status "Could not determine WSL username" -Type Error
+                $failedItems["WSL"] += "Unable to configure sudo (username unknown)"
+            } elseif (Set-WslPasswordlessSudo -LinuxUser $linuxUser) {
+                Write-Status "Passwordless sudo configured for $linuxUser" -Type Success
+                $sudoOk = $true
+            } else {
+                Write-Status "Failed to configure passwordless sudo" -Type Error
+                $failedItems["WSL"] += "sudoers configuration failed"
+            }
+        }
+    }
+
+    if ($sudoOk) {
+        Write-Status "Running apt-get update and upgrade..." -Type Action
+        Write-Log "Running apt-get update and upgrade."
+        & wsl.exe sudo apt-get update
+        if ($LASTEXITCODE -ne 0) {
+            Write-Status "apt-get update failed (exit $LASTEXITCODE)" -Type Error
+            $failedItems["WSL"] += "apt-get update failed"
+        } else {
+            & wsl.exe sudo apt-get full-upgrade -y
+            if ($LASTEXITCODE -eq 0) {
+                $updatedItems["WSL"] += "Updated packages in default WSL distro"
+                $autoremoveOut = & wsl.exe sudo apt-get autoremove -y 2>&1
+                $autoremoveOut | ForEach-Object { Write-Log "  [autoremove] $_" -Level "DEBUG" }
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Status "apt-get autoremove failed (exit $LASTEXITCODE)" -Type Warning
+                    Write-Log "apt-get autoremove exited $LASTEXITCODE" -Level "WARN"
+                }
+            } else {
+                Write-Status "apt-get full-upgrade failed (exit $LASTEXITCODE)" -Type Error
+                $failedItems["WSL"] += "apt-get full-upgrade failed"
+            }
+        }
+    }
+}
+
+# ══════════════════════════════════════════════════════
+# JAVASCRIPT ECOSYSTEM
+# ══════════════════════════════════════════════════════
+
+# --- Update npm Packages ---
+Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command npm -ErrorAction SilentlyContinue } {
+    Write-Status "Checking for outdated global packages..." -Type Action
+    $outdatedNpmJson = & npm outdated -g --json 2>&1
+    # npm outdated exits 1 when packages ARE outdated (by design) — not an error condition.
+    # We parse JSON regardless of exit code.
+    $npmOutdated = $null
+    try { $npmOutdated = $outdatedNpmJson | ConvertFrom-Json -ErrorAction Stop } catch {}
+    $npmToUpdate = if ($npmOutdated) { @($npmOutdated.PSObject.Properties.Name) } else { @() }
+
+    if ($npmToUpdate.Count -eq 0) {
+        Write-Status "All global packages up-to-date" -Type Success
+        Write-Log "npm: all global packages up-to-date." -Level "INFO"
+        return
+    }
+
+    Write-Status "Found $($npmToUpdate.Count) outdated: $($npmToUpdate -join ', ')" -Type Info
+    Write-Log "npm: $($npmToUpdate.Count) outdated: $($npmToUpdate -join ', ')" -Level "INFO"
+
+    # Verify npm's global prefix is writable — EPERM (-4048) is non-retryable, skip early
+    $npmPrefix = (& npm config get prefix 2>&1).Trim()
+    $npmWriteTest = Join-Path $npmPrefix ".write-test-$([System.Guid]::NewGuid().ToString('N'))"
+    $npmWritable = $false
+    try {
+        [System.IO.File]::WriteAllText($npmWriteTest, '')
+        Remove-Item $npmWriteTest -ErrorAction SilentlyContinue
+        $npmWritable = $true
+    } catch { }
+    if (-not $npmWritable) {
+        Write-Status "npm prefix '$npmPrefix' is not writable — run as Administrator to update npm" -Type Warning
+        Write-Log "npm: prefix '$npmPrefix' not writable — skipping updates." -Level "WARN"
+        $script:skippedSections += "npm (prefix not writable, needs elevation)"
+        return
+    }
+
+    Write-Status "Updating npm itself..." -Type Action
+    if (-not (Invoke-WithRetry -Action { & npm install -g npm } -ActionName "npm install -g npm")) {
+        Write-Status "npm self-update failed" -Type Warning
+        $failedItems["npm"] += "npm install -g npm (failed after retries)"
+    }
+
+    Write-Status "Updating all global packages..." -Type Action
+    if (Invoke-WithRetry -Action { & npm update -g } -ActionName "npm update -g") {
+        $updatedItems["npm"] += $npmToUpdate
+    } else {
+        Write-Status "npm update -g failed after retries" -Type Error
+        $failedItems["npm"] += "npm update -g (failed after retries)"
+    }
+}
+
+# --- Update pnpm ---
+Update-Section "pnpm" ($NoPnpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command pnpm -ErrorAction SilentlyContinue } {
+    Write-Status "Updating pnpm..." -Type Action
+    if (Invoke-WithRetry -Action { & pnpm self-update 2>&1 | Out-Null } -ActionName "pnpm self-update") {
+        $updatedItems["pnpm"] += "pnpm"
+    } else {
+        Write-Status "pnpm self-update failed" -Type Error
+        $failedItems["pnpm"] += "pnpm self-update (failed)"
+    }
+}
+
+# --- Update Bun ---
+Update-Section "Bun" ($NoBun -or $OnlyWsl -or $OnlyWslPackages) { Get-Command bun -ErrorAction SilentlyContinue } {
+    Write-Status "Upgrading Bun..." -Type Action
+    if (Invoke-WithRetry -Action { & bun upgrade 2>&1 | Out-Null } -ActionName "bun upgrade") {
+        $updatedItems["Bun"] += "Bun"
+    } else {
+        Write-Status "bun upgrade failed" -Type Error
+        $failedItems["Bun"] += "bun upgrade (failed)"
+    }
+}
+
+# --- Update Deno ---
+Update-Section "Deno" ($NoDeno -or $OnlyWsl -or $OnlyWslPackages) { Get-Command deno -ErrorAction SilentlyContinue } {
+    Write-Status "Upgrading Deno..." -Type Action
+    if (Invoke-WithRetry -Action { & deno upgrade 2>&1 | Out-Null } -ActionName "deno upgrade") {
+        $updatedItems["Deno"] += "Deno"
+    } else {
+        Write-Status "deno upgrade failed" -Type Error
+        $failedItems["Deno"] += "deno upgrade (failed)"
+    }
+}
+
+# ══════════════════════════════════════════════════════
+# PYTHON ECOSYSTEM
+# ══════════════════════════════════════════════════════
+
+# --- Update Miniconda ---
+Update-Section "Miniconda and conda environments" ($NoConda -or $OnlyWsl -or $OnlyWslPackages) { Get-Command conda -ErrorAction SilentlyContinue } {
+    Write-Status "Updating base environment..." -Type Action
+    if (Invoke-WithRetry -Action { & conda update -n base -c defaults conda -y } -ActionName "conda update -n base") {
+        $updatedItems["Conda"] += "Miniconda (base)"
+    } else {
+        Write-Status "conda update -n base failed after retries" -Type Error
+        $failedItems["Conda"] += "conda update -n base (failed after retries)"
+    }
+
+    # After upgrading conda itself, update all packages in the base environment
+    Write-Status "Updating all packages in base environment..." -Type Action
+    if (Invoke-WithRetry -Action { & conda update -n base --all -y } -ActionName "conda update -n base --all") {
+        $updatedItems["Conda"] += "Conda packages (base)"
+    } else {
+        Write-Status "conda update -n base --all failed after retries" -Type Error
+        $failedItems["Conda"] += "conda update -n base --all (failed after retries)"
+    }
+
+    # Enumerate all non-base environments and update each
+    # Note: conda prints its env list to both stdout and stderr; use 2>$null to avoid duplicates.
+    $condaEnvList = & conda env list 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "conda env list failed" -Type Error
+        $failedItems["Conda"] += "conda env list (Exit Code: $LASTEXITCODE)"
+    } else {
+        $nonBaseEnvs = $condaEnvList |
+            Where-Object { $_ -notmatch '^\s*#' -and $_ -match '^\S' -and $_ -notmatch '^base\s' } |
+            ForEach-Object { ($_ -split '\s+')[0] } |
+            Where-Object { $_ -and $_ -ne 'base' } |
+            Select-Object -Unique
+        if ($nonBaseEnvs) {
+            foreach ($envName in $nonBaseEnvs) {
+                Write-Status "Updating '$envName' environment..." -Type Action
+                if (Invoke-WithRetry -Action { & conda update -n $envName --all -y } -ActionName "conda update -n $envName") {
+                    $updatedItems["Conda"] += "Conda environment ($envName)"
+                } else {
+                    Write-Status "conda update -n $envName failed after retries" -Type Error
+                    $failedItems["Conda"] += "conda update -n $envName (failed)"
+                }
+            }
+        } else {
+            Write-Status "No additional conda environments found" -Type Info
+        }
+    }
+
+    # Ensure base environment activates automatically in new shells so tools
+    # installed there (e.g. pipx) are available on PATH without manual activation.
+    # Note: auto_activate_base was renamed to auto_activate in recent conda versions.
+    Write-Status "Ensuring auto_activate is enabled..." -Type Action
+    & conda config --set auto_activate true
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "conda config --set auto_activate failed (exit $LASTEXITCODE)" -Type Warning
+        Write-Log "conda config --set auto_activate failed (exit $LASTEXITCODE)" -Level "WARN"
+    }
+}
+
+# --- Update pipx packages ---
+Update-Section "pipx packages" ($NoPipx -or $OnlyWsl -or $OnlyWslPackages) {
+    # pipx may live in conda base even when auto_activate_base is off; accept either
+    (Get-Command pipx -ErrorAction SilentlyContinue) -or (Get-Command conda -ErrorAction SilentlyContinue)
+} {
+    Write-Status "Upgrading all pipx packages..." -Type Action
+    Write-Log "Upgrading pipx packages."
+    # Force Python UTF-8 mode so pipx can print emoji in its output without crashing
+    # on Windows consoles with cp1252 or other narrow code pages.
+    $env:PYTHONUTF8 = '1'
+    # Prefer direct pipx; fall back to conda run -n base if pipx is only in conda base
+    $pipxAction = if (Get-Command pipx -ErrorAction SilentlyContinue) {
+        { & pipx upgrade-all }
+    } else {
+        Write-Status "pipx not on PATH — running via conda base" -Type Info
+        { & conda run -n base pipx upgrade-all }
+    }
+    if (Invoke-WithRetry -Action $pipxAction -ActionName "pipx upgrade-all") {
+        $updatedItems["pipx"] += "All pipx packages"
+    } else {
+        Write-Status "pipx upgrade-all failed after retries" -Type Error
+        $failedItems["pipx"] += "pipx upgrade-all (failed after retries)"
+    }
+}
+
+# --- Update uv ---
+Update-Section "uv" ($NoUv -or $OnlyWsl -or $OnlyWslPackages) { Get-Command uv -ErrorAction SilentlyContinue } {
+    Write-Status "Updating uv..." -Type Action
+    if (Invoke-WithRetry -Action { & uv self update 2>&1 | Out-Null } -ActionName "uv self update") {
+        $updatedItems["uv"] += "uv"
+    } else {
+        Write-Status "uv self update failed" -Type Error
+        $failedItems["uv"] += "uv self update (failed)"
+    }
+}
+
+# --- Update Poetry ---
+Update-Section "Poetry" ($NoPoetry -or $OnlyWsl -or $OnlyWslPackages) { Get-Command poetry -ErrorAction SilentlyContinue } {
+    Write-Status "Updating Poetry..." -Type Action
+    if (Invoke-WithRetry -Action { & poetry self update 2>&1 | Out-Null } -ActionName "poetry self update") {
+        $updatedItems["Poetry"] += "Poetry"
+    } else {
+        Write-Status "poetry self update failed" -Type Error
+        $failedItems["Poetry"] += "poetry self update (failed)"
+    }
+}
+
+# --- Update Rye ---
+Update-Section "Rye" ($NoRye -or $OnlyWsl -or $OnlyWslPackages) { Get-Command rye -ErrorAction SilentlyContinue } {
+    Write-Status "Updating Rye..." -Type Action
+    if (Invoke-WithRetry -Action { & rye self update 2>&1 | Out-Null } -ActionName "rye self update") {
+        $updatedItems["Rye"] += "Rye"
+    } else {
+        Write-Status "rye self update failed" -Type Error
+        $failedItems["Rye"] += "rye self update (failed)"
+    }
+}
+
+# ══════════════════════════════════════════════════════
+# OTHER LANGUAGES
+# ══════════════════════════════════════════════════════
+
+# --- Update .NET Global Tools ---
+Update-Section ".NET Global Tools" ($NoDotnet -or $OnlyWsl -or $OnlyWslPackages) { Get-Command dotnet -ErrorAction SilentlyContinue } {
+    Write-Status "Listing installed .NET global tools..." -Type Action
+    $toolListOut = & dotnet tool list -g 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "dotnet tool list failed (exit $LASTEXITCODE)" -Type Error
+        $failedItems[".NET Global Tools"] += "dotnet tool list (Exit Code: $LASTEXITCODE)"
+        return
+    }
+    $toolLines = $toolListOut | Select-Object -Skip 2 | Where-Object { $_ -match '\S' }
+    if (-not $toolLines) {
+        Write-Status "No .NET global tools installed" -Type Info
+        return
+    }
+    $toolIds = $toolLines | ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        Write-Status "Updating $($toolIds.Count) tool(s) in parallel..." -Type Action
+        $results = $toolIds | ForEach-Object -Parallel {
+            & dotnet tool update -g $_ 2>&1 | Out-Null
+            [PSCustomObject]@{ Id = $_; ExitCode = $LASTEXITCODE }
+        } -ThrottleLimit 4
+
+        foreach ($r in $results) {
+            if ($r.ExitCode -eq 0) {
+                Write-Status "Updated: $($r.Id)" -Type Success
+                $updatedItems[".NET Global Tools"] += $r.Id
+            } else {
+                Write-Status "Failed: $($r.Id)" -Type Error
+                $failedItems[".NET Global Tools"] += $r.Id
+            }
+        }
+    } else {
+        foreach ($toolId in $toolIds) {
+            Write-Status "Updating: $toolId..." -Type Action
+            & dotnet tool update -g $toolId 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $updatedItems[".NET Global Tools"] += $toolId
+            } else {
+                $failedItems[".NET Global Tools"] += $toolId
+            }
+        }
+    }
+}
+
+# --- Update Rust toolchain ---
+Update-Section "Rust (rustup)" ($NoRust -or $OnlyWsl -or $OnlyWslPackages) { Get-Command rustup -ErrorAction SilentlyContinue } {
+    Write-Status "Updating Rust toolchain..." -Type Action
+    Write-Log "Updating Rust toolchain via rustup."
+    if (Invoke-WithRetry -Action { & rustup update } -ActionName "rustup update") {
+        $updatedItems["Rust"] += "Rust toolchain"
+    } else {
+        Write-Status "rustup update failed after retries" -Type Error
+        $failedItems["Rust"] += "rustup update (failed after retries)"
+    }
+}
+
+# --- Update Ruby Gems ---
+Update-Section "Ruby Gems" ($NoGem -or $OnlyWsl -or $OnlyWslPackages) { Get-Command gem -ErrorAction SilentlyContinue } {
+    Write-Status "Updating RubyGems system..." -Type Action
+    Write-Log "Updating Ruby Gems."
+    if (-not (Invoke-WithRetry -Action { & gem update --system } -ActionName "gem update --system")) {
+        Write-Status "gem update --system failed after retries" -Type Warning
+    }
+    Write-Status "Updating all gems..." -Type Action
+    if (Invoke-WithRetry -Action { & gem update } -ActionName "gem update") {
+        $updatedItems["Ruby Gems"] += "All gems"
+    } else {
+        Write-Status "gem update failed after retries" -Type Error
+        $failedItems["Ruby Gems"] += "gem update (failed after retries)"
+    }
+}
+
+# --- Update Composer ---
+Update-Section "Composer" ($NoComposer -or $OnlyWsl -or $OnlyWslPackages) { Get-Command composer -ErrorAction SilentlyContinue } {
+    Write-Status "Self-updating Composer..." -Type Action
+    if (Invoke-WithRetry -Action { & composer self-update 2>&1 | Out-Null } -ActionName "composer self-update") {
+        $updatedItems["Composer"] += "Composer"
+    } else {
+        Write-Status "composer self-update failed" -Type Error
+        $failedItems["Composer"] += "composer self-update (failed)"
+    }
+}
+
+# ══════════════════════════════════════════════════════
+# CLOUD / DEVOPS
+# ══════════════════════════════════════════════════════
 
 # --- Update Google Cloud SDK ---
 Update-Section "Google Cloud SDK" ($NoGCloud -or $OnlyWsl -or $OnlyWslPackages) { Get-Command gcloud -ErrorAction SilentlyContinue } {
@@ -906,6 +1322,48 @@ Update-Section "Android SDK" ($NoAndroid -or $OnlyWsl -or $OnlyWslPackages) { Ge
         $failedItems["Android SDK"] += "sdkmanager --update (Exit Code: $LASTEXITCODE)"
     }
 }
+
+# --- Update Helm plugins ---
+Update-Section "Helm plugins" ($NoHelm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command helm -ErrorAction SilentlyContinue } {
+    Write-Status "Listing Helm plugins..." -Type Action
+    $helmPluginLines = & helm plugin list 2>&1 | Select-Object -Skip 1 | Where-Object { $_ -match '\S' }
+    if (-not $helmPluginLines) {
+        Write-Status "No Helm plugins installed" -Type Info
+        return
+    }
+    $pluginNames = $helmPluginLines | ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { $_ }
+    Write-Status "Updating $($pluginNames.Count) plugin(s): $($pluginNames -join ', ')..." -Type Action
+    foreach ($plugin in $pluginNames) {
+        & helm plugin update $plugin 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $updatedItems["Helm plugins"] += $plugin
+        } else {
+            Write-Status "helm plugin update $plugin failed (exit $LASTEXITCODE)" -Type Error
+            $failedItems["Helm plugins"] += "$plugin (Exit Code: $LASTEXITCODE)"
+        }
+    }
+}
+
+# --- Update krew plugins ---
+Update-Section "krew plugins" ($NoKrew -or $OnlyWsl -or $OnlyWslPackages) { Get-Command kubectl -ErrorAction SilentlyContinue } {
+    & kubectl krew version 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "krew not installed — skipping" -Type Skip
+        $script:skippedSections += "krew plugins (krew not installed)"
+        return
+    }
+    Write-Status "Upgrading krew plugins..." -Type Action
+    if (Invoke-WithRetry -Action { & kubectl krew upgrade 2>&1 | Out-Null } -ActionName "kubectl krew upgrade") {
+        $updatedItems["krew plugins"] += "All krew plugins"
+    } else {
+        Write-Status "kubectl krew upgrade failed" -Type Error
+        $failedItems["krew plugins"] += "kubectl krew upgrade (failed)"
+    }
+}
+
+# ══════════════════════════════════════════════════════
+# DEV TOOLING
+# ══════════════════════════════════════════════════════
 
 # --- Update Visual Studio Code Extensions ---
 Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $OnlyWslPackages) { Get-Command code -ErrorAction SilentlyContinue } {
@@ -987,60 +1445,9 @@ Update-Section "GitHub CLI Extensions" ($NoGhExt -or $OnlyWsl -or $OnlyWslPackag
     }
 }
 
-# --- Update Miniconda ---
-Update-Section "Miniconda and conda environments" ($NoConda -or $OnlyWsl -or $OnlyWslPackages) { Get-Command conda -ErrorAction SilentlyContinue } {
-    Write-Status "Updating base environment..." -Type Action
-    if (Invoke-WithRetry -Action { & conda update -n base -c defaults conda -y } -ActionName "conda update -n base") {
-        $updatedItems["Conda"] += "Miniconda (base)"
-    } else {
-        Write-Status "conda update -n base failed after retries" -Type Error
-        $failedItems["Conda"] += "conda update -n base (failed after retries)"
-    }
-
-    # After upgrading conda itself, update all packages in the base environment
-    Write-Status "Updating all packages in base environment..." -Type Action
-    if (Invoke-WithRetry -Action { & conda update -n base --all -y } -ActionName "conda update -n base --all") {
-        $updatedItems["Conda"] += "Conda packages (base)"
-    } else {
-        Write-Status "conda update -n base --all failed after retries" -Type Error
-        $failedItems["Conda"] += "conda update -n base --all (failed after retries)"
-    }
-
-    # Enumerate all non-base environments and update each
-    $condaEnvList = & conda env list 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-Status "conda env list failed" -Type Error
-        $failedItems["Conda"] += "conda env list (Exit Code: $LASTEXITCODE)"
-    } else {
-        $nonBaseEnvs = $condaEnvList |
-            Where-Object { $_ -notmatch '^\s*#' -and $_ -match '^\S' -and $_ -notmatch '^base\s' } |
-            ForEach-Object { ($_ -split '\s+')[0] } |
-            Where-Object { $_ -and $_ -ne 'base' }
-        if ($nonBaseEnvs) {
-            foreach ($envName in $nonBaseEnvs) {
-                Write-Status "Updating '$envName' environment..." -Type Action
-                if (Invoke-WithRetry -Action { & conda update -n $envName --all -y } -ActionName "conda update -n $envName") {
-                    $updatedItems["Conda"] += "Conda environment ($envName)"
-                } else {
-                    Write-Status "conda update -n $envName failed after retries" -Type Error
-                    $failedItems["Conda"] += "conda update -n $envName (failed)"
-                }
-            }
-        } else {
-            Write-Status "No additional conda environments found" -Type Info
-        }
-    }
-
-    # Ensure base environment activates automatically in new shells so tools
-    # installed there (e.g. pipx) are available on PATH without manual activation.
-    # Note: auto_activate_base was renamed to auto_activate in recent conda versions.
-    Write-Status "Ensuring auto_activate is enabled..." -Type Action
-    & conda config --set auto_activate true
-    if ($LASTEXITCODE -ne 0) {
-        Write-Status "conda config --set auto_activate failed (exit $LASTEXITCODE)" -Type Warning
-        Write-Log "conda config --set auto_activate failed (exit $LASTEXITCODE)" -Level "WARN"
-    }
-}
+# ══════════════════════════════════════════════════════
+# TYPESETTING
+# ══════════════════════════════════════════════════════
 
 # --- Update TeX Live ---
 Update-Section "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Command tlmgr -ErrorAction SilentlyContinue } {
@@ -1096,370 +1503,6 @@ Update-Section "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Comma
     } else {
         Write-Status "tlmgr update failed (admin required?)" -Type Error
         $failedItems["TeX Live"] += "tlmgr update failed"
-    }
-}
-
-# --- Update WSL ---
-Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !$OnlyWslPackages) { Get-Command wsl -ErrorAction SilentlyContinue } {
-    Write-Log "Starting WSL updates."
-    # Since elevation is handled at the start, we can proceed directly.
-    if (-not $OnlyWslPackages) {
-        if ($script:isAdmin) {
-            Write-Status "Updating WSL kernel..." -Type Action
-            Write-Log "Updating WSL kernel."
-            if (Invoke-WithRetry -Action { & wsl --update --web-download } -ActionName "wsl --update" -MaxRetries 2) {
-                $updatedItems["WSL"] += "WSL Kernel"
-            } else {
-                Write-Status "wsl --update failed after retries" -Type Error
-                $failedItems["WSL"] += "wsl --update (failed after retries)"
-            }
-
-            Write-Status "Shutting down WSL to apply updates..." -Type Action
-            Write-Log "Shutting down WSL."
-            Invoke-WithRetry -Action { & wsl --shutdown } -ActionName "wsl --shutdown" -MaxRetries 0 | Out-Null
-        } else {
-            Write-Status "WSL kernel update skipped (not running as admin)" -Type Skip
-            Write-Log "Skipping WSL kernel update — not elevated."
-        }
-    } else {
-        Write-Log "Skipping WSL kernel update as requested."
-    }
-
-    Write-Status "Updating packages in default WSL distro..." -Type Action
-    # Use the exact allowed command for the passwordless-sudo check (not 'true',
-    # which isn't in the sudoers rule and would always require a password).
-    & wsl.exe sudo -n apt-get --version 2>$null | Out-Null
-    $sudoOk = ($LASTEXITCODE -eq 0)
-
-    if (-not $sudoOk) {
-        Write-Status "Passwordless sudo not configured" -Type Error
-        if ($SkipWslSudoConfig) {
-            Write-Status "Skipping automatic sudo configuration as requested" -Type Skip
-            $failedItems["WSL"] += "Package update skipped (passwordless sudo not configured)"
-        } else {
-            Write-Status "Attempting automatic sudo configuration..." -Type Action
-            $linuxUser = (& wsl.exe whoami 2>$null | Select-Object -First 1).Trim()
-            if (-not $linuxUser) {
-                Write-Status "Could not determine WSL username" -Type Error
-                $failedItems["WSL"] += "Unable to configure sudo (username unknown)"
-            } elseif (Set-WslPasswordlessSudo -LinuxUser $linuxUser) {
-                Write-Status "Passwordless sudo configured for $linuxUser" -Type Success
-                $sudoOk = $true
-            } else {
-                Write-Status "Failed to configure passwordless sudo" -Type Error
-                $failedItems["WSL"] += "sudoers configuration failed"
-            }
-        }
-    }
-
-    if ($sudoOk) {
-        Write-Status "Running apt-get update and upgrade..." -Type Action
-        Write-Log "Running apt-get update and upgrade."
-        & wsl.exe sudo apt-get update
-        if ($LASTEXITCODE -ne 0) {
-            Write-Status "apt-get update failed (exit $LASTEXITCODE)" -Type Error
-            $failedItems["WSL"] += "apt-get update failed"
-        } else {
-            & wsl.exe sudo apt-get full-upgrade -y
-            if ($LASTEXITCODE -eq 0) {
-                $updatedItems["WSL"] += "Updated packages in default WSL distro"
-                $autoremoveOut = & wsl.exe sudo apt-get autoremove -y 2>&1
-                $autoremoveOut | ForEach-Object { Write-Log "  [autoremove] $_" -Level "DEBUG" }
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Status "apt-get autoremove failed (exit $LASTEXITCODE)" -Type Warning
-                    Write-Log "apt-get autoremove exited $LASTEXITCODE" -Level "WARN"
-                }
-            } else {
-                Write-Status "apt-get full-upgrade failed (exit $LASTEXITCODE)" -Type Error
-                $failedItems["WSL"] += "apt-get full-upgrade failed"
-            }
-        }
-    }
-}
-
-# --- Update npm Packages ---
-Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command npm -ErrorAction SilentlyContinue } {
-    Write-Status "Checking for outdated global packages..." -Type Action
-    $outdatedNpmJson = & npm outdated -g --json 2>&1
-    # npm outdated exits 1 when packages ARE outdated (by design) — not an error condition.
-    # We parse JSON regardless of exit code.
-    $npmOutdated = $null
-    try { $npmOutdated = $outdatedNpmJson | ConvertFrom-Json -ErrorAction Stop } catch {}
-    $npmToUpdate = if ($npmOutdated) { @($npmOutdated.PSObject.Properties.Name) } else { @() }
-
-    if ($npmToUpdate.Count -eq 0) {
-        Write-Status "All global packages up-to-date" -Type Success
-        Write-Log "npm: all global packages up-to-date." -Level "INFO"
-        return
-    }
-
-    Write-Status "Found $($npmToUpdate.Count) outdated: $($npmToUpdate -join ', ')" -Type Info
-    Write-Log "npm: $($npmToUpdate.Count) outdated: $($npmToUpdate -join ', ')" -Level "INFO"
-
-    # Verify npm's global prefix is writable — EPERM (-4048) is non-retryable, skip early
-    $npmPrefix = (& npm config get prefix 2>&1).Trim()
-    $npmWriteTest = Join-Path $npmPrefix ".write-test-$([System.Guid]::NewGuid().ToString('N'))"
-    $npmWritable = $false
-    try {
-        [System.IO.File]::WriteAllText($npmWriteTest, '')
-        Remove-Item $npmWriteTest -ErrorAction SilentlyContinue
-        $npmWritable = $true
-    } catch { }
-    if (-not $npmWritable) {
-        Write-Status "npm prefix '$npmPrefix' is not writable — run as Administrator to update npm" -Type Warning
-        Write-Log "npm: prefix '$npmPrefix' not writable — skipping updates." -Level "WARN"
-        $script:skippedSections += "npm (prefix not writable, needs elevation)"
-        return
-    }
-
-    Write-Status "Updating npm itself..." -Type Action
-    if (-not (Invoke-WithRetry -Action { & npm install -g npm } -ActionName "npm install -g npm")) {
-        Write-Status "npm self-update failed" -Type Warning
-        $failedItems["npm"] += "npm install -g npm (failed after retries)"
-    }
-
-    Write-Status "Updating all global packages..." -Type Action
-    if (Invoke-WithRetry -Action { & npm update -g } -ActionName "npm update -g") {
-        $updatedItems["npm"] += $npmToUpdate
-    } else {
-        Write-Status "npm update -g failed after retries" -Type Error
-        $failedItems["npm"] += "npm update -g (failed after retries)"
-    }
-}
-
-# --- Update pipx packages ---
-Update-Section "pipx packages" ($NoPipx -or $OnlyWsl -or $OnlyWslPackages) {
-    # pipx may live in conda base even when auto_activate_base is off; accept either
-    (Get-Command pipx -ErrorAction SilentlyContinue) -or (Get-Command conda -ErrorAction SilentlyContinue)
-} {
-    Write-Status "Upgrading all pipx packages..." -Type Action
-    Write-Log "Upgrading pipx packages."
-    # Force Python UTF-8 mode so pipx can print emoji in its output without crashing
-    # on Windows consoles with cp1252 or other narrow code pages.
-    $env:PYTHONUTF8 = '1'
-    # Prefer direct pipx; fall back to conda run -n base if pipx is only in conda base
-    $pipxAction = if (Get-Command pipx -ErrorAction SilentlyContinue) {
-        { & pipx upgrade-all }
-    } else {
-        Write-Status "pipx not on PATH — running via conda base" -Type Info
-        { & conda run -n base pipx upgrade-all }
-    }
-    if (Invoke-WithRetry -Action $pipxAction -ActionName "pipx upgrade-all") {
-        $updatedItems["pipx"] += "All pipx packages"
-    } else {
-        Write-Status "pipx upgrade-all failed after retries" -Type Error
-        $failedItems["pipx"] += "pipx upgrade-all (failed after retries)"
-    }
-}
-
-# --- Update .NET Global Tools ---
-Update-Section ".NET Global Tools" ($NoDotnet -or $OnlyWsl -or $OnlyWslPackages) { Get-Command dotnet -ErrorAction SilentlyContinue } {
-    Write-Status "Listing installed .NET global tools..." -Type Action
-    $toolListOut = & dotnet tool list -g 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-Status "dotnet tool list failed (exit $LASTEXITCODE)" -Type Error
-        $failedItems[".NET Global Tools"] += "dotnet tool list (Exit Code: $LASTEXITCODE)"
-        return
-    }
-    $toolLines = $toolListOut | Select-Object -Skip 2 | Where-Object { $_ -match '\S' }
-    if (-not $toolLines) {
-        Write-Status "No .NET global tools installed" -Type Info
-        return
-    }
-    $toolIds = $toolLines | ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-
-    if ($PSVersionTable.PSVersion.Major -ge 7) {
-        Write-Status "Updating $($toolIds.Count) tool(s) in parallel..." -Type Action
-        $results = $toolIds | ForEach-Object -Parallel {
-            & dotnet tool update -g $_ 2>&1 | Out-Null
-            [PSCustomObject]@{ Id = $_; ExitCode = $LASTEXITCODE }
-        } -ThrottleLimit 4
-
-        foreach ($r in $results) {
-            if ($r.ExitCode -eq 0) {
-                Write-Status "Updated: $($r.Id)" -Type Success
-                $updatedItems[".NET Global Tools"] += $r.Id
-            } else {
-                Write-Status "Failed: $($r.Id)" -Type Error
-                $failedItems[".NET Global Tools"] += $r.Id
-            }
-        }
-    } else {
-        foreach ($toolId in $toolIds) {
-            Write-Status "Updating: $toolId..." -Type Action
-            & dotnet tool update -g $toolId 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                $updatedItems[".NET Global Tools"] += $toolId
-            } else {
-                $failedItems[".NET Global Tools"] += $toolId
-            }
-        }
-    }
-}
-
-# --- Update Oh My Posh ---
-Update-Section "Oh My Posh" ($NoOhMyPosh -or $OnlyWsl -or $OnlyWslPackages) { Get-Command oh-my-posh -ErrorAction SilentlyContinue } {
-    Write-Status "Upgrading Oh My Posh..." -Type Action
-    if (Invoke-WithRetry -Action { & oh-my-posh upgrade 2>&1 | Out-Null } -ActionName "oh-my-posh upgrade") {
-        $updatedItems["Oh My Posh"] += "Oh My Posh"
-    } else {
-        Write-Status "oh-my-posh upgrade failed" -Type Error
-        $failedItems["Oh My Posh"] += "oh-my-posh upgrade (failed)"
-    }
-}
-
-# --- Update uv ---
-Update-Section "uv" ($NoUv -or $OnlyWsl -or $OnlyWslPackages) { Get-Command uv -ErrorAction SilentlyContinue } {
-    Write-Status "Updating uv..." -Type Action
-    if (Invoke-WithRetry -Action { & uv self update 2>&1 | Out-Null } -ActionName "uv self update") {
-        $updatedItems["uv"] += "uv"
-    } else {
-        Write-Status "uv self update failed" -Type Error
-        $failedItems["uv"] += "uv self update (failed)"
-    }
-}
-
-# --- Update pnpm ---
-Update-Section "pnpm" ($NoPnpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command pnpm -ErrorAction SilentlyContinue } {
-    Write-Status "Updating pnpm..." -Type Action
-    if (Invoke-WithRetry -Action { & pnpm self-update 2>&1 | Out-Null } -ActionName "pnpm self-update") {
-        $updatedItems["pnpm"] += "pnpm"
-    } else {
-        Write-Status "pnpm self-update failed" -Type Error
-        $failedItems["pnpm"] += "pnpm self-update (failed)"
-    }
-}
-
-# --- Update Bun ---
-Update-Section "Bun" ($NoBun -or $OnlyWsl -or $OnlyWslPackages) { Get-Command bun -ErrorAction SilentlyContinue } {
-    Write-Status "Upgrading Bun..." -Type Action
-    if (Invoke-WithRetry -Action { & bun upgrade 2>&1 | Out-Null } -ActionName "bun upgrade") {
-        $updatedItems["Bun"] += "Bun"
-    } else {
-        Write-Status "bun upgrade failed" -Type Error
-        $failedItems["Bun"] += "bun upgrade (failed)"
-    }
-}
-
-# --- Update Deno ---
-Update-Section "Deno" ($NoDeno -or $OnlyWsl -or $OnlyWslPackages) { Get-Command deno -ErrorAction SilentlyContinue } {
-    Write-Status "Upgrading Deno..." -Type Action
-    if (Invoke-WithRetry -Action { & deno upgrade 2>&1 | Out-Null } -ActionName "deno upgrade") {
-        $updatedItems["Deno"] += "Deno"
-    } else {
-        Write-Status "deno upgrade failed" -Type Error
-        $failedItems["Deno"] += "deno upgrade (failed)"
-    }
-}
-
-# --- Update Helm plugins ---
-Update-Section "Helm plugins" ($NoHelm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command helm -ErrorAction SilentlyContinue } {
-    Write-Status "Listing Helm plugins..." -Type Action
-    $helmPluginLines = & helm plugin list 2>&1 | Select-Object -Skip 1 | Where-Object { $_ -match '\S' }
-    if (-not $helmPluginLines) {
-        Write-Status "No Helm plugins installed" -Type Info
-        return
-    }
-    $pluginNames = $helmPluginLines | ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { $_ }
-    Write-Status "Updating $($pluginNames.Count) plugin(s): $($pluginNames -join ', ')..." -Type Action
-    foreach ($plugin in $pluginNames) {
-        & helm plugin update $plugin 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            $updatedItems["Helm plugins"] += $plugin
-        } else {
-            Write-Status "helm plugin update $plugin failed (exit $LASTEXITCODE)" -Type Error
-            $failedItems["Helm plugins"] += "$plugin (Exit Code: $LASTEXITCODE)"
-        }
-    }
-}
-
-# --- Update Poetry ---
-Update-Section "Poetry" ($NoPoetry -or $OnlyWsl -or $OnlyWslPackages) { Get-Command poetry -ErrorAction SilentlyContinue } {
-    Write-Status "Updating Poetry..." -Type Action
-    if (Invoke-WithRetry -Action { & poetry self update 2>&1 | Out-Null } -ActionName "poetry self update") {
-        $updatedItems["Poetry"] += "Poetry"
-    } else {
-        Write-Status "poetry self update failed" -Type Error
-        $failedItems["Poetry"] += "poetry self update (failed)"
-    }
-}
-
-# --- Update Rye ---
-Update-Section "Rye" ($NoRye -or $OnlyWsl -or $OnlyWslPackages) { Get-Command rye -ErrorAction SilentlyContinue } {
-    Write-Status "Updating Rye..." -Type Action
-    if (Invoke-WithRetry -Action { & rye self update 2>&1 | Out-Null } -ActionName "rye self update") {
-        $updatedItems["Rye"] += "Rye"
-    } else {
-        Write-Status "rye self update failed" -Type Error
-        $failedItems["Rye"] += "rye self update (failed)"
-    }
-}
-
-# --- Update Composer ---
-Update-Section "Composer" ($NoComposer -or $OnlyWsl -or $OnlyWslPackages) { Get-Command composer -ErrorAction SilentlyContinue } {
-    Write-Status "Self-updating Composer..." -Type Action
-    if (Invoke-WithRetry -Action { & composer self-update 2>&1 | Out-Null } -ActionName "composer self-update") {
-        $updatedItems["Composer"] += "Composer"
-    } else {
-        Write-Status "composer self-update failed" -Type Error
-        $failedItems["Composer"] += "composer self-update (failed)"
-    }
-}
-
-# --- Update krew plugins ---
-Update-Section "krew plugins" ($NoKrew -or $OnlyWsl -or $OnlyWslPackages) { Get-Command kubectl -ErrorAction SilentlyContinue } {
-    & kubectl krew version 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Status "krew not installed — skipping" -Type Skip
-        $script:skippedSections += "krew plugins (krew not installed)"
-        return
-    }
-    Write-Status "Upgrading krew plugins..." -Type Action
-    if (Invoke-WithRetry -Action { & kubectl krew upgrade 2>&1 | Out-Null } -ActionName "kubectl krew upgrade") {
-        $updatedItems["krew plugins"] += "All krew plugins"
-    } else {
-        Write-Status "kubectl krew upgrade failed" -Type Error
-        $failedItems["krew plugins"] += "kubectl krew upgrade (failed)"
-    }
-}
-
-# --- Update Rust toolchain ---
-Update-Section "Rust (rustup)" ($NoRust -or $OnlyWsl -or $OnlyWslPackages) { Get-Command rustup -ErrorAction SilentlyContinue } {
-    Write-Status "Updating Rust toolchain..." -Type Action
-    Write-Log "Updating Rust toolchain via rustup."
-    if (Invoke-WithRetry -Action { & rustup update } -ActionName "rustup update") {
-        $updatedItems["Rust"] += "Rust toolchain"
-    } else {
-        Write-Status "rustup update failed after retries" -Type Error
-        $failedItems["Rust"] += "rustup update (failed after retries)"
-    }
-}
-
-# --- Update Ruby Gems ---
-Update-Section "Ruby Gems" ($NoGem -or $OnlyWsl -or $OnlyWslPackages) { Get-Command gem -ErrorAction SilentlyContinue } {
-    Write-Status "Updating RubyGems system..." -Type Action
-    Write-Log "Updating Ruby Gems."
-    if (-not (Invoke-WithRetry -Action { & gem update --system } -ActionName "gem update --system")) {
-        Write-Status "gem update --system failed after retries" -Type Warning
-    }
-    Write-Status "Updating all gems..." -Type Action
-    if (Invoke-WithRetry -Action { & gem update } -ActionName "gem update") {
-        $updatedItems["Ruby Gems"] += "All gems"
-    } else {
-        Write-Status "gem update failed after retries" -Type Error
-        $failedItems["Ruby Gems"] += "gem update (failed after retries)"
-    }
-}
-
-# --- Update Chocolatey packages ---
-Update-Section "Chocolatey packages" ($NoChoco -or $OnlyWsl -or $OnlyWslPackages) { Get-Command choco -ErrorAction SilentlyContinue } {
-    Write-Status "Upgrading all Chocolatey packages..." -Type Action
-    Write-Log "Upgrading Chocolatey packages."
-    if (Invoke-WithRetry -Action { & choco upgrade all -y } -ActionName "choco upgrade all") {
-        $updatedItems["Chocolatey"] += "All Chocolatey packages"
-    } else {
-        Write-Status "choco upgrade failed after retries" -Type Error
-        $failedItems["Chocolatey"] += "choco upgrade all (failed after retries)"
     }
 }
 
