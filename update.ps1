@@ -424,7 +424,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.7"
+$_version = "v10.8"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -449,22 +449,27 @@ if (-not $NoSelfUpdate) {
             $pullOut = & git -C $scriptDir pull 2>&1
             if ($LASTEXITCODE -ne 0) {
                 Write-Status "git pull failed: $($pullOut -join ' ')" -Type Warning
+                Write-Log "Self-update: git pull failed (exit $LASTEXITCODE): $($pullOut -join ' ')" -Level "WARN"
             } elseif (($pullOut -join ' ') -match 'Already up[ -]to[ -]date') {
                 Write-Status "Script is up to date ($_version)" -Type Success
+                Write-Log "Self-update: already up to date ($_version)" -Level "INFO"
             } else {
                 # Repo changed — check if the script file itself was updated
                 $newVerMatch = Select-String '^\$_version\s*=\s*"(v[\d.]+)"' $PSCommandPath
                 $newVer = if ($newVerMatch) { $newVerMatch.Matches[0].Groups[1].Value } else { $null }
                 if ($newVer -and $newVer -ne $_version) {
                     Write-Status "Script updated: $_version → $newVer. Re-running..." -Type Success
+                    Write-Log "Self-update: script updated $_version → $newVer, re-running." -Level "INFO"
                     & $PSCommandPath @PSBoundParameters -NoSelfUpdate
                     exit $LASTEXITCODE
                 } else {
                     Write-Status "Repo updated (non-script files only)" -Type Info
+                    Write-Log "Self-update: repo updated (non-script files only)" -Level "INFO"
                 }
             }
         } catch {
             Write-Status "git pull failed: $($_.Exception.Message)" -Type Warning
+            Write-Log "Self-update: git pull exception: $($_.Exception.Message)" -Level "WARN"
         }
     }
 }
@@ -479,6 +484,7 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
 $freeGB = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
 if ($freeGB -lt 2) {
     Write-Status "Low disk space: ${freeGB} GB free on C: — updates may fail" -Type Warning
+    Write-Log "WARNING: Low disk space: ${freeGB} GB free on C:" -Level "WARN"
 }
 
 Write-Log "Starting update script."
@@ -503,12 +509,16 @@ $npmNeedsElevation    = $false
 
 if ($Sudo) {
     Write-Status "Sudo flag set — skipping pre-checks, will elevate immediately" -Type Info
+    Write-Log "Pre-check: -Sudo specified, skipping all pre-checks." -Level "INFO"
 } else {
     if (-not $NoWinget -and (Get-Command winget -ErrorAction SilentlyContinue)) {
         Write-Status "Pre-checking winget for available updates..." -Type Action
         $wingetNeedsElevation = Test-WingetHasUpdates
-        if (-not $wingetNeedsElevation) {
+        if ($wingetNeedsElevation) {
+            Write-Log "Pre-check: winget has updates — elevation needed." -Level "INFO"
+        } else {
             Write-Status "Winget: all packages up-to-date — no elevation needed" -Type Success
+            Write-Log "Pre-check: winget up-to-date, no elevation needed." -Level "INFO"
         }
     }
 
@@ -517,8 +527,11 @@ if ($Sudo) {
     if (-not $NoWsl -and -not $OnlyWslPackages -and (Get-Command wsl -ErrorAction SilentlyContinue)) {
         Write-Status "Pre-checking WSL for available kernel updates..." -Type Action
         $wslNeedsElevation = Test-WslHasUpdates
-        if (-not $wslNeedsElevation) {
+        if ($wslNeedsElevation) {
+            Write-Log "Pre-check: WSL kernel has updates — elevation needed." -Level "INFO"
+        } else {
             Write-Status "WSL kernel already up-to-date — no elevation needed for WSL" -Type Success
+            Write-Log "Pre-check: WSL kernel up-to-date, no elevation needed." -Level "INFO"
         }
     }
 
@@ -535,6 +548,7 @@ if ($Sudo) {
 
         if ($npmPrefixWritable) {
             Write-Status "npm: prefix writable — no elevation needed" -Type Success
+            Write-Log "Pre-check: npm prefix writable, no elevation needed." -Level "INFO"
         } else {
             # Prefix is protected — only elevate if there are actual updates to install.
             # npm outdated -g --json exits 1 when outdated, 0 when current; always emits JSON (empty {} = no updates).
@@ -546,8 +560,10 @@ if ($Sudo) {
             if ($npmHasUpdates) {
                 $npmNeedsElevation = $true
                 Write-Status "npm: updates available + prefix '$npmPrefix' requires elevation" -Type Warning
+                Write-Log "Pre-check: npm prefix '$npmPrefix' not writable and updates found — elevation needed." -Level "INFO"
             } else {
                 Write-Status "npm: all packages up-to-date — no elevation needed" -Type Success
+                Write-Log "Pre-check: npm prefix '$npmPrefix' not writable but no updates — no elevation needed." -Level "INFO"
             }
         }
     }
@@ -578,6 +594,12 @@ if ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -or $npmNeedsElevatio
         # Use the current PowerShell executable (pwsh.exe for PS7, powershell.exe for PS5)
         # so the elevated process runs the same version.
         $psExe = (Get-Process -Id $PID).MainModule.FileName
+        $elevationReasons = @()
+        if ($Sudo)                { $elevationReasons += '-Sudo flag' }
+        if ($wingetNeedsElevation){ $elevationReasons += 'winget updates' }
+        if ($wslNeedsElevation)   { $elevationReasons += 'WSL kernel update' }
+        if ($npmNeedsElevation)   { $elevationReasons += 'npm updates' }
+        Write-Log "Elevation required ($($elevationReasons -join ', ')) — re-launching as administrator." -Level "INFO"
         $sudoExists = Get-Command sudo -ErrorAction SilentlyContinue
         if ($sudoExists) {
             # Use the new Windows 'sudo' to re-launch.
@@ -768,9 +790,11 @@ Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPacka
 
         if ($outdatedApps.Count -gt 0) {
             Write-Status "Found $($outdatedApps.Count) outdated: $($outdatedApps -join ', ')" -Type Info
+            Write-Log "Scoop: $($outdatedApps.Count) outdated: $($outdatedApps -join ', ')" -Level "INFO"
             $updatedItems["Scoop"] += $outdatedApps
         } else {
             Write-Status "All packages up-to-date" -Type Success
+            Write-Log "Scoop: all packages up-to-date." -Level "INFO"
         }
 
         Write-Status "Updating Scoop itself..." -Type Action
@@ -833,9 +857,11 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
 
         if ($upgradablePackages.Count -gt 0) {
             Write-Status "Found $($upgradablePackages.Count) upgradable packages" -Type Info
+            Write-Log "Winget: $($upgradablePackages.Count) upgradable: $($upgradablePackages -join ', ')" -Level "INFO"
             $updatedItems["Winget"] += $upgradablePackages
         } else {
             Write-Status "All packages up-to-date" -Type Success
+            Write-Log "Winget: all packages up-to-date." -Level "INFO"
         }
 
         Write-Status "Refreshing winget sources..." -Type Action
@@ -938,9 +964,11 @@ Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $Only
 
         if ($actuallyUpdated.Count -gt 0) {
             Write-Status "$($actuallyUpdated.Count) extensions updated" -Type Success
+            Write-Log "VS Code: $($actuallyUpdated.Count) updated: $($actuallyUpdated -join ', ')" -Level "INFO"
             $updatedItems["VS Code Extensions"] += $actuallyUpdated
         } else {
             Write-Status "All extensions already up-to-date" -Type Success
+            Write-Log "VS Code: all $($validExtensions.Count) extensions up-to-date." -Level "INFO"
         }
     }
 }
@@ -1169,10 +1197,12 @@ Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $O
 
     if ($npmToUpdate.Count -eq 0) {
         Write-Status "All global packages up-to-date" -Type Success
+        Write-Log "npm: all global packages up-to-date." -Level "INFO"
         return
     }
 
     Write-Status "Found $($npmToUpdate.Count) outdated: $($npmToUpdate -join ', ')" -Type Info
+    Write-Log "npm: $($npmToUpdate.Count) outdated: $($npmToUpdate -join ', ')" -Level "INFO"
 
     # Verify npm's global prefix is writable — EPERM (-4048) is non-retryable, skip early
     $npmPrefix = (& npm config get prefix 2>&1).Trim()
@@ -1185,6 +1215,7 @@ Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $O
     } catch { }
     if (-not $npmWritable) {
         Write-Status "npm prefix '$npmPrefix' is not writable — run as Administrator to update npm" -Type Warning
+        Write-Log "npm: prefix '$npmPrefix' not writable — skipping updates." -Level "WARN"
         $script:skippedSections += "npm (prefix not writable, needs elevation)"
         return
     }
