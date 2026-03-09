@@ -416,15 +416,41 @@ function Invoke-TlMgrUpdate {
     return $result
 }
 
-# Initialize logging and display startup banner
+# --- Early log initialization ---
+# Must happen before the banner, self-update, and pre-checks so that all Write-Log
+# calls land in logs/update.log rather than a relative-path file that gets archived.
 $scriptStartTime = Get-Date
+$ScriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
+$LogDir = Join-Path $ScriptPath "logs"
+if (-not (Test-Path $LogDir)) {
+    New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
+}
+if (-not $PSBoundParameters.ContainsKey('LogFile')) {
+    $LogFile = Join-Path $LogDir "update.log"
+} elseif (-not ([System.IO.Path]::IsPathRooted($LogFile))) {
+    $LogFile = Join-Path $ScriptPath $LogFile
+}
+# Log rotation: rename existing log with timestamp, keep last 5 archives
+if (Test-Path $LogFile) {
+    $stamp   = $scriptStartTime.ToString('yyyy-MM-dd_HHmmss')
+    $logBase = [System.IO.Path]::GetFileNameWithoutExtension($LogFile)
+    if ([string]::IsNullOrWhiteSpace($logBase)) { $logBase = 'update' }
+    $archivePath = Join-Path $LogDir "$logBase-$stamp.log"
+    Rename-Item -Path $LogFile -NewName $archivePath -ErrorAction SilentlyContinue
+    Get-ChildItem -Path $LogDir -Filter "$logBase-*.log" |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -Skip 5 |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
+# Display startup banner
 $_bw      = 40
 $_bTop    = "  $([char]0x256D)$(([char]0x2500).ToString() * $_bw)$([char]0x256E)"
 $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)"
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.8"
+$_version = "v10.9"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -619,52 +645,6 @@ if ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -or $npmNeedsElevatio
     }
 }
 
-# Security: Require script to be run from the directory where it's located
-$ScriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
-
-# Ensure a dedicated log directory exists and adjust the default log file path
-$LogDir = Join-Path $ScriptPath "logs"
-if (-not (Test-Path $LogDir)) {
-    New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
-}
-
-# Move any existing log files from the script directory into the dedicated log folder
-Get-ChildItem -Path $ScriptPath -Filter "update*.log" -File -ErrorAction SilentlyContinue |
-    ForEach-Object {
-        $dest = Join-Path $LogDir $_.Name
-        if (-not (Test-Path $dest)) {
-            Move-Item -Path $_.FullName -Destination $dest -Force
-        } else {
-            $ts = Get-Date -Format "yyyy-MM-dd_HHmmss"
-            $newName = "${($_.BaseName)}-$ts$($_.Extension)"
-            Move-Item -Path $_.FullName -Destination (Join-Path $LogDir $newName) -Force
-        }
-    }
-
-# Resolve log file to absolute path now that $ScriptPath is known
-if (-not $PSBoundParameters.ContainsKey('LogFile')) {
-    $LogFile = Join-Path $LogDir "update.log"
-} else {
-    # if user provided a relative path, make it absolute relative to script path
-    if (-not ([System.IO.Path]::IsPathRooted($LogFile))) {
-        $LogFile = Join-Path $ScriptPath $LogFile
-    }
-}
-
-# Log rotation: rename existing log with timestamp, keep last 5 archives
-if (Test-Path $LogFile) {
-    $stamp  = $scriptStartTime.ToString('yyyy-MM-dd_HHmmss')
-    # basename may sometimes be empty (e.g. malformed path); fall back to 'update'
-    $logBase = [System.IO.Path]::GetFileNameWithoutExtension($LogFile)
-    if ([string]::IsNullOrWhiteSpace($logBase)) { $logBase = 'update' }
-    $logDir = Split-Path $LogFile -Parent
-    $archivePath = Join-Path $logDir "$logBase-$stamp.log"
-    Rename-Item -Path $LogFile -NewName $archivePath -ErrorAction SilentlyContinue
-    Get-ChildItem -Path $logDir -Filter "$logBase-*.log" |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -Skip 5 |
-        Remove-Item -Force -ErrorAction SilentlyContinue
-}
 if ((Get-Location).Path -ne $ScriptPath) {
     Write-Warning "Script should be run from its directory: $ScriptPath"
     Write-Host "Changing to script directory..." -ForegroundColor Yellow
