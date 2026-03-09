@@ -460,7 +460,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.11"
+$_version = "v10.12"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -1171,11 +1171,18 @@ Update-Section "pipx packages" ($NoPipx -or $OnlyWsl -or $OnlyWslPackages) {
 # --- Update uv ---
 Update-Section "uv" ($NoUv -or $OnlyWsl -or $OnlyWslPackages) { Get-Command uv -ErrorAction SilentlyContinue } {
     Write-Status "Updating uv..." -Type Action
-    if (Invoke-WithRetry -Action { & uv self update 2>&1 | Out-Null } -ActionName "uv self update") {
+    & uv self update 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
         $updatedItems["uv"] += "uv"
+    } elseif ($LASTEXITCODE -eq 2) {
+        # Exit code 2 = uv managed by an external package manager (Scoop, pip, brew, etc.)
+        # It will be updated by that manager — not a failure.
+        Write-Status "uv is managed by another package manager — skipping self-update" -Type Skip
+        Write-Log "uv self update skipped: managed externally (exit 2)." -Level "INFO"
+        $script:skippedSections += "uv (managed by another package manager)"
     } else {
-        Write-Status "uv self update failed" -Type Error
-        $failedItems["uv"] += "uv self update (failed)"
+        Write-Status "uv self update failed (exit $LASTEXITCODE)" -Type Error
+        $failedItems["uv"] += "uv self update (exit $LASTEXITCODE)"
     }
 }
 
