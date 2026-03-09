@@ -138,6 +138,16 @@ param(
     [switch]$NoAndroid,
     [switch]$NoSelfUpdate,
     [switch]$Sudo,          # Re-launch as administrator immediately, skipping pre-checks
+    [switch]$NoOhMyPosh,    # Skip Oh My Posh upgrade
+    [switch]$NoUv,          # Skip uv self-update
+    [switch]$NoPnpm,        # Skip pnpm self-update
+    [switch]$NoBun,         # Skip Bun upgrade
+    [switch]$NoDeno,        # Skip Deno upgrade
+    [switch]$NoHelm,        # Skip Helm plugin updates
+    [switch]$NoPoetry,      # Skip Poetry self-update
+    [switch]$NoRye,         # Skip Rye self-update
+    [switch]$NoComposer,    # Skip Composer self-update
+    [switch]$NoKrew,        # Skip krew (kubectl plugin manager) upgrade
     [switch]$OnlyWsl,
     [switch]$OnlyWslPackages,
 
@@ -450,7 +460,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.9"
+$_version = "v10.10"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -660,7 +670,9 @@ if ($Help) {
 
 
 # Initialize hashtables to store results for the final summary
-$sectionKeys = "PowerShell Modules", "Scoop", "Winget", "Google Cloud SDK", "Android SDK", "VS Code Extensions", "GitHub CLI Extensions", "Conda", "TeX Live", "WSL", "npm", "pipx", ".NET Global Tools", "Rust", "Ruby Gems", "Chocolatey"
+$sectionKeys = "PowerShell Modules", "Scoop", "Winget", "Google Cloud SDK", "Android SDK", "VS Code Extensions", "GitHub CLI Extensions", "Conda", "TeX Live", "WSL", "npm", "pipx", ".NET Global Tools",
+              "Oh My Posh", "uv", "pnpm", "Bun", "Deno", "Helm plugins", "Poetry", "Rye", "Composer", "krew plugins",
+              "Rust", "Ruby Gems", "Chocolatey"
 $updatedItems = @{}
 $failedItems  = @{}
 foreach ($k in $sectionKeys) {
@@ -1282,6 +1294,132 @@ Update-Section ".NET Global Tools" ($NoDotnet -or $OnlyWsl -or $OnlyWslPackages)
                 $failedItems[".NET Global Tools"] += $toolId
             }
         }
+    }
+}
+
+# --- Update Oh My Posh ---
+Update-Section "Oh My Posh" ($NoOhMyPosh -or $OnlyWsl -or $OnlyWslPackages) { Get-Command oh-my-posh -ErrorAction SilentlyContinue } {
+    Write-Status "Upgrading Oh My Posh..." -Type Action
+    if (Invoke-WithRetry -Action { & oh-my-posh upgrade 2>&1 | Out-Null } -ActionName "oh-my-posh upgrade") {
+        $updatedItems["Oh My Posh"] += "Oh My Posh"
+    } else {
+        Write-Status "oh-my-posh upgrade failed" -Type Error
+        $failedItems["Oh My Posh"] += "oh-my-posh upgrade (failed)"
+    }
+}
+
+# --- Update uv ---
+Update-Section "uv" ($NoUv -or $OnlyWsl -or $OnlyWslPackages) { Get-Command uv -ErrorAction SilentlyContinue } {
+    Write-Status "Updating uv..." -Type Action
+    if (Invoke-WithRetry -Action { & uv self update 2>&1 | Out-Null } -ActionName "uv self update") {
+        $updatedItems["uv"] += "uv"
+    } else {
+        Write-Status "uv self update failed" -Type Error
+        $failedItems["uv"] += "uv self update (failed)"
+    }
+}
+
+# --- Update pnpm ---
+Update-Section "pnpm" ($NoPnpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command pnpm -ErrorAction SilentlyContinue } {
+    Write-Status "Updating pnpm..." -Type Action
+    if (Invoke-WithRetry -Action { & pnpm self-update 2>&1 | Out-Null } -ActionName "pnpm self-update") {
+        $updatedItems["pnpm"] += "pnpm"
+    } else {
+        Write-Status "pnpm self-update failed" -Type Error
+        $failedItems["pnpm"] += "pnpm self-update (failed)"
+    }
+}
+
+# --- Update Bun ---
+Update-Section "Bun" ($NoBun -or $OnlyWsl -or $OnlyWslPackages) { Get-Command bun -ErrorAction SilentlyContinue } {
+    Write-Status "Upgrading Bun..." -Type Action
+    if (Invoke-WithRetry -Action { & bun upgrade 2>&1 | Out-Null } -ActionName "bun upgrade") {
+        $updatedItems["Bun"] += "Bun"
+    } else {
+        Write-Status "bun upgrade failed" -Type Error
+        $failedItems["Bun"] += "bun upgrade (failed)"
+    }
+}
+
+# --- Update Deno ---
+Update-Section "Deno" ($NoDeno -or $OnlyWsl -or $OnlyWslPackages) { Get-Command deno -ErrorAction SilentlyContinue } {
+    Write-Status "Upgrading Deno..." -Type Action
+    if (Invoke-WithRetry -Action { & deno upgrade 2>&1 | Out-Null } -ActionName "deno upgrade") {
+        $updatedItems["Deno"] += "Deno"
+    } else {
+        Write-Status "deno upgrade failed" -Type Error
+        $failedItems["Deno"] += "deno upgrade (failed)"
+    }
+}
+
+# --- Update Helm plugins ---
+Update-Section "Helm plugins" ($NoHelm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command helm -ErrorAction SilentlyContinue } {
+    Write-Status "Listing Helm plugins..." -Type Action
+    $helmPluginLines = & helm plugin list 2>&1 | Select-Object -Skip 1 | Where-Object { $_ -match '\S' }
+    if (-not $helmPluginLines) {
+        Write-Status "No Helm plugins installed" -Type Info
+        return
+    }
+    $pluginNames = $helmPluginLines | ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { $_ }
+    Write-Status "Updating $($pluginNames.Count) plugin(s): $($pluginNames -join ', ')..." -Type Action
+    foreach ($plugin in $pluginNames) {
+        & helm plugin update $plugin 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $updatedItems["Helm plugins"] += $plugin
+        } else {
+            Write-Status "helm plugin update $plugin failed (exit $LASTEXITCODE)" -Type Error
+            $failedItems["Helm plugins"] += "$plugin (Exit Code: $LASTEXITCODE)"
+        }
+    }
+}
+
+# --- Update Poetry ---
+Update-Section "Poetry" ($NoPoetry -or $OnlyWsl -or $OnlyWslPackages) { Get-Command poetry -ErrorAction SilentlyContinue } {
+    Write-Status "Updating Poetry..." -Type Action
+    if (Invoke-WithRetry -Action { & poetry self update 2>&1 | Out-Null } -ActionName "poetry self update") {
+        $updatedItems["Poetry"] += "Poetry"
+    } else {
+        Write-Status "poetry self update failed" -Type Error
+        $failedItems["Poetry"] += "poetry self update (failed)"
+    }
+}
+
+# --- Update Rye ---
+Update-Section "Rye" ($NoRye -or $OnlyWsl -or $OnlyWslPackages) { Get-Command rye -ErrorAction SilentlyContinue } {
+    Write-Status "Updating Rye..." -Type Action
+    if (Invoke-WithRetry -Action { & rye self update 2>&1 | Out-Null } -ActionName "rye self update") {
+        $updatedItems["Rye"] += "Rye"
+    } else {
+        Write-Status "rye self update failed" -Type Error
+        $failedItems["Rye"] += "rye self update (failed)"
+    }
+}
+
+# --- Update Composer ---
+Update-Section "Composer" ($NoComposer -or $OnlyWsl -or $OnlyWslPackages) { Get-Command composer -ErrorAction SilentlyContinue } {
+    Write-Status "Self-updating Composer..." -Type Action
+    if (Invoke-WithRetry -Action { & composer self-update 2>&1 | Out-Null } -ActionName "composer self-update") {
+        $updatedItems["Composer"] += "Composer"
+    } else {
+        Write-Status "composer self-update failed" -Type Error
+        $failedItems["Composer"] += "composer self-update (failed)"
+    }
+}
+
+# --- Update krew plugins ---
+Update-Section "krew plugins" ($NoKrew -or $OnlyWsl -or $OnlyWslPackages) { Get-Command kubectl -ErrorAction SilentlyContinue } {
+    & kubectl krew version 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "krew not installed — skipping" -Type Skip
+        $script:skippedSections += "krew plugins (krew not installed)"
+        return
+    }
+    Write-Status "Upgrading krew plugins..." -Type Action
+    if (Invoke-WithRetry -Action { & kubectl krew upgrade 2>&1 | Out-Null } -ActionName "kubectl krew upgrade") {
+        $updatedItems["krew plugins"] += "All krew plugins"
+    } else {
+        Write-Status "kubectl krew upgrade failed" -Type Error
+        $failedItems["krew plugins"] += "kubectl krew upgrade (failed)"
     }
 }
 
