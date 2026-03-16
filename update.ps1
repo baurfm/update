@@ -112,7 +112,7 @@
 .NOTES
     Author: Your Name
     Date: 2025-01-20
-    Version: 10.5 (Add: GitHub self-update check at startup with -NoSelfUpdate; PS modules: skip modules already at latest version via Find-Module pre-check; npm: detect EPERM/non-writable prefix and skip gracefully; previous 10.4: Android SDK, dynamic conda envs)
+    Version: 10.18
 #>
 
 param(
@@ -467,7 +467,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.17"
+$_version = "v10.18"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -883,7 +883,7 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
             if ($warnMsgs | Where-Object { $_.Message -like "*currently in use*" }) {
                 Write-Status "In use: $($module.Name) — starting subprocess..." -Type Warning
                 Write-Log "Module $($module.Name) is in use — spawning subprocess." -Level "INFO"
-                $tmpScript = [System.IO.Path]::GetTempFileName() + ".ps1"
+                $tmpScript = Join-Path $env:TEMP "$([System.Guid]::NewGuid().ToString()).ps1"
                 $safeName  = $module.Name -replace "'", "''"
                 Set-Content $tmpScript -Encoding UTF8 -Value "Update-Module -Name '$safeName' -Force -ErrorAction Stop"
                 $subprocs.Add([PSCustomObject]@{
@@ -1009,10 +1009,11 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
             if ($LASTEXITCODE -eq 0) {
                 $updatedItems["WSL"] += "Updated packages in default WSL distro"
                 $autoremoveOut = & wsl.exe sudo apt-get autoremove -y 2>&1
+                $autoremoveExitCode = $LASTEXITCODE
                 $autoremoveOut | ForEach-Object { Write-Log "  [autoremove] $_" -Level "DEBUG" }
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Status "apt-get autoremove failed (exit $LASTEXITCODE)" -Type Warning
-                    Write-Log "apt-get autoremove exited $LASTEXITCODE" -Level "WARN"
+                if ($autoremoveExitCode -ne 0) {
+                    Write-Status "apt-get autoremove failed (exit $autoremoveExitCode)" -Type Warning
+                    Write-Log "apt-get autoremove exited $autoremoveExitCode" -Level "WARN"
                 }
             } else {
                 Write-Status "apt-get full-upgrade failed (exit $LASTEXITCODE)" -Type Error
