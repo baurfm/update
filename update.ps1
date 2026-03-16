@@ -608,19 +608,20 @@ if ($Sudo) {
     $preWslJob    = $null
 
     if (-not $NoWinget -and (Get-Command winget -ErrorAction SilentlyContinue)) {
-        $fnWinget = ${Function:Test-WingetHasUpdates}
+        # ${Function:...} gives a ScriptBlock, but $using: serialises it to a string in the job.
+        # Use [scriptblock]::Create() to reconstruct it on the other side.
+        $fnWinget = ${Function:Test-WingetHasUpdates}.ToString()
         $preWingetJob = Start-Job -ScriptBlock {
-            # Stub host functions not available in a job runspace
             function Write-Status { param([string]$Message, [string]$Type = 'Info') }
             function Write-Log    { param([string]$Message, [string]$Level = 'INFO') }
-            & $using:fnWinget
+            & ([scriptblock]::Create($using:fnWinget))
         }
     }
 
     # Only wsl --update needs elevation; apt-get does not.
     # Skip when -NoWsl or -OnlyWslPackages is set (wsl --update won't run anyway).
     if (-not $NoWsl -and -not $OnlyWslPackages -and (Get-Command wsl -ErrorAction SilentlyContinue)) {
-        $fnWsl = ${Function:Test-WslHasUpdates}
+        $fnWsl = ${Function:Test-WslHasUpdates}.ToString()
         $preWslJob = Start-Job -ScriptBlock {
             # Capture Write-Status calls so they can be replayed in the main runspace
             $wslMsgs = [System.Collections.Generic.List[hashtable]]::new()
@@ -629,7 +630,7 @@ if ($Sudo) {
                 $wslMsgs.Add(@{ Message = $Message; Type = $Type })
             }
             function Write-Log { param([string]$Message, [string]$Level = 'INFO') }
-            $r = & $using:fnWsl
+            $r = & ([scriptblock]::Create($using:fnWsl))
             [PSCustomObject]@{ Result = $r; Messages = $wslMsgs.ToArray() }
         }
     }
