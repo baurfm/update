@@ -467,7 +467,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.16"
+$_version = "v10.17"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -595,7 +595,7 @@ if ($Sudo) {
         } else {
             # Prefix is protected — only elevate if there are actual updates to install.
             # npm outdated -g --json exits 1 when outdated, 0 when current; always emits JSON (empty {} = no updates).
-            $npmOutdatedJson = & npm outdated -g --json 2>&1
+            $npmOutdatedJson = & npm outdated -g --json 2>$null
             $npmOutdatedParsed = $npmOutdatedJson | ConvertFrom-Json -ErrorAction SilentlyContinue
             # An empty {} parses to a non-null PSCustomObject with no properties — that means no updates.
             $npmHasUpdates = $null -ne $npmOutdatedParsed -and
