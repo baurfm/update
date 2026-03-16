@@ -79,6 +79,10 @@
 .PARAMETER LogFile
     Path to the log file. Default is 'update.log'.
 
+.PARAMETER DryRun
+    Show which tools are installed and would be updated, without executing any updates.
+    Pre-checks and elevation are skipped; all sections show "dry run" in the output.
+
 .EXAMPLE
     .\update.ps1
 
@@ -112,7 +116,7 @@
 .NOTES
     Author: Your Name
     Date: 2025-01-20
-    Version: 10.18
+    Version: 10.19
 #>
 
 param(
@@ -148,6 +152,7 @@ param(
     [switch]$NoRye,         # Skip Rye self-update
     [switch]$NoComposer,    # Skip Composer self-update
     [switch]$NoKrew,        # Skip krew (kubectl plugin manager) upgrade
+    [switch]$DryRun,        # Show what would be updated without running updates
     [switch]$OnlyWsl,
     [switch]$OnlyWslPackages,
 
@@ -165,6 +170,8 @@ param(
 $script:TexLiveTimeoutSec  = 1800   # max seconds to wait for tlmgr (30 min)
 $script:TexLiveLogAgeMins  = 10     # minutes back to scan for TeX Live log files
 $script:DownloadTimeoutSec = 120    # seconds for Invoke-WebRequest calls
+$script:DiskSpaceWarnGB    = 2      # GB free on C: below which to warn
+$script:LogArchiveCount    = 5      # number of archived log files to keep
 # ───────────────────────────────────────────────────────────────────────────
 
 # Helper: format a TimeSpan as "4m 12s" / "38s" / "1h 2m"
@@ -187,6 +194,8 @@ function Write-SectionHeader {
 # Function to display a group header (primary level — separates logical categories)
 function Write-GroupHeader {
     param([string]$Title)
+    $maxLen = 54   # 58-char rule minus 4 for the ▪ prefix — truncate if longer
+    if ($Title.Length -gt $maxLen) { $Title = $Title.Substring(0, $maxLen - 3) + '...' }
     $line = ([char]0x2550).ToString() * 58   # ══════════ (double rule — visually heavier)
     Write-Host ""
     Write-Host "  $line" -ForegroundColor DarkGray
@@ -258,6 +267,12 @@ function Update-Section {
         return
     }
 
+    if ($DryRun) {
+        Write-Status "$SectionName — installed (dry run, skipping)" -Type Skip
+        $script:skippedSections += "$SectionName (dry run)"
+        return
+    }
+
     Write-SectionHeader "Updating $SectionName"
     Write-Log "Starting $SectionName updates."
 
@@ -265,12 +280,14 @@ function Update-Section {
     try {
         & $UpdateAction
         $elapsed = (Get-Date) - $sectionStart
+        $script:sectionTimings[$SectionName] = $elapsed
         Write-Status "Done  $(Format-Elapsed $elapsed)" -Type Success
-        Write-Log "$SectionName updates completed."
+        Write-Log "$SectionName updates completed in $(Format-Elapsed $elapsed)."
     } catch {
         $elapsed = (Get-Date) - $sectionStart
+        $script:sectionTimings[$SectionName] = $elapsed
         Write-Status "Failed after $(Format-Elapsed $elapsed): $_" -Type Error
-        Write-Log "Error during $SectionName updates: $_" -Level "ERROR"
+        Write-Log "Error during $SectionName updates: $_ [$(Format-Elapsed $elapsed)]" -Level "ERROR"
     }
 }
 
@@ -301,12 +318,35 @@ function Invoke-WithRetry {
             Write-Log "$ActionName threw exception (attempt $attempt): $_" -Level "WARN"
         }
         if ($attempt -lt $maxAttempts) {
-            Write-Status "Retrying $ActionName (attempt $($attempt + 1) of $maxAttempts)..." -Type Warning
-            Start-Sleep -Seconds $DelaySeconds
+            $sleepSec = $DelaySeconds * $attempt   # exponential: 5s, 10s, 15s …
+            Write-Status "Retrying $ActionName in ${sleepSec}s (attempt $($attempt + 1) of $maxAttempts)..." -Type Warning
+            Start-Sleep -Seconds $sleepSec
         }
     } while ($attempt -lt $maxAttempts)
     Write-Log "$ActionName failed after $maxAttempts attempts." -Level "ERROR"
     return $false
+}
+
+# Helper: standard "tool self-update" — wraps Invoke-WithRetry and records into result hashtables.
+# Write-Status for the action line is intentionally inside callers so the message can be customised.
+function Invoke-SelfUpdate {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ToolName,
+        [Parameter(Mandatory)]
+        [string]$Key,
+        [Parameter(Mandatory)]
+        [scriptblock]$Action,
+        [string]$ActionName
+    )
+    if (-not $ActionName) { $ActionName = "$ToolName self-update" }
+    Write-Status "Updating $ToolName..." -Type Action
+    if (Invoke-WithRetry -Action $Action -ActionName $ActionName) {
+        $updatedItems[$Key] += $ToolName
+    } else {
+        Write-Status "$ToolName self-update failed" -Type Error
+        $failedItems[$Key] += "$ToolName self-update (failed)"
+    }
 }
 
 # Helper: non-elevated pre-check — returns $true if winget reports any non-pinned upgradable
@@ -456,7 +496,7 @@ if (Test-Path $LogFile) {
     Rename-Item -Path $LogFile -NewName $archivePath -ErrorAction SilentlyContinue
     Get-ChildItem -Path $LogDir -Filter "$logBase-*.log" |
         Sort-Object LastWriteTime -Descending |
-        Select-Object -Skip 5 |
+        Select-Object -Skip $script:LogArchiveCount |
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
@@ -467,7 +507,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.18"
+$_version = "v10.19"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -525,9 +565,9 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
 
 # Disk space warning
 $freeGB = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
-if ($freeGB -lt 2) {
-    Write-Status "Low disk space: ${freeGB} GB free on C: — updates may fail" -Type Warning
-    Write-Log "WARNING: Low disk space: ${freeGB} GB free on C:" -Level "WARN"
+if ($freeGB -lt $script:DiskSpaceWarnGB) {
+    Write-Status "Low disk space: ${freeGB} GB free on C: — updates may fail (threshold: $($script:DiskSpaceWarnGB) GB)" -Type Warning
+    Write-Log "WARNING: Low disk space: ${freeGB} GB free on C: (threshold: $($script:DiskSpaceWarnGB) GB)" -Level "WARN"
 }
 
 Write-Log "Starting update script."
@@ -536,7 +576,10 @@ Write-Log "PowerShell: $($PSVersionTable.PSVersion)"
 Write-Log "User: $([System.Environment]::UserName)"
 Write-Log "Free disk (C:): ${freeGB} GB"
 if ($PSBoundParameters.Count -gt 0) {
-    Write-Log "Parameters: $($PSBoundParameters.Keys -join ', ')"
+    $paramStr = ($PSBoundParameters.GetEnumerator() | ForEach-Object {
+        if ($_.Value -is [switch]) { "-$($_.Key)" } else { "-$($_.Key) '$($_.Value)'" }
+    }) -join ' '
+    Write-Log "Parameters: $paramStr"
 }
 
 # Set error action preference for consistent error handling
@@ -553,33 +596,54 @@ $npmNeedsElevation    = $false
 if ($Sudo) {
     Write-Status "Sudo flag set — skipping pre-checks, will elevate immediately" -Type Info
     Write-Log "Pre-check: -Sudo specified, skipping all pre-checks." -Level "INFO"
+} elseif ($DryRun) {
+    Write-Status "Dry run — skipping pre-checks and elevation" -Type Info
+    Write-Log "Pre-check: dry run, skipping all pre-checks." -Level "INFO"
 } else {
+    # winget and WSL pre-checks are launched as background jobs so they run in parallel.
+    # Both involve network/process calls (winget source update, GitHub API); running them
+    # concurrently shaves several seconds off startup time.
+    # npm prefix write-test is instant — runs inline while the jobs are in flight.
+    $preWingetJob = $null
+    $preWslJob    = $null
+
     if (-not $NoWinget -and (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Write-Status "Pre-checking winget for available updates..." -Type Action
-        $wingetNeedsElevation = Test-WingetHasUpdates
-        if ($wingetNeedsElevation) {
-            Write-Log "Pre-check: winget has updates — elevation needed." -Level "INFO"
-        } else {
-            Write-Status "Winget: all packages up-to-date — no elevation needed" -Type Success
-            Write-Log "Pre-check: winget up-to-date, no elevation needed." -Level "INFO"
+        $fnWinget = ${Function:Test-WingetHasUpdates}
+        $preWingetJob = Start-Job -ScriptBlock {
+            # Stub host functions not available in a job runspace
+            function Write-Status { param([string]$Message, [string]$Type = 'Info') }
+            function Write-Log    { param([string]$Message, [string]$Level = 'INFO') }
+            & $using:fnWinget
         }
     }
 
     # Only wsl --update needs elevation; apt-get does not.
     # Skip when -NoWsl or -OnlyWslPackages is set (wsl --update won't run anyway).
     if (-not $NoWsl -and -not $OnlyWslPackages -and (Get-Command wsl -ErrorAction SilentlyContinue)) {
-        Write-Status "Pre-checking WSL for available kernel updates..." -Type Action
-        $wslNeedsElevation = Test-WslHasUpdates
-        if ($wslNeedsElevation) {
-            Write-Log "Pre-check: WSL kernel has updates — elevation needed." -Level "INFO"
-        } else {
-            Write-Status "WSL kernel already up-to-date — no elevation needed for WSL" -Type Success
-            Write-Log "Pre-check: WSL kernel up-to-date, no elevation needed." -Level "INFO"
+        $fnWsl = ${Function:Test-WslHasUpdates}
+        $preWslJob = Start-Job -ScriptBlock {
+            # Capture Write-Status calls so they can be replayed in the main runspace
+            $wslMsgs = [System.Collections.Generic.List[hashtable]]::new()
+            function Write-Status {
+                param([string]$Message, [string]$Type = 'Info')
+                $wslMsgs.Add(@{ Message = $Message; Type = $Type })
+            }
+            function Write-Log { param([string]$Message, [string]$Level = 'INFO') }
+            $r = & $using:fnWsl
+            [PSCustomObject]@{ Result = $r; Messages = $wslMsgs.ToArray() }
         }
     }
 
+    if ($preWingetJob -or $preWslJob) {
+        $preCheckNames = @()
+        if ($preWingetJob) { $preCheckNames += 'winget' }
+        if ($preWslJob)    { $preCheckNames += 'WSL' }
+        Write-Status "Running $($preCheckNames -join ' + ') pre-checks in background..." -Type Action
+    }
+
+    # npm: prefix write-test runs inline (no network, no blocking) while the jobs are in flight
     if (-not $NoNpm -and -not $OnlyWsl -and -not $OnlyWslPackages -and (Get-Command npm -ErrorAction SilentlyContinue)) {
-        Write-Status "Pre-checking npm for available updates..." -Type Action
+        Write-Status "Pre-checking npm prefix writability..." -Type Action
         $npmPrefix = (& npm config get prefix 2>&1).Trim()
         $npmWriteTest = Join-Path $npmPrefix ".write-test-$([System.Guid]::NewGuid().ToString('N'))"
         $npmPrefixWritable = $false
@@ -610,6 +674,37 @@ if ($Sudo) {
             }
         }
     }
+
+    # Collect background job results (jobs were running while npm check ran above)
+    if ($preWingetJob) {
+        $preWingetJob | Wait-Job | Out-Null
+        $wingetNeedsElevation = [bool]($preWingetJob | Receive-Job)
+        $preWingetJob | Remove-Job -Force
+        if ($wingetNeedsElevation) {
+            Write-Log "Pre-check: winget has updates — elevation needed." -Level "INFO"
+        } else {
+            Write-Status "Winget: all packages up-to-date — no elevation needed" -Type Success
+            Write-Log "Pre-check: winget up-to-date, no elevation needed." -Level "INFO"
+        }
+    }
+
+    if ($preWslJob) {
+        $preWslJob | Wait-Job | Out-Null
+        $wslJobResult = $preWslJob | Receive-Job
+        $preWslJob | Remove-Job -Force
+        # Replay status messages captured inside the job (version strings, warnings)
+        if ($wslJobResult -and $wslJobResult.Messages) {
+            foreach ($wslMsg in $wslJobResult.Messages) {
+                Write-Status $wslMsg.Message -Type $wslMsg.Type
+            }
+        }
+        $wslNeedsElevation = if ($wslJobResult) { [bool]$wslJobResult.Result } else { $false }
+        if ($wslNeedsElevation) {
+            Write-Log "Pre-check: WSL kernel has updates — elevation needed." -Level "INFO"
+        } else {
+            Write-Log "Pre-check: WSL kernel up-to-date, no elevation needed." -Level "INFO"
+        }
+    }
 }
 
 # Compute admin status once; used later by the WSL section to gate wsl --update.
@@ -618,7 +713,7 @@ $myWindowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal($myW
 $adminRole          = [System.Security.Principal.WindowsBuiltInRole]::Administrator
 $script:isAdmin     = $myWindowsPrincipal.IsInRole($adminRole)
 
-if ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -or $npmNeedsElevation) {
+if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -or $npmNeedsElevation)) {
     if (-not $script:isAdmin) {
         # Build argument array from bound parameters
         $argArray = @()
@@ -702,7 +797,8 @@ foreach ($k in $sectionKeys) {
     $updatedItems[$k] = @()
     $failedItems[$k]  = @()
 }
-$skippedSections = @()
+$skippedSections      = @()
+$script:sectionTimings = @{}   # SectionName → TimeSpan (populated by Update-Section)
 
 # ══════════════════════════════════════════════════════
 # PACKAGE MANAGERS  (update foundations first)
@@ -927,13 +1023,8 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
 
 # --- Update Oh My Posh ---
 Update-Section "Oh My Posh" ($NoOhMyPosh -or $OnlyWsl -or $OnlyWslPackages) { Get-Command oh-my-posh -ErrorAction SilentlyContinue } {
-    Write-Status "Upgrading Oh My Posh..." -Type Action
-    if (Invoke-WithRetry -Action { & oh-my-posh upgrade 2>&1 | Out-Null } -ActionName "oh-my-posh upgrade") {
-        $updatedItems["Oh My Posh"] += "Oh My Posh"
-    } else {
-        Write-Status "oh-my-posh upgrade failed" -Type Error
-        $failedItems["Oh My Posh"] += "oh-my-posh upgrade (failed)"
-    }
+    Invoke-SelfUpdate -ToolName "Oh My Posh" -Key "Oh My Posh" `
+        -Action { & oh-my-posh upgrade 2>&1 | Out-Null } -ActionName "oh-my-posh upgrade"
 }
 
 # ══════════════════════════════════════════════════════
@@ -1080,35 +1171,19 @@ Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $O
 
 # --- Update pnpm ---
 Update-Section "pnpm" ($NoPnpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command pnpm -ErrorAction SilentlyContinue } {
-    Write-Status "Updating pnpm..." -Type Action
-    if (Invoke-WithRetry -Action { & pnpm self-update 2>&1 | Out-Null } -ActionName "pnpm self-update") {
-        $updatedItems["pnpm"] += "pnpm"
-    } else {
-        Write-Status "pnpm self-update failed" -Type Error
-        $failedItems["pnpm"] += "pnpm self-update (failed)"
-    }
+    Invoke-SelfUpdate -ToolName "pnpm" -Key "pnpm" -Action { & pnpm self-update 2>&1 | Out-Null }
 }
 
 # --- Update Bun ---
 Update-Section "Bun" ($NoBun -or $OnlyWsl -or $OnlyWslPackages) { Get-Command bun -ErrorAction SilentlyContinue } {
-    Write-Status "Upgrading Bun..." -Type Action
-    if (Invoke-WithRetry -Action { & bun upgrade 2>&1 | Out-Null } -ActionName "bun upgrade") {
-        $updatedItems["Bun"] += "Bun"
-    } else {
-        Write-Status "bun upgrade failed" -Type Error
-        $failedItems["Bun"] += "bun upgrade (failed)"
-    }
+    Invoke-SelfUpdate -ToolName "Bun" -Key "Bun" `
+        -Action { & bun upgrade 2>&1 | Out-Null } -ActionName "bun upgrade"
 }
 
 # --- Update Deno ---
 Update-Section "Deno" ($NoDeno -or $OnlyWsl -or $OnlyWslPackages) { Get-Command deno -ErrorAction SilentlyContinue } {
-    Write-Status "Upgrading Deno..." -Type Action
-    if (Invoke-WithRetry -Action { & deno upgrade 2>&1 | Out-Null } -ActionName "deno upgrade") {
-        $updatedItems["Deno"] += "Deno"
-    } else {
-        Write-Status "deno upgrade failed" -Type Error
-        $failedItems["Deno"] += "deno upgrade (failed)"
-    }
+    Invoke-SelfUpdate -ToolName "Deno" -Key "Deno" `
+        -Action { & deno upgrade 2>&1 | Out-Null } -ActionName "deno upgrade"
 }
 
 # ══════════════════════════════════════════════════════
@@ -1218,24 +1293,14 @@ Update-Section "uv" ($NoUv -or $OnlyWsl -or $OnlyWslPackages) { Get-Command uv -
 
 # --- Update Poetry ---
 Update-Section "Poetry" ($NoPoetry -or $OnlyWsl -or $OnlyWslPackages) { Get-Command poetry -ErrorAction SilentlyContinue } {
-    Write-Status "Updating Poetry..." -Type Action
-    if (Invoke-WithRetry -Action { & poetry self update 2>&1 | Out-Null } -ActionName "poetry self update") {
-        $updatedItems["Poetry"] += "Poetry"
-    } else {
-        Write-Status "poetry self update failed" -Type Error
-        $failedItems["Poetry"] += "poetry self update (failed)"
-    }
+    Invoke-SelfUpdate -ToolName "Poetry" -Key "Poetry" `
+        -Action { & poetry self update 2>&1 | Out-Null } -ActionName "poetry self update"
 }
 
 # --- Update Rye ---
 Update-Section "Rye" ($NoRye -or $OnlyWsl -or $OnlyWslPackages) { Get-Command rye -ErrorAction SilentlyContinue } {
-    Write-Status "Updating Rye..." -Type Action
-    if (Invoke-WithRetry -Action { & rye self update 2>&1 | Out-Null } -ActionName "rye self update") {
-        $updatedItems["Rye"] += "Rye"
-    } else {
-        Write-Status "rye self update failed" -Type Error
-        $failedItems["Rye"] += "rye self update (failed)"
-    }
+    Invoke-SelfUpdate -ToolName "Rye" -Key "Rye" `
+        -Action { & rye self update 2>&1 | Out-Null } -ActionName "rye self update"
 }
 
 # ══════════════════════════════════════════════════════
@@ -1318,13 +1383,7 @@ Update-Section "Ruby Gems" ($NoGem -or $OnlyWsl -or $OnlyWslPackages) { Get-Comm
 
 # --- Update Composer ---
 Update-Section "Composer" ($NoComposer -or $OnlyWsl -or $OnlyWslPackages) { Get-Command composer -ErrorAction SilentlyContinue } {
-    Write-Status "Self-updating Composer..." -Type Action
-    if (Invoke-WithRetry -Action { & composer self-update 2>&1 | Out-Null } -ActionName "composer self-update") {
-        $updatedItems["Composer"] += "Composer"
-    } else {
-        Write-Status "composer self-update failed" -Type Error
-        $failedItems["Composer"] += "composer self-update (failed)"
-    }
+    Invoke-SelfUpdate -ToolName "Composer" -Key "Composer" -Action { & composer self-update 2>&1 | Out-Null }
 }
 
 # ══════════════════════════════════════════════════════
@@ -1509,10 +1568,12 @@ Update-Section "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Comma
                 -OutFile $updaterPath -UseBasicParsing -ErrorAction Stop -TimeoutSec $script:DownloadTimeoutSec
             Write-Log "Downloaded update-tlmgr-latest.exe to $updaterPath." -Level "INFO"
             Write-Status "Running update-tlmgr-latest.exe --update..." -Type Action
-            $updaterOutput = & $updaterPath --update 2>&1
+            $updaterOutput   = & $updaterPath --update 2>&1
+            $updaterExitCode = $LASTEXITCODE
             $updaterOutput | ForEach-Object { Write-Log "  [updater] $_" -Level "DEBUG" }
+            Remove-Item $updaterPath -ErrorAction SilentlyContinue   # clean up temp file
             Write-TexLiveLog
-            if ($LASTEXITCODE -eq 0) {
+            if ($updaterExitCode -eq 0) {
                 Write-Log "update-tlmgr-latest.exe succeeded. Retrying tlmgr update." -Level "INFO"
                 Write-Status "tlmgr upgraded — retrying full update (30 min timeout)..." -Type Action
                 $tl2 = Invoke-TlMgrUpdate
@@ -1530,8 +1591,8 @@ Update-Section "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Comma
                     $failedItems["TeX Live"] += "tlmgr update failed after cross-release upgrade"
                 }
             } else {
-                Write-Log "update-tlmgr-latest.exe failed (exit $LASTEXITCODE)." -Level "ERROR"
-                Write-Status "update-tlmgr-latest.exe failed (exit $LASTEXITCODE)" -Type Error
+                Write-Log "update-tlmgr-latest.exe failed (exit $updaterExitCode)." -Level "ERROR"
+                Write-Status "update-tlmgr-latest.exe failed (exit $updaterExitCode)" -Type Error
                 $failedItems["TeX Live"] += "update-tlmgr-latest.exe failed — run manually"
             }
         } catch {
@@ -1591,6 +1652,25 @@ if ($skippedSections.Count -gt 0) {
     Write-Host "  $([char]0x25CB)  Skipped" -ForegroundColor DarkGray
     $skippedSections | ForEach-Object { Write-Host "       $([char]0x2022) $_" -ForegroundColor DarkGray }
 }
+
+# Section timings — only show sections that took 5 s or more
+$slowSections = $script:sectionTimings.GetEnumerator() |
+    Where-Object { $_.Value.TotalSeconds -ge 5 } |
+    Sort-Object { $_.Value } -Descending
+if ($slowSections) {
+    Write-Host ""
+    Write-Host "  $([char]0x25CB)  Timings" -ForegroundColor DarkGray
+    $slowSections | ForEach-Object {
+        Write-Host "       $([char]0x2022) $($_.Key): $(Format-Elapsed $_.Value)" -ForegroundColor DarkGray
+    }
+}
+
+# One-line stats
+$updatedCount = ($updatedItems.Values | Where-Object { $_.Count -gt 0 }).Count
+$failedCount  = ($failedItems.Values  | Where-Object { $_.Count -gt 0 }).Count
+$skippedCount = $skippedSections.Count
+Write-Host ""
+Write-Host "  $([char]0x00B7)  $updatedCount updated  $([char]0x00B7)  $failedCount failed  $([char]0x00B7)  $skippedCount skipped" -ForegroundColor DarkGray
 
 Write-Host ""
 if ($hasFailures) {
