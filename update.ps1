@@ -1312,18 +1312,24 @@ Write-GroupHeader "Other Languages"
 # --- Update .NET Global Tools ---
 Update-Section ".NET Global Tools" ($NoDotnet -or $OnlyWsl -or $OnlyWslPackages) { Get-Command dotnet -ErrorAction SilentlyContinue } {
     Write-Status "Listing installed .NET global tools..." -Type Action
-    $toolListOut = & dotnet tool list -g 2>&1
+    # 2>$null suppresses the SDK telemetry disclaimer that dotnet writes to stderr.
+    # With 2>&1 those lines get mixed into the tool list and parsed as fake tool IDs.
+    $toolListOut = & dotnet tool list -g 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Status "dotnet tool list failed (exit $LASTEXITCODE)" -Type Error
         $failedItems[".NET Global Tools"] += "dotnet tool list (Exit Code: $LASTEXITCODE)"
         return
     }
+    # Skip the two header lines, then keep only lines whose first token looks like a
+    # NuGet package ID (letter/digit start, contains at least one dot).
     $toolLines = $toolListOut | Select-Object -Skip 2 | Where-Object { $_ -match '\S' }
     if (-not $toolLines) {
         Write-Status "No .NET global tools installed" -Type Info
         return
     }
-    $toolIds = $toolLines | ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $toolIds = $toolLines |
+        ForEach-Object { ($_ -split '\s+')[0] } |
+        Where-Object { $_ -match '^[A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z0-9]' }
 
     if ($PSVersionTable.PSVersion.Major -ge 7) {
         Write-Status "Updating $($toolIds.Count) tool(s) in parallel..." -Type Action
