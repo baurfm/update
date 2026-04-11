@@ -179,6 +179,7 @@ Get-Help .\update.ps1 -Full
 | `-SkipWslSudoConfig` | - | Skip automatic passwordless-sudo setup for WSL |
 | `-LogFile <path>` | - | Override log file path (default: `logs/update.log`) |
 | `-EnableVerbose` | - | Verbose output |
+| `-RemoveFromPath` | - | Remove the auto-registered `update.cmd` shim and strip the script dir from User PATH, then exit |
 
 ## 📋 Prerequisites
 
@@ -368,6 +369,7 @@ After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any di
 
 ## 📈 Version History
 
+- **v10.21** — Auto-register `update` command on User PATH via `update.cmd` shim (new `-RemoveFromPath` to undo); gcloud now parses output instead of blindly trusting exit code (handles external-package-manager case); cleaner summary layout (no duplicate failure lines, group headers get trailing whitespace); silent script-directory switch
 - **v10.20** — Fix: winget upgrade check treated "no updates" exit code as failure; PS module subprocess leaked temp script on `Start-Process` exception; added `uv tool upgrade --all` so all uv-installed tools are updated alongside uv itself
 - **v10.19** — Parallel pre-checks, `-DryRun` mode, .NET tool list stderr fix, broad refactoring
 - **v10.18** — Fix: temp-file leak, defensive `$LASTEXITCODE` capture

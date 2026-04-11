@@ -116,7 +116,7 @@
 .NOTES
     Author: Your Name
     Date: 2025-01-20
-    Version: 10.20
+    Version: 10.21
 #>
 
 param(
@@ -153,6 +153,7 @@ param(
     [switch]$NoComposer,    # Skip Composer self-update
     [switch]$NoKrew,        # Skip krew (kubectl plugin manager) upgrade
     [switch]$DryRun,        # Show what would be updated without running updates
+    [switch]$RemoveFromPath, # Remove update.cmd shim and strip script dir from User PATH, then exit
     [switch]$OnlyWsl,
     [switch]$OnlyWslPackages,
 
@@ -201,6 +202,7 @@ function Write-GroupHeader {
     Write-Host "  $line" -ForegroundColor DarkGray
     Write-Host "  $([char]0x25AA) " -NoNewline -ForegroundColor DarkYellow   # ▪
     Write-Host $Title -ForegroundColor Yellow
+    Write-Host ""
 }
 
 # Function to display a status message with a consistent prefix
@@ -473,6 +475,83 @@ function Invoke-TlMgrUpdate {
     return $result
 }
 
+# Ensures 'update' is callable from any shell by writing a small update.cmd shim
+# in the script directory and adding that directory to the User PATH. Idempotent:
+# no-op if an 'update' command already resolves (respects user's existing setup).
+function Initialize-UpdateCommand {
+    param([string]$ScriptDir)
+
+    # Respect existing setups (profile function, scoop shim, manual entry, …)
+    if (Get-Command update -ErrorAction SilentlyContinue) { return }
+
+    $shimPath = Join-Path $ScriptDir "update.cmd"
+    if (-not (Test-Path $shimPath)) {
+        $shimBody = @'
+@echo off
+where /q pwsh >nul 2>&1
+if %errorlevel%==0 (
+    pwsh -File "%~dp0update.ps1" %*
+) else (
+    powershell -File "%~dp0update.ps1" %*
+)
+'@
+        Set-Content -Path $shimPath -Value $shimBody -Encoding ASCII
+        Write-Status "Created update.cmd shim" -Type Info
+    }
+
+    $resolvedDir = try { (Resolve-Path $ScriptDir).Path.TrimEnd('\') } catch { $ScriptDir.TrimEnd('\') }
+    $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+    $entries  = @()
+    if ($userPath) { $entries = $userPath -split ';' | Where-Object { $_ } }
+
+    $alreadyInPath = $false
+    foreach ($e in $entries) {
+        $resolved = try { (Resolve-Path $e -ErrorAction Stop).Path.TrimEnd('\') } catch { $e.TrimEnd('\') }
+        if ($resolved -ieq $resolvedDir) { $alreadyInPath = $true; break }
+    }
+
+    if (-not $alreadyInPath) {
+        $newUserPath = if ($userPath) { "$userPath;$ScriptDir" } else { $ScriptDir }
+        [Environment]::SetEnvironmentVariable('PATH', $newUserPath, 'User')
+        Write-Status "Added $ScriptDir to user PATH — 'update' is now reachable from any shell" -Type Success
+        Write-Log "PATH: appended $ScriptDir to User PATH" -Level "INFO"
+    }
+
+    # Also make it visible in the *current* session
+    if (";$env:PATH;" -notlike "*;$ScriptDir;*") {
+        $env:PATH = "$env:PATH;$ScriptDir"
+    }
+}
+
+# Removes the update.cmd shim and strips the script directory from User PATH.
+function Remove-UpdateCommand {
+    param([string]$ScriptDir)
+
+    $shimPath = Join-Path $ScriptDir "update.cmd"
+    if (Test-Path $shimPath) {
+        Remove-Item $shimPath -Force -ErrorAction SilentlyContinue
+        Write-Status "Removed update.cmd shim" -Type Info
+    }
+
+    $resolvedDir = try { (Resolve-Path $ScriptDir).Path.TrimEnd('\') } catch { $ScriptDir.TrimEnd('\') }
+    $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+    if ($userPath) {
+        $kept = $userPath -split ';' | Where-Object {
+            if (-not $_) { return $false }
+            $resolved = try { (Resolve-Path $_ -ErrorAction Stop).Path.TrimEnd('\') } catch { $_.TrimEnd('\') }
+            $resolved -ine $resolvedDir
+        }
+        $newUserPath = $kept -join ';'
+        if ($newUserPath -ne $userPath) {
+            [Environment]::SetEnvironmentVariable('PATH', $newUserPath, 'User')
+            Write-Status "Removed $ScriptDir from User PATH" -Type Success
+            Write-Log "PATH: removed $ScriptDir from User PATH" -Level "INFO"
+        } else {
+            Write-Status "$ScriptDir was not in User PATH" -Type Info
+        }
+    }
+}
+
 # --- Early log initialization ---
 # Must happen before the banner, self-update, and pre-checks so that all Write-Log
 # calls land in logs/update.log rather than a relative-path file that gets archived.
@@ -507,7 +586,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.20"
+$_version = "v10.21"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -522,6 +601,15 @@ Write-Host (" " * [Math]::Max(0, $_bw - $_dateStr.Length)) -NoNewline
 Write-Host "$_bBar" -ForegroundColor DarkGray
 Write-Host $_bBot -ForegroundColor DarkGray
 Write-Host ""
+
+# --- Handle -RemoveFromPath: strip shim + PATH entry and exit ---
+if ($RemoveFromPath) {
+    Remove-UpdateCommand -ScriptDir $ScriptPath
+    exit 0
+}
+
+# --- Auto-register 'update' command on PATH (silent if already reachable) ---
+Initialize-UpdateCommand -ScriptDir $ScriptPath
 
 # --- Self-update via git pull ---
 if (-not $NoSelfUpdate) {
@@ -769,8 +857,6 @@ if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -o
 }
 
 if ((Get-Location).Path -ne $ScriptPath) {
-    Write-Warning "Script should be run from its directory: $ScriptPath"
-    Write-Host "Changing to script directory..." -ForegroundColor Yellow
     Set-Location $ScriptPath
 }
 
@@ -1417,11 +1503,29 @@ Write-GroupHeader "Cloud / DevOps"
 # --- Update Google Cloud SDK ---
 Update-Section "Google Cloud SDK" ($NoGCloud -or $OnlyWsl -or $OnlyWslPackages) { Get-Command gcloud -ErrorAction SilentlyContinue } {
     Write-Status "Updating gcloud components..." -Type Action
-    if (Invoke-WithRetry -Action { & gcloud components update --quiet 2>&1 | Out-Null } -ActionName "gcloud components update") {
+    # Don't retry: gcloud often exits non-zero when installed via an external
+    # package manager (Scoop/Choco/apt) because the component manager is disabled.
+    # Capture output so we can distinguish real failures from benign ones.
+    $gcloudOut  = & gcloud components update --quiet 2>&1
+    $gcloudCode = $LASTEXITCODE
+    $gcloudText = ($gcloudOut | Out-String)
+    $gcloudOut | ForEach-Object { Write-Log "  [gcloud] $_" -Level "DEBUG" }
+
+    if ($gcloudText -match 'disabled for this installation' -or
+        $gcloudText -match 'managed by an external package manager' -or
+        $gcloudText -match 'installation is managed by') {
+        Write-Status "gcloud is managed by an external package manager — skipping" -Type Skip
+        Write-Log "gcloud: component manager disabled (external install)" -Level "INFO"
+        $script:skippedSections += "Google Cloud SDK (managed externally)"
+        return
+    }
+
+    if ($gcloudCode -eq 0 -or $gcloudText -match 'All components are up to date') {
         $updatedItems["Google Cloud SDK"] += "All components"
     } else {
-        Write-Status "gcloud components update failed" -Type Error
-        $failedItems["Google Cloud SDK"] += "gcloud components update failed"
+        Write-Status "gcloud components update failed (exit $gcloudCode)" -Type Error
+        Write-Log "gcloud output: $gcloudText" -Level "INFO"
+        $failedItems["Google Cloud SDK"] += "gcloud components update (exit $gcloudCode)"
     }
 }
 
@@ -1712,7 +1816,8 @@ foreach ($key in $updatedItems.Keys) {
 }
 foreach ($key in $failedItems.Keys) {
     if ($failedItems[$key].Count -gt 0) {
-        Write-Log "  Failed  [$key]: $($failedItems[$key] -join ', ')" -Level "ERROR"
+        # Use INFO so Write-Log doesn't re-emit the already-shown terminal line via Write-Status
+        Write-Log "  Failed  [$key]: $($failedItems[$key] -join ', ')"
     }
 }
 if ($skippedSections.Count -gt 0) {
@@ -1721,9 +1826,10 @@ if ($skippedSections.Count -gt 0) {
 Write-Log "Total time: $(Format-Elapsed $totalElapsed)"
 Write-Log "==================="
 
-# Exit with appropriate code based on failures
+# Exit with appropriate code based on failures.
+# Use INFO for the exit-status log — the banner/summary already rendered it to terminal.
 if ($hasFailures) {
-    Write-Log "Script completed with failures." -Level "ERROR"
+    Write-Log "Script completed with failures."
     exit 1
 }
 Write-Log "Script completed successfully."
