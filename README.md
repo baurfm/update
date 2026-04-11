@@ -8,34 +8,90 @@ A comprehensive PowerShell script that automates the update process for multiple
 
 ## 🚀 Features
 
-- **Comprehensive Coverage**: Updates 11 different development tool categories
-- **Selective Updates**: Skip specific sections using command-line parameters
-- **Error Handling**: Robust error handling with detailed reporting
-- **Centralized Logs**: Output and past logs are stored in a `logs/` subdirectory for easy review
-- **Progress Tracking**: Real-time progress updates and final summary
-- **Administrative Support**: Handles elevated privileges when needed, including the new Windows `sudo`.
-- **Cross-Platform Tools**: Supports both Windows-native and cross-platform tools
+- **Comprehensive Coverage**: Updates ~27 development tool categories across package managers, language runtimes, CLIs and IDEs
+- **Selective Updates**: Skip specific sections using command-line parameters (`-NoX` flags)
+- **Dry-Run Mode**: Preview which sections would run without making any changes (`-DryRun`)
+- **Parallel Pre-Checks**: Fast up-front detection of which sections actually need updates — reduces elevation prompts and runtime
+- **Retry with Backoff**: All external commands wrapped in `Invoke-WithRetry` for transient-error resilience
+- **Automatic WSL Sudo Config**: Writes a NOPASSWD sudoers entry for `apt-get` on first run (skip with `-SkipWslSudoConfig`)
+- **Self-Update Check**: Verifies the script itself is current via GitHub on startup (disable with `-NoSelfUpdate`)
+- **Centralized Logs**: Output and past logs stored in a `logs/` subdirectory (auto-rotated, last 5 archives kept)
+- **Administrative Support**: Lazy elevation based on pre-checks, also supports the Windows `sudo` command and the `-Sudo` flag for immediate elevation
 
 ## 📦 Supported Tools
 
+Sections are organised into logical groups in the order they run:
+
+### Package Managers
+
 | Category | Tools Updated | Command Used |
 |----------|---------------|--------------|
-| **PowerShell** | All installed modules | `Update-Module` |
-| **Scoop** | Scoop itself + all packages | `scoop update` |
-| **Winget** | All Microsoft Store apps (pinned packages are ignored) | `winget upgrade --all` |
-| **VS Code** | All installed extensions | `code --install-extension` |
-| **Conda** | Base environment + all named environments | `conda update` |
-| **npm** | All globally installed packages | `npm update -g` |
-| **TeX Live** | All TeX packages | `tlmgr update --self --all` |
-| **WSL** | WSL kernel + distro packages | `wsl --update`, `apt-get full-upgrade` |
-| **pipx** | All pipx-installed apps | `pipx upgrade-all` |
-| **Rust** | Rust toolchain | `rustup update` |
-| **Ruby Gems** | RubyGems system + all gems | `gem update --system && gem update` |
+| **Scoop** | Scoop itself + all packages | `scoop update *`, `scoop cleanup *` |
+| **Winget** | All Microsoft Store / winget apps (pinned packages ignored) | `winget upgrade --all` |
 | **Chocolatey** | All Chocolatey packages | `choco upgrade all -y` |
+
+### Shell & Terminal
+
+| Category | Tools Updated | Command Used |
+|----------|---------------|--------------|
+| **PowerShell Modules** | All installed modules (with in-use fallback via subprocess) | `Update-Module` |
+| **Oh My Posh** | Oh My Posh prompt engine | `oh-my-posh upgrade` |
+
+### System
+
+| Category | Tools Updated | Command Used |
+|----------|---------------|--------------|
+| **WSL** | WSL kernel + default distro packages | `wsl --update --web-download`, `apt-get full-upgrade`, `autoremove` |
+
+### JavaScript
+
+| Category | Tools Updated | Command Used |
+|----------|---------------|--------------|
+| **npm** | All globally installed packages | `npm update -g` |
+| **pnpm** | pnpm itself | `pnpm self-update` |
+| **Bun** | Bun runtime | `bun upgrade` |
+| **Deno** | Deno runtime | `deno upgrade` |
+
+### Python
+
+| Category | Tools Updated | Command Used |
+|----------|---------------|--------------|
+| **Conda** | Base environment + all named environments (dynamic) | `conda update --all` |
+| **pipx** | All pipx-installed apps (with `conda run` fallback) | `pipx upgrade-all` |
+| **uv** | uv itself **and** all uv-installed tools | `uv self update` + `uv tool upgrade --all` |
+| **Poetry** | Poetry itself | `poetry self update` |
+| **Rye** | Rye itself | `rye self update` |
+
+### Other Languages
+
+| Category | Tools Updated | Command Used |
+|----------|---------------|--------------|
+| **.NET Global Tools** | All `dotnet tool`-installed global tools | `dotnet tool update -g` |
+| **Rust** | Rust toolchain | `rustup update` |
+| **Ruby Gems** | RubyGems system + all gems | `gem update --system`, `gem update` |
+| **Composer** | Composer itself | `composer self-update` |
+
+### Cloud & DevOps
+
+| Category | Tools Updated | Command Used |
+|----------|---------------|--------------|
 | **Google Cloud SDK** | All gcloud components | `gcloud components update --quiet` |
-| **GitHub CLI Extensions** | All gh extensions | `gh extension upgrade --all` |
-| **.NET Global Tools** | All dotnet global tools | `dotnet tool update -g` |
 | **Android SDK** | All installed SDK components | `sdkmanager --update` |
+| **Helm plugins** | All installed Helm plugins | `helm plugin update <name>` |
+| **krew plugins** | All kubectl plugins managed by krew | `kubectl krew upgrade` |
+
+### Dev Tooling
+
+| Category | Tools Updated | Command Used |
+|----------|---------------|--------------|
+| **VS Code Extensions** | All installed extensions (parallel on PS7+) | `code --install-extension` |
+| **GitHub CLI Extensions** | All `gh` extensions | `gh extension upgrade --all` |
+
+### Typesetting
+
+| Category | Tools Updated | Command Used |
+|----------|---------------|--------------|
+| **TeX Live** | All TeX packages (background job with 30-min timeout, auto cross-release upgrade) | `tlmgr update --self --all` |
 
 ## 🛠️ Installation
 
@@ -79,25 +135,50 @@ Get-Help .\update.ps1 -Full
 
 ## ⚙️ Parameters
 
+### Skip flags (one per section)
+
+| Parameter | Description |
+|-----------|-------------|
+| `-NoPowerShell` | Skip PowerShell Modules |
+| `-NoScoop` | Skip Scoop + its packages |
+| `-NoWinget` | Skip Winget apps |
+| `-NoChoco` | Skip Chocolatey packages |
+| `-NoOhMyPosh` | Skip Oh My Posh upgrade |
+| `-NoWsl` | Skip WSL kernel + distro packages |
+| `-NoNpm` | Skip global npm packages |
+| `-NoPnpm` | Skip pnpm self-update |
+| `-NoBun` | Skip Bun upgrade |
+| `-NoDeno` | Skip Deno upgrade |
+| `-NoConda` | Skip Conda base + named environments |
+| `-NoPipx` | Skip pipx packages |
+| `-NoUv` | Skip uv self-update and `uv tool upgrade --all` |
+| `-NoPoetry` | Skip Poetry self-update |
+| `-NoRye` | Skip Rye self-update |
+| `-NoDotnet` | Skip .NET global tools |
+| `-NoRust` | Skip Rust toolchain (rustup) |
+| `-NoGem` | Skip Ruby Gems |
+| `-NoComposer` | Skip Composer self-update |
+| `-NoGCloud` | Skip Google Cloud SDK components |
+| `-NoAndroid` | Skip Android SDK components |
+| `-NoHelm` | Skip Helm plugin updates |
+| `-NoKrew` | Skip krew (kubectl plugin manager) |
+| `-NoVsCode` | Skip VS Code extensions |
+| `-NoGhExt` | Skip GitHub CLI extensions |
+| `-NoTex` | Skip TeX Live |
+
+### Mode flags
+
 | Parameter | Alias | Description |
 |-----------|-------|-------------|
 | `-Help` | `-h`, `-?` | Display detailed help message and exit |
-| `-NoPowerShell` | - | Skip updating PowerShell Modules |
-| `-NoScoop` | - | Skip updating Scoop and its packages |
-| `-NoWinget` | - | Skip updating Winget and Microsoft Store apps |
-| `-NoVsCode` | - | Skip updating Visual Studio Code extensions |
-| `-NoConda` | - | Skip updating Miniconda and its environments |
-| `-NoNpm` | - | Skip updating global npm packages |
-| `-NoTex` | - | Skip updating TeX Live |
-| `-NoWsl` | - | Skip updating Windows Subsystem for Linux (WSL) |
-| `-NoPipx` | - | Skip updating pipx packages |
-| `-NoRust` | - | Skip updating Rust toolchain via rustup |
-| `-NoGem` | - | Skip updating Ruby Gems |
-| `-NoChoco` | - | Skip updating Chocolatey packages |
-| `-NoGCloud` | - | Skip updating Google Cloud SDK components |
-| `-NoGhExt` | - | Skip updating GitHub CLI extensions |
-| `-NoDotnet` | - | Skip updating .NET global tools |
-| `-NoAndroid` | - | Skip updating Android SDK components |
+| `-DryRun` | - | Preview what would run without executing any updates |
+| `-Sudo` | - | Re-launch elevated immediately, skipping pre-checks |
+| `-NoSelfUpdate` | - | Skip the GitHub self-update check at startup |
+| `-OnlyWsl` | - | Update only WSL (kernel + distro packages) |
+| `-OnlyWslPackages` | - | Update only WSL distro packages (skip kernel) |
+| `-SkipWslSudoConfig` | - | Skip automatic passwordless-sudo setup for WSL |
+| `-LogFile <path>` | - | Override log file path (default: `logs/update.log`) |
+| `-EnableVerbose` | - | Verbose output |
 
 ## 📋 Prerequisites
 
@@ -135,24 +216,25 @@ The script provides:
 
 ### WSL Package Updates
 
-> **Logs** are now stored in a `logs/` subdirectory next to the script; the previous `update.log` text file is still written there by default and the last five archives are kept.
+> **Logs** are stored in a `logs/` subdirectory next to the script; the last five archives are kept automatically.
 
-If passwordless `sudo` is not configured for `apt-get`, the script will automatically add the necessary entry to `/etc/sudoers.d` (unless run with `-SkipWslSudoConfig`). No interactive confirmation is requested, making the script suitable for non‑interactive usage.
+The script updates packages inside your default WSL distribution via `apt-get full-upgrade`, which requires `sudo`. On first run the script **automatically writes a passwordless sudoers entry** for `apt-get` (skip with `-SkipWslSudoConfig`) — no interactive confirmation, no manual setup.
 
+<details>
+<summary>Manual passwordless-sudo setup (only if <code>-SkipWslSudoConfig</code> is used)</summary>
 
-The script now automatically updates packages within your default WSL distribution using `apt-get`. This requires `sudo` access. To allow the script to run `sudo` without a password prompt, you need to add a configuration file to your WSL instance.
+1. Open WSL: `wsl`
+2. Find your username: `whoami`
+3. Edit sudoers: `sudo visudo`
+4. Append (replace `your_linux_username`):
 
-**How to Configure Passwordless `sudo` for `apt-get`**
-
-1.  Open your WSL terminal (e.g., by running `wsl` in PowerShell).
-2.  Find your exact Linux username by running the command: `whoami`.
-3.  Open the `sudoers` configuration file with the command: `sudo visudo`. This will open the file in a terminal-based editor like `nano` or `vim`.
-4.  Add the following line to the very end of the file. **It is critical to replace `your_linux_username` with the actual username you found in step 2.**
-
-    ```
+    ```text
     your_linux_username ALL=(ALL) NOPASSWD: /usr/bin/apt-get
     ```
-5.  Save the file and exit the editor (in `nano`, press `Ctrl+X`, then `Y`, then `Enter`). The script will now be able to update your WSL packages without a password prompt.
+
+5. Save and exit.
+
+</details>
 
 ### Sample Output
 
@@ -286,24 +368,42 @@ After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any di
 
 ## 📈 Version History
 
-- **v10.5** - Add: GitHub self-update check at startup (`-NoSelfUpdate` to skip); PS modules now skips already-current modules via batch `Find-Module` pre-check; npm detects non-writable prefix (EPERM) and skips gracefully instead of retrying 3×
-- **v10.4** - Add: Android SDK via `sdkmanager --update` with `-NoAndroid`; Conda now updates all named environments dynamically (was hardcoded to `ocr-azure`)
-- **v10.3** - Perf: VS Code extensions now updated in parallel on PS7+ (`ForEach-Object -Parallel`, ThrottleLimit 6); sequential fallback for PS5
-- **v10.2** - Add: Google Cloud SDK components (`gcloud components update`), GitHub CLI extensions (`gh extension upgrade --all`), .NET global tools (`dotnet tool update -g`) with `-NoGCloud`/`-NoGhExt`/`-NoDotnet` flags
-- **v10.1** - Fix: TeX Live cross-release auto-upgrade (downloads `update-tlmgr-latest.exe` automatically), WSL `full-upgrade` for kept-back packages, conda `auto_activate` key (was deprecated `auto_activate_base`), PowerShell module false-success for in-use modules, npm packages only tracked after successful update; UI: box-drawing banner, colored section headers, per-type status colors, colored summary footer
-- **v10.0** - Add: pipx, Rust (rustup), Ruby Gems, Chocolatey update sections with `-NoPipx`/`-NoRust`/`-NoGem`/`-NoChoco` params; Fix: WSL circular sudo bug (use `wsl -u root` instead of `wsl sudo`), unconditional apt-get success tracking, re-verify sudo after auto-config; Refactor: WSL sudo logic into `Set-WslPasswordlessSudo` helper
-- **v9.9** - Automatically configure passwordless sudo for WSL `apt-get` without prompting; new `-SkipWslSudoConfig` switch
-- **v9.8** - Add: winget ignores pinned packages, conda base environment `--all` update, log files saved in dedicated `logs/` folder (retains last 5 archives); fix inconsistent archive naming
+- **v10.20** — Fix: winget upgrade check treated "no updates" exit code as failure; PS module subprocess leaked temp script on `Start-Process` exception; added `uv tool upgrade --all` so all uv-installed tools are updated alongside uv itself
+- **v10.19** — Parallel pre-checks, `-DryRun` mode, .NET tool list stderr fix, broad refactoring
+- **v10.18** — Fix: temp-file leak, defensive `$LASTEXITCODE` capture
+- **v10.17** — Fix: npm pre-check stderr pollution
+- **v10.16** — Fix bugs, improve terminal hierarchy (`Write-GroupHeader` / `Write-SectionHeader`)
+- **v10.14** — Fix: TeX Live false-positive 'Updated' when no packages changed
+- **v10.13** — Add: group headers to terminal output
+- **v10.12** — Fix: uv self-update no longer reports failure when managed externally (Scoop/pip)
+- **v10.11** — Sections reordered into logical groups; fix Conda duplicate environments
+- **v10.10** — Add 10 new sections: pnpm, Bun, Deno, Oh My Posh, uv, Poetry, Rye, Composer, Helm plugins, krew plugins (plus `uv tool upgrade --all` for all uv-installed tools)
+- **v10.9** — Fix: pre-check log entries missing from `update.log`
+- **v10.8** — Improve log file coverage
+- **v10.7** — Fix: `-Sudo` flag skips pre-checks and elevates immediately
+- **v10.6** — Error handling improvements, `-Sudo` flag, fix npm false elevation
+- **v10.5** — Add: GitHub self-update check at startup (`-NoSelfUpdate` to skip); PS modules batch pre-check via `Find-Module`; npm handles EPERM gracefully
+- **v10.4** — Add: Android SDK via `sdkmanager --update` (`-NoAndroid`); Conda updates all named environments dynamically
+- **v10.3** — Perf: VS Code extensions updated in parallel on PS7+ (ThrottleLimit 6)
+- **v10.2** — Add: Google Cloud SDK, GitHub CLI extensions, .NET global tools (`-NoGCloud`/`-NoGhExt`/`-NoDotnet`)
+- **v10.1** — Fix: TeX Live cross-release auto-upgrade, WSL `full-upgrade` for kept-back packages, conda `auto_activate` key, PS module false-success for in-use modules; UI: box-drawing banner, colored status
+- **v10.0** — Add: pipx, Rust, Ruby Gems, Chocolatey (`-NoPipx`/`-NoRust`/`-NoGem`/`-NoChoco`); Fix: WSL circular sudo (`wsl -u root` instead of `wsl sudo`); Refactor: `Set-WslPasswordlessSudo` helper
 
-- **v9.7** - Cleanup (hashtable refactor, retry style), bugfix (npm exit code + JSON parsing), add (winget source update, scoop cleanup, npm self-update, log rotation, structured logging)
-- **v9.6** - Bug fixes (Conda regex, log path), skipped-sections in summary, PS version check, disk space warning
-- **v9.5** - Fixed winget/scoop retry bug, removed dead code, cleanup
-- **v9.4** - Removed dry-run option, added retry logic to all sections, proper exit codes
-- **v9.3** - Improved WSL updates with retry logic and better sudo handling
-- **v9.2** - Added support for the new Windows `sudo` command.
-- **v9.1** - Fixed PSScriptAnalyzer warning for unused variable
-- **v9.0** - Added comprehensive error handling and summary reporting
-- **v8.x** - Previous versions with incremental improvements
+<details>
+<summary>Older versions (v8.x – v9.9)</summary>
+
+- **v9.9** — Automatic passwordless sudo config for WSL (`-SkipWslSudoConfig`)
+- **v9.8** — winget ignores pinned packages, conda base `--all` update, logs in `logs/` folder
+- **v9.7** — hashtable refactor, retry-style cleanup, winget source update, scoop cleanup, structured logging
+- **v9.6** — Conda regex fix, skipped-sections in summary, PS version check, disk space warning
+- **v9.5** — winget/scoop retry bug fix, dead code removal
+- **v9.4** — Retry logic across all sections, proper exit codes
+- **v9.3** — Improved WSL updates with retry and sudo handling
+- **v9.2** — Windows `sudo` command support
+- **v9.0–9.1** — Comprehensive error handling and summary reporting
+- **v8.x** — Incremental improvements
+
+</details>
 
 ---
 

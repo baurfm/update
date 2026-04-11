@@ -116,7 +116,7 @@
 .NOTES
     Author: Your Name
     Date: 2025-01-20
-    Version: 10.19
+    Version: 10.20
 #>
 
 param(
@@ -507,7 +507,7 @@ $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)
 $_bBar    = [char]0x2502
 $_gem     = [char]0x25C6
 $_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.19"
+$_version = "v10.20"
 $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
 Write-Host ""
 Write-Host $_bTop -ForegroundColor DarkGray
@@ -861,10 +861,13 @@ Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPacka
 Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $OnlyWslPackages) { Get-Command winget -ErrorAction SilentlyContinue } {
     Write-Status "Checking for outdated packages..." -Type Action
     # We run 'winget upgrade' to get the list of upgradable packages.
-    $wingetUpgradeOutput = & winget upgrade --include-unknown
-    if ($LASTEXITCODE -ne 0) {
-        Write-Status "winget upgrade check failed (exit code $LASTEXITCODE)" -Type Error
-        $failedItems["Winget"] += "winget upgrade (check) (Exit Code: $LASTEXITCODE)"
+    # NOTE: winget exits non-zero (0x8A150014) when there are NO updates — do NOT gate on
+    # $LASTEXITCODE here. Same approach as Test-WingetHasUpdates.
+    $wingetUpgradeOutput = & winget upgrade --include-unknown 2>&1
+    if (-not $wingetUpgradeOutput -or (($wingetUpgradeOutput -join "`n") -match 'No applicable upgrades were found')) {
+        Write-Status "All packages up-to-date" -Type Success
+        Write-Log "Winget: no applicable upgrades." -Level "INFO"
+        $upgradablePackages = @()
     } else {
         $upgradablePackages = @()
 
@@ -983,13 +986,19 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
                 $tmpScript = Join-Path $env:TEMP "$([System.Guid]::NewGuid().ToString()).ps1"
                 $safeName  = $module.Name -replace "'", "''"
                 Set-Content $tmpScript -Encoding UTF8 -Value "Update-Module -Name '$safeName' -Force -ErrorAction Stop"
-                $subprocs.Add([PSCustomObject]@{
-                    Name      = $module.Name
-                    TmpScript = $tmpScript
-                    Process   = Start-Process $psExe `
+                try {
+                    $proc = Start-Process $psExe `
                         -ArgumentList "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $tmpScript `
                         -PassThru -WindowStyle Hidden
-                })
+                    $subprocs.Add([PSCustomObject]@{
+                        Name      = $module.Name
+                        TmpScript = $tmpScript
+                        Process   = $proc
+                    })
+                } catch {
+                    Remove-Item $tmpScript -ErrorAction SilentlyContinue
+                    throw
+                }
             } else {
                 $updatedItems["PowerShell Modules"] += $module.Name
                 Write-Log "Successfully updated module: $($module.Name)"
@@ -1285,10 +1294,17 @@ Update-Section "uv" ($NoUv -or $OnlyWsl -or $OnlyWslPackages) { Get-Command uv -
         # It will be updated by that manager — not a failure.
         Write-Status "uv is managed by another package manager — skipping self-update" -Type Skip
         Write-Log "uv self update skipped: managed externally (exit 2)." -Level "INFO"
-        $script:skippedSections += "uv (managed by another package manager)"
     } else {
         Write-Status "uv self update failed (exit $LASTEXITCODE)" -Type Error
         $failedItems["uv"] += "uv self update (exit $LASTEXITCODE)"
+    }
+
+    Write-Status "Upgrading all uv tools..." -Type Action
+    if (Invoke-WithRetry -Action { & uv tool upgrade --all } -ActionName "uv tool upgrade --all") {
+        $updatedItems["uv"] += "All uv tools"
+    } else {
+        Write-Status "uv tool upgrade --all failed after retries" -Type Error
+        $failedItems["uv"] += "uv tool upgrade --all (failed after retries)"
     }
 }
 
