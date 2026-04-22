@@ -9,7 +9,6 @@
     - Scoop packages
     - Winget packages (using the 'winget upgrade --all' command)
     - Visual Studio Code extensions
-    - Miniconda (base and 'ocr-azure' environments)
     - TeX Live
     - WSL (Windows Subsystem for Linux)
 
@@ -31,9 +30,6 @@
 
 .PARAMETER NoVsCode
     A switch to skip updating Visual Studio Code extensions.
-
-.PARAMETER NoConda
-    A switch to skip updating Miniconda and its environments.
 
 .PARAMETER NoTex
     A switch to skip updating TeX Live.
@@ -73,9 +69,6 @@
 .PARAMETER OnlyWslPackages
     A switch to only update WSL packages (apt-get) and skip other sections including WSL kernel.
 
-.PARAMETER EnableVerbose
-    A switch to enable verbose output.
-
 .PARAMETER LogFile
     Path to the log file. Default is 'update.log'.
 
@@ -83,15 +76,51 @@
     Show which tools are installed and would be updated, without executing any updates.
     Pre-checks and elevation are skipped; all sections show "dry run" in the output.
 
+.PARAMETER RegisterSchedule
+    Register the script as a Scheduled Task running with highest privileges, then exit.
+    Combine with -ScheduleTime and -ScheduleFrequency. Re-running replaces the existing task.
+
+.PARAMETER UnregisterSchedule
+    Remove the Scheduled Task registered by -RegisterSchedule, then exit.
+
+.PARAMETER Unattended
+    Composite switch for headless runs (Scheduled Task / CI): silences prompts, enforces command
+    timeouts, enables Event Log notification on failure, suppresses progress bars.
+
+.PARAMETER Quiet
+    Suppress the banner and most status output. Summary + failures still print.
+
+.PARAMETER CmdTimeoutSec
+    Hard timeout (seconds) applied to each external command via Invoke-WithRetry.
+    0 disables. Default: 0 (on) / 600 (when -Unattended).
+
+.PARAMETER AutoReboot
+    Reboot automatically if the script detects a pending reboot at the end of the run.
+
+.PARAMETER NotifyToast
+    Show a Windows Toast notification after the run (installs BurntToast from PSGallery on first use).
+
+.PARAMETER NotifyWebhook
+    POST a JSON summary to the given URL (ntfy.sh, Discord, Slack, etc.) after the run.
+
+.PARAMETER NotifyEventLog
+    Write the run result into the Windows Event Log under source 'UpdateScript'.
+
+.PARAMETER NotifyOn
+    Controls when notifications fire: Always, Failure (default), or Never.
+
+.PARAMETER SkipNetworkCheck
+    Skip the network reachability pre-check at startup.
+
 .EXAMPLE
     .\update.ps1
 
     Runs all update tasks.
 
 .EXAMPLE
-    .\update.ps1 -NoTex -NoConda
+    .\update.ps1 -NoTex
 
-    Runs all update tasks EXCEPT for TeX Live and Miniconda/Conda.
+    Runs all update tasks EXCEPT for TeX Live.
 
 .EXAMPLE
     .\update.ps1 -h
@@ -104,7 +133,7 @@
     Displays this help message using the built-in PowerShell help system.
 
 .EXAMPLE
-    .\update.ps1 -EnableVerbose -LogFile "myupdate.log"
+    .\update.ps1 -Verbose -LogFile "myupdate.log"
 
     Runs updates with verbose output and logs to 'myupdate.log'.
 
@@ -113,12 +142,23 @@
 
     Updates only the WSL packages (apt-get), skipping WSL kernel and other sections.
 
+.EXAMPLE
+    .\update.ps1 -RegisterSchedule -ScheduleTime "03:00"
+
+    Registers a daily Scheduled Task that runs the script unattended at 03:00 with admin rights.
+
+.EXAMPLE
+    .\update.ps1 -Unattended -NotifyWebhook "https://ntfy.sh/my-topic"
+
+    Runs fully unattended: prompts silenced, strict timeouts, summary pushed to the given webhook.
+
 .NOTES
     Author: Your Name
-    Date: 2025-01-20
-    Version: 10.21
+    Date: 2026-04-22
+    Version: 12.0
 #>
 
+[CmdletBinding()]
 param(
     [Parameter(HelpMessage = "Display this help message.")]
     [Alias('h', '?')]
@@ -128,7 +168,6 @@ param(
     [switch]$NoScoop,
     [switch]$NoWinget,
     [switch]$NoVsCode,
-    [switch]$NoConda,
     [switch]$NoTex,
     [switch]$NoWsl,
     [switch]$NoNpm,
@@ -157,14 +196,47 @@ param(
     [switch]$OnlyWsl,
     [switch]$OnlyWslPackages,
 
-    [Parameter(HelpMessage = "Enable verbose output.")]
-    [switch]$EnableVerbose,
-
     [Parameter(HelpMessage = "If set, skip any automatic configuration of WSL sudo (passwordless apt-get).")]
     [switch]$SkipWslSudoConfig,
 
     [Parameter(HelpMessage = "Path to log file. Defaults to 'logs/update.log' under script directory.")]
-    [string]$LogFile = "update.log"
+    [string]$LogFile = "update.log",
+
+    # ── Unattended / Scheduling ─────────────────────────────────────────────
+    [Parameter(HelpMessage = "Register as a Scheduled Task running with highest privileges, then exit.")]
+    [switch]$RegisterSchedule,
+    [Parameter(HelpMessage = "Remove the Scheduled Task registered by -RegisterSchedule, then exit.")]
+    [switch]$UnregisterSchedule,
+    [Parameter(HelpMessage = "Time of day for the Scheduled Task in HH:mm 24h format. Default: 03:00.")]
+    [string]$ScheduleTime = '03:00',
+    [Parameter(HelpMessage = "Scheduled-Task frequency.")]
+    [ValidateSet('Daily','Weekly')]
+    [string]$ScheduleFrequency = 'Daily',
+
+    [Parameter(HelpMessage = "Composite flag: silence prompts + strict timeouts + notify on failure. Ideal for Scheduled Task runs.")]
+    [switch]$Unattended,
+    [Parameter(HelpMessage = "Suppress the banner and all non-essential terminal output; summary + failures remain.")]
+    [switch]$Quiet,
+    [Parameter(HelpMessage = "Do not acquire an exclusive lock — allow overlapping runs (dangerous).")]
+    [switch]$NoLock,
+    [Parameter(HelpMessage = "Hard per-external-command timeout in seconds. 0 disables. Default: 600.")]
+    [int]$CmdTimeoutSec = 0,
+    [Parameter(HelpMessage = "Skip the network reachability pre-check.")]
+    [switch]$SkipNetworkCheck,
+
+    [Parameter(HelpMessage = "Reboot automatically if a pending reboot is detected at the end of the run.")]
+    [switch]$AutoReboot,
+
+    # ── Notifications ────────────────────────────────────────────────────────
+    [Parameter(HelpMessage = "Show a BurntToast notification after the run. Requires BurntToast module.")]
+    [switch]$NotifyToast,
+    [Parameter(HelpMessage = "POST a JSON summary to this URL after the run (ntfy.sh, Discord, Slack, etc.).")]
+    [string]$NotifyWebhook,
+    [Parameter(HelpMessage = "Write the run result into the Windows Event Log (source: UpdateScript).")]
+    [switch]$NotifyEventLog,
+    [Parameter(HelpMessage = "When to send notifications: Always, Failure, Never. Default: Failure.")]
+    [ValidateSet('Always','Failure','Never')]
+    [string]$NotifyOn = 'Failure'
 )
 
 # ── Configurable constants ─────────────────────────────────────────────────
@@ -172,8 +244,49 @@ $script:TexLiveTimeoutSec  = 1800   # max seconds to wait for tlmgr (30 min)
 $script:TexLiveLogAgeMins  = 10     # minutes back to scan for TeX Live log files
 $script:DownloadTimeoutSec = 120    # seconds for Invoke-WebRequest calls
 $script:DiskSpaceWarnGB    = 2      # GB free on C: below which to warn
-$script:LogArchiveCount    = 5      # number of archived log files to keep
+$script:LogArchiveCount    = 30     # number of archived log files to keep (headroom for unattended daily runs)
+$script:EventLogSource     = 'UpdateScript'
+$script:ScheduledTaskName  = 'UpdateScript-Daily'
+$script:NetCheckHosts      = @('github.com','registry.npmjs.org','ghcr.io')
+$script:NetCheckTimeoutSec = 5
+
+# ── Exit codes ─────────────────────────────────────────────────────────────
+# Consumed by Scheduled-Task history, wrappers, and monitoring.
+$script:ExitOk             = 0   # everything updated cleanly
+$script:ExitPartial        = 1   # some sections failed but majority succeeded
+$script:ExitHardFailure    = 2   # >=50% of attempted sections failed
+$script:ExitElevationMissing = 3 # needed elevation but couldn't acquire it
+$script:ExitLockActive     = 4   # another run already in progress
+$script:ExitNetworkDown    = 5   # no network reachable
+$script:ExitTimedOut       = 6   # wall-clock or per-section timeout hit
 # ───────────────────────────────────────────────────────────────────────────
+
+# ── Unattended composite flag — expands convenient defaults ────────────────
+# Must run before any Write-Status / Write-Log so preferences are in place.
+if ($Unattended) {
+    if (-not $PSBoundParameters.ContainsKey('Quiet'))          { $Quiet          = $true }
+    if (-not $PSBoundParameters.ContainsKey('NotifyEventLog')) { $NotifyEventLog = $true }
+    if (-not $PSBoundParameters.ContainsKey('CmdTimeoutSec') -or $CmdTimeoutSec -eq 0) { $CmdTimeoutSec = 600 }
+    if (-not $PSBoundParameters.ContainsKey('SkipWslSudoConfig')) { $SkipWslSudoConfig = $false }  # still want it
+}
+
+# Globale Preferences für Unattended-Betrieb — verhindert Prompts aus Tools/Cmdlets.
+$ConfirmPreference     = 'None'
+$ErrorActionPreference = 'Continue'
+if ($Quiet -or $Unattended) { $ProgressPreference = 'SilentlyContinue' }
+
+# Telemetry / update-check opt-outs — silent for unattended runs, harmless otherwise.
+$env:POWERSHELL_UPDATECHECK       = 'Off'
+$env:DOTNET_CLI_TELEMETRY_OPTOUT  = '1'
+$env:NEXT_TELEMETRY_DISABLED      = '1'
+$env:DO_NOT_TRACK                 = '1'
+$env:SCOOP_LAST_UPDATE            = $env:SCOOP_LAST_UPDATE   # preserve
+$env:PYTHONUTF8                   = '1'
+
+$script:QuietMode      = [bool]$Quiet
+$script:CmdTimeoutSec  = [int]$CmdTimeoutSec
+$script:LockAcquired   = $false
+$script:VersionString  = '12.3'
 
 # Helper: format a TimeSpan as "4m 12s" / "38s" / "1h 2m"
 function Format-Elapsed {
@@ -186,6 +299,7 @@ function Format-Elapsed {
 # Function to display a formatted section header (secondary level — within a group)
 function Write-SectionHeader {
     param([string]$Title)
+    if ($script:QuietMode) { return }
     Write-Host ""
     Write-Host "  $([char]0x25B6)  " -NoNewline -ForegroundColor DarkCyan   # ▶
     Write-Host $Title -ForegroundColor Cyan
@@ -195,6 +309,7 @@ function Write-SectionHeader {
 # Function to display a group header (primary level — separates logical categories)
 function Write-GroupHeader {
     param([string]$Title)
+    if ($script:QuietMode) { return }
     $maxLen = 54   # 58-char rule minus 4 for the ▪ prefix — truncate if longer
     if ($Title.Length -gt $maxLen) { $Title = $Title.Substring(0, $maxLen - 3) + '...' }
     $line = ([char]0x2550).ToString() * 58   # ══════════ (double rule — visually heavier)
@@ -212,6 +327,8 @@ function Write-Status {
         [ValidateSet("Info", "Success", "Warning", "Error", "Skip", "Action")]
         [string]$Type = "Info"
     )
+    # In quiet mode only surface failures and warnings — callers still call this freely.
+    if ($script:QuietMode -and $Type -in @('Info','Skip','Action','Success')) { return }
     switch ($Type) {
         "Info"    { Write-Host "  $([char]0x00B7)  $Message" -ForegroundColor DarkGray }  # ·
         "Success" { Write-Host "  $([char]0x2713)  $Message" -ForegroundColor Green }     # ✓
@@ -225,6 +342,7 @@ function Write-Status {
     }
 }
 
+
 # Function to write log messages
 function Write-Log {
     param(
@@ -236,14 +354,14 @@ function Write-Log {
     # Always write to file
     if ($LogFile) { Add-Content -Path $LogFile -Value $logMessage }
     # Terminal: raw log lines only in verbose mode; WARN/ERROR shown via Write-Status otherwise
-    if ($EnableVerbose) {
+    if ($VerbosePreference -ne 'SilentlyContinue') {
         Write-Host $logMessage -ForegroundColor DarkGray
     } elseif ($Level -eq "WARN") {
         Write-Status $Message -Type Warning
     } elseif ($Level -eq "ERROR") {
         Write-Status $Message -Type Error
     }
-    # INFO and DEBUG are silent in terminal unless -EnableVerbose
+    # INFO and DEBUG are silent in terminal unless -Verbose
 }
 
 # Function to handle common update section logic
@@ -286,6 +404,7 @@ function Update-Section {
         Write-Status "Done  $(Format-Elapsed $elapsed)" -Type Success
         Write-Log "$SectionName updates completed in $(Format-Elapsed $elapsed)."
     } catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
         $elapsed = (Get-Date) - $sectionStart
         $script:sectionTimings[$SectionName] = $elapsed
         Write-Status "Failed after $(Format-Elapsed $elapsed): $_" -Type Error
@@ -293,7 +412,10 @@ function Update-Section {
     }
 }
 
-# Function to execute a command with retry logic
+# Function to execute a command with retry logic.
+# When TimeoutSec > 0 (or -CmdTimeoutSec is set globally for unattended runs), the action runs in
+# a background job and is killed if it exceeds the timeout — a timed-out attempt counts as a
+# failure and is retried like any other failure up to MaxRetries.
 function Invoke-WithRetry {
     param(
         [Parameter(Mandatory = $true)]
@@ -301,20 +423,40 @@ function Invoke-WithRetry {
         [Parameter(Mandatory = $true)]
         [string]$ActionName,
         [int]$MaxRetries = 2,
-        [int]$DelaySeconds = 5
+        [int]$DelaySeconds = 5,
+        [int]$TimeoutSec = 0
     )
+    # Inherit global default from -CmdTimeoutSec / -Unattended when caller didn't set one.
+    if ($TimeoutSec -le 0 -and $script:CmdTimeoutSec -gt 0) { $TimeoutSec = $script:CmdTimeoutSec }
+
     $attempt = 0
     $maxAttempts = $MaxRetries + 1
     do {
         $attempt++
-        Write-Log "Executing $ActionName (attempt $attempt of $maxAttempts)" -Level "DEBUG"
+        Write-Log "Executing $ActionName (attempt $attempt of $maxAttempts$( if ($TimeoutSec -gt 0) { ", timeout ${TimeoutSec}s" } ))" -Level "DEBUG"
         try {
-            & $Action
-            if ($LASTEXITCODE -eq 0) {
-                Write-Log "$ActionName succeeded." -Level "INFO"
-                return $true
+            if ($TimeoutSec -gt 0) {
+                $r = Invoke-WithTimeout -Action $Action -TimeoutSec $TimeoutSec
+                if ($r.Output) { $r.Output | ForEach-Object { Write-Log "  [$ActionName] $_" -Level "DEBUG" } }
+                if ($r.TimedOut) {
+                    Write-Status "$ActionName timed out after ${TimeoutSec}s" -Type Warning
+                    Write-Log "$ActionName timed out after ${TimeoutSec}s (attempt $attempt)" -Level "INFO"
+                } elseif ($r.Error) {
+                    Write-Log "$ActionName threw (attempt $attempt): $($r.Error)" -Level "WARN"
+                } elseif ($r.ExitCode -eq 0) {
+                    Write-Log "$ActionName succeeded." -Level "INFO"
+                    return $true
+                } else {
+                    Write-Log "$ActionName failed with exit code $($r.ExitCode) (attempt $attempt)" -Level "WARN"
+                }
             } else {
-                Write-Log "$ActionName failed with exit code $LASTEXITCODE (attempt $attempt)" -Level "WARN"
+                & $Action
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Log "$ActionName succeeded." -Level "INFO"
+                    return $true
+                } else {
+                    Write-Log "$ActionName failed with exit code $LASTEXITCODE (attempt $attempt)" -Level "WARN"
+                }
             }
         } catch {
             Write-Log "$ActionName threw exception (attempt $attempt): $_" -Level "WARN"
@@ -351,8 +493,69 @@ function Invoke-SelfUpdate {
     }
 }
 
+# Helper: run Invoke-WithRetry and record success/failure into result hashtables.
+# Collapses the repetitive: if (Invoke-WithRetry ...) { $updatedItems[...] += ... }
+# else { Write-Status Error; $failedItems[...] += ... }
+function Invoke-UpdateStep {
+    param(
+        [Parameter(Mandatory)] [string]$Key,
+        [Parameter(Mandatory)] [string]$ActionName,
+        [Parameter(Mandatory)] [scriptblock]$Action,
+        [Parameter(Mandatory)] [string]$SuccessLabel,
+        [string]$FailureLabel,
+        [int]$MaxRetries = 2
+    )
+    if (-not $FailureLabel) { $FailureLabel = "$ActionName (failed after retries)" }
+    if (Invoke-WithRetry -Action $Action -ActionName $ActionName -MaxRetries $MaxRetries) {
+        $updatedItems[$Key] += $SuccessLabel
+        return $true
+    }
+    Write-Status "$ActionName failed after retries" -Type Error
+    $failedItems[$Key] += $FailureLabel
+    return $false
+}
+
+# Parse `winget upgrade` output and return an array of upgradable package IDs.
+# Returns @() when no updates, when only pinned packages show, or when output is unparseable.
+# Used by both Test-WingetHasUpdates (pre-check) and the Winget section (update loop).
+function Get-WingetUpgradableIds {
+    param(
+        [Parameter(Mandatory)]
+        [AllowNull()] [AllowEmptyCollection()] [AllowEmptyString()]
+        [string[]]$WingetOutput
+    )
+    $ids = @()
+    if (-not $WingetOutput -or -not ($WingetOutput -join '').Trim()) { return $ids }
+    if (($WingetOutput -join "`n") -match 'No applicable upgrades were found') { return $ids }
+
+    $lines  = $WingetOutput -split [System.Environment]::NewLine
+    # Winget sometimes emits progress lines before the table header; find the real header
+    # by locating the first line that contains both 'Id' and 'Version' columns.
+    $header = $lines | Where-Object { $_ -match '\bId\b' -and $_ -match '\bVersion\b' } |
+                       Select-Object -First 1
+    if (-not $header) { return $ids }
+
+    $idCol  = $header.IndexOf('Id')
+    $verCol = $header.IndexOf('Version')
+    # Malformed header = can't parse = return empty (avoid false elevation/upgrades)
+    if ($idCol -lt 0 -or $verCol -le $idCol) { return $ids }
+
+    $headerIdx = [Array]::IndexOf($lines, $header)
+    for ($i = $headerIdx + 2; $i -lt $lines.Length; $i++) {
+        $line = $lines[$i]
+        if ($line.Trim().Length -eq 0)  { continue }   # blank
+        if ($line -match '\bPinned\b')  { continue }   # user-pinned — skip
+        if ($line -match '^\s*-+\s*$')  { continue }   # separator row
+        if ($line.Length -le $idCol)    { continue }
+        $pkg = $line.Substring($idCol, [Math]::Min($verCol - $idCol, $line.Length - $idCol)).Trim()
+        # Skip summary lines like "2 upgrades available."
+        if ($pkg.Length -gt 0 -and $pkg -notmatch '^\d') { $ids += $pkg }
+    }
+    return $ids
+}
+
 # Helper: non-elevated pre-check — returns $true if winget reports any non-pinned upgradable
-# packages. On any parse error or winget failure, returns $true (safe default: assume updates).
+# packages. On any parse error or winget failure, returns $false (safe default: no elevation).
 function Test-WingetHasUpdates {
     # Refresh sources first — stale cache can show phantom updates that disappear after refresh.
     & winget source update 2>$null | Out-Null
@@ -362,38 +565,68 @@ function Test-WingetHasUpdates {
     # NOTE: winget exits non-zero (0x8A150014) when there are NO updates — do NOT gate on
     # $LASTEXITCODE here. We rely entirely on the output text and table content.
     $output = & winget upgrade 2>$null
-    if (-not $output) { return $false }
+    return ((Get-WingetUpgradableIds $output).Count -gt 0)
+}
 
-    # When nothing needs updating winget prints this message with no table.
-    if (($output -join "`n") -match 'No applicable upgrades were found') { return $false }
-
-    $lines = $output -split [System.Environment]::NewLine
-
-    # Winget sometimes emits a progress line before the table header; find the real
-    # header by locating the first line that contains both 'Id' and 'Version' columns.
-    $header = $lines | Where-Object { $_ -match '\bId\b' -and $_ -match '\bVersion\b' } |
-                       Select-Object -First 1
-    # No table → winget showed nothing upgradeable. The common case is "all upgradeable
-    # packages are pinned" which prints a pins message with no table. No table = no action.
-    if (-not $header) { return $false }
-
-    $idCol  = $header.IndexOf('Id')
-    $verCol = $header.IndexOf('Version')
-    # Malformed header = can't parse = treat as no updates (avoid false elevation)
-    if ($idCol -lt 0 -or $verCol -le $idCol) { return $false }
-
-    $headerIdx = [Array]::IndexOf($lines, $header)
-    for ($i = $headerIdx + 2; $i -lt $lines.Length; $i++) {
-        $line = $lines[$i]
-        if ($line.Trim().Length -eq 0)      { continue }   # blank
-        if ($line -match '\bPinned\b')       { continue }   # user-pinned — skip
-        if ($line -match '^\s*-+\s*$')       { continue }   # separator row
-        if ($line.Length -le $idCol)         { continue }
-        $pkg = $line.Substring($idCol, [Math]::Min($verCol - $idCol, $line.Length - $idCol)).Trim()
-        # Skip summary lines like "2 upgrades available."
-        if ($pkg.Length -gt 0 -and $pkg -notmatch '^\d') { return $true }
+# Returns an array of process names that would block the Git for Windows installer.
+# Inno Setup uses the Restart Manager API to detect any process whose binary lives
+# inside the Git installation (usually C:\Program Files\Git\…). bash.exe is the most
+# common culprit because Git Bash is the shell of choice for many devs — if update.ps1
+# runs FROM a Git Bash (e.g. Claude Code's default terminal), the installer will abort
+# with exit 1 in silent mode.
+function Test-GitBinariesInUse {
+    $blockers = @('bash.exe', 'git.exe', 'git-bash.exe', 'mintty.exe', 'gitk.exe', 'git-cmd.exe')
+    $running  = @()
+    foreach ($name in $blockers) {
+        $procName = [System.IO.Path]::GetFileNameWithoutExtension($name)
+        if (Get-Process -Name $procName -ErrorAction SilentlyContinue) {
+            $running += $name
+        }
     }
-    return $false
+    return ,$running
+}
+
+# Pending-Git-Update flag: persists across runs when Git.Git had to be skipped
+# because bash.exe etc. were running. A later run that starts without blockers
+# can then apply the pending update as a fast-path before the regular upgrade batch.
+function Get-PendingGitUpdate {
+    if (-not (Test-Path $script:PendingGitUpdateFlag)) { return $null }
+    try {
+        return Get-Content -Path $script:PendingGitUpdateFlag -Raw -ErrorAction Stop |
+               ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        # corrupted/unreadable — remove and treat as no pending update
+        Remove-Item -Path $script:PendingGitUpdateFlag -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+}
+
+function Set-PendingGitUpdate {
+    param(
+        [Parameter(Mandatory)] [string[]]$Blockers
+    )
+    $existing  = Get-PendingGitUpdate
+    $now       = (Get-Date).ToString('s')
+    $firstSeen = if ($existing -and $existing.firstDetected) { $existing.firstDetected } else { $now }
+    $count     = if ($existing -and $existing.skipCount)     { [int]$existing.skipCount + 1 } else { 1 }
+    $data = [ordered]@{
+        package       = 'Git.Git'
+        firstDetected = $firstSeen
+        lastDetected  = $now
+        skipCount     = $count
+        blockers      = $Blockers
+    }
+    try {
+        $data | ConvertTo-Json -Depth 3 | Set-Content -Path $script:PendingGitUpdateFlag -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        Write-Log "Failed to write pending Git update flag: $_" -Level "INFO"
+    }
+}
+
+function Clear-PendingGitUpdate {
+    if (Test-Path $script:PendingGitUpdateFlag) {
+        Remove-Item -Path $script:PendingGitUpdateFlag -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # Helper: non-elevated WSL version check — returns $true if a newer WSL kernel is available
@@ -552,6 +785,263 @@ function Remove-UpdateCommand {
     }
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# UNATTENDED HELPERS  (lock, network probe, timeouts, schedule, notifications)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Exclusive run lock: writes <logs>/update.lock with PID + start time. Returns $true on acquire,
+# $false if another live run already holds the lock (stale locks from dead PIDs are evicted).
+function Acquire-UpdateLock {
+    param([string]$LockPath)
+    if (Test-Path $LockPath) {
+        try {
+            $existing = Get-Content $LockPath -ErrorAction Stop | ConvertFrom-Json
+            $alive = $false
+            if ($existing.PID) { $alive = [bool](Get-Process -Id $existing.PID -ErrorAction SilentlyContinue) }
+            if ($alive) {
+                Write-Status "Another run is active (PID $($existing.PID), started $($existing.StartTime))" -Type Error
+                Write-Log "Lock active: PID=$($existing.PID), started=$($existing.StartTime)" -Level "INFO"
+                return $false
+            }
+            Write-Log "Evicting stale lock from dead PID $($existing.PID)." -Level "INFO"
+            Remove-Item $LockPath -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Log "Lock file corrupted ($($_.Exception.Message)) — evicting." -Level "INFO"
+            Remove-Item $LockPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    @{ PID = $PID; StartTime = (Get-Date).ToString('o'); Host = $env:COMPUTERNAME; User = $env:USERNAME } |
+        ConvertTo-Json -Compress | Set-Content -Path $LockPath -Encoding UTF8
+    $script:LockAcquired = $true
+    return $true
+}
+
+function Release-UpdateLock {
+    param([string]$LockPath)
+    if ($script:LockAcquired -and $LockPath -and (Test-Path $LockPath)) {
+        Remove-Item $LockPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Network reachability pre-check. Returns $true if any of the probe hosts answers within the
+# configured timeout; $false means "offline" and is a safe-skip signal for the main run.
+function Test-NetworkReachable {
+    param(
+        [string[]]$Hosts = $script:NetCheckHosts,
+        [int]$TimeoutSec = $script:NetCheckTimeoutSec
+    )
+    foreach ($h in $Hosts) {
+        try {
+            $reply = Test-Connection -TargetName $h -Count 1 -TimeoutSeconds $TimeoutSec -Quiet -ErrorAction SilentlyContinue
+            if ($reply) { return $true }
+        } catch {
+            # Test-Connection on PS5.1 has different parameters — fallback:
+            try {
+                $ok = [bool](Test-Connection -ComputerName $h -Count 1 -Quiet -ErrorAction SilentlyContinue)
+                if ($ok) { return $true }
+            } catch { }
+        }
+    }
+    return $false
+}
+
+# Run a scriptblock in a background job with a hard timeout. Returns a PSCustomObject:
+#   @{ TimedOut=[bool]; ExitCode=[int]; Output=[object[]]; Error=[string] }
+# Used by Invoke-WithRetry when -TimeoutSec > 0 so hanging external commands can't stall the run.
+# ScriptBlocks don't cross the job boundary as live objects — serialise to text and reconstruct.
+function Invoke-WithTimeout {
+    param(
+        [Parameter(Mandatory)] [scriptblock]$Action,
+        [Parameter(Mandatory)] [int]$TimeoutSec
+    )
+    $actionText = $Action.ToString()
+    $envPath    = $env:PATH     # preserve PATH so the child sees tools installed in this shell's env
+    $job = Start-Job -ScriptBlock {
+        $env:PATH = $using:envPath
+        try {
+            $sb  = [scriptblock]::Create($using:actionText)
+            $out = & $sb *>&1
+            [PSCustomObject]@{ ExitCode = $LASTEXITCODE; Output = $out; Error = $null }
+        } catch {
+            [PSCustomObject]@{ ExitCode = -1; Output = $null; Error = $_.Exception.Message }
+        }
+    }
+    $done = $job | Wait-Job -Timeout $TimeoutSec
+    if ($null -eq $done) {
+        $job | Stop-Job -ErrorAction SilentlyContinue
+        $job | Remove-Job -Force -ErrorAction SilentlyContinue
+        return [PSCustomObject]@{ TimedOut = $true; ExitCode = -2; Output = @(); Error = "timed out after ${TimeoutSec}s" }
+    }
+    $r = $job | Receive-Job
+    $job | Remove-Job -Force -ErrorAction SilentlyContinue
+    return [PSCustomObject]@{ TimedOut = $false; ExitCode = $r.ExitCode; Output = $r.Output; Error = $r.Error }
+}
+
+# Register this script as a Scheduled Task. Idempotent: re-registering replaces the existing task.
+# Uses the Windows Task Scheduler ServiceAccount principal so the task runs elevated without
+# storing a password. Requires admin for registration (Scheduled Tasks API limitation).
+function Register-UpdateScheduledTask {
+    param(
+        [Parameter(Mandatory)] [string]$ScriptPath,
+        [Parameter(Mandatory)] [string]$AtTime,
+        [Parameter(Mandatory)] [ValidateSet('Daily','Weekly')] [string]$Frequency
+    )
+    if (-not $script:isAdmin) {
+        Write-Status "Scheduled Task registration requires admin — re-run in an elevated shell." -Type Error
+        return $false
+    }
+    $pwshExe = (Get-Process -Id $PID).MainModule.FileName
+    $taskArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`" -Unattended -NoSelfUpdate"
+    $action   = New-ScheduledTaskAction -Execute $pwshExe -Argument $taskArgs
+    $trigger  = switch ($Frequency) {
+        'Daily'  { New-ScheduledTaskTrigger -Daily  -At $AtTime }
+        'Weekly' { New-ScheduledTaskTrigger -Weekly -At $AtTime -DaysOfWeek Monday }
+    }
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+        -WakeToRun -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5) `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+    try {
+        Register-ScheduledTask -TaskName $script:ScheduledTaskName -Action $action `
+            -Trigger $trigger -Principal $principal -Settings $settings `
+            -Description "Windows Update Script — unattended daily dev-tool refresh (v$script:VersionString)" `
+            -Force | Out-Null
+        Write-Status "Scheduled Task '$($script:ScheduledTaskName)' registered ($Frequency at $AtTime, SYSTEM, elevated)" -Type Success
+        Write-Log "Scheduled Task registered: name=$($script:ScheduledTaskName) freq=$Frequency at=$AtTime" -Level "INFO"
+        return $true
+    } catch {
+        Write-Status "Scheduled Task registration failed: $($_.Exception.Message)" -Type Error
+        Write-Log "Scheduled Task register failed: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
+}
+
+function Unregister-UpdateScheduledTask {
+    try {
+        $t = Get-ScheduledTask -TaskName $script:ScheduledTaskName -ErrorAction Stop
+        if ($t) {
+            Unregister-ScheduledTask -TaskName $script:ScheduledTaskName -Confirm:$false
+            Write-Status "Scheduled Task '$($script:ScheduledTaskName)' removed" -Type Success
+            Write-Log "Scheduled Task unregistered: $($script:ScheduledTaskName)" -Level "INFO"
+            return $true
+        }
+    } catch {
+        Write-Status "No Scheduled Task '$($script:ScheduledTaskName)' to remove." -Type Info
+        return $true
+    }
+}
+
+# Detect pending reboot via the canonical set of Windows registry/WMI signals used by
+# Windows Update / Component Based Servicing. No reboot-is-pending key has an authoritative
+# name, so we OR a handful of well-known ones.
+function Test-PendingReboot {
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'
+    )
+    foreach ($k in $keys) { if (Test-Path $k) { return $true } }
+    $pfro = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+    if ($pfro -and $pfro.PendingFileRenameOperations) { return $true }
+    return $false
+}
+
+# Ensure BurntToast is installed (once), then emit a toast. No-op + one-line log on any failure
+# so a toast problem never breaks the main run. Runs in quiet mode as well — this IS the output.
+function Send-ToastNotification {
+    param([string]$Title, [string]$Body)
+    try {
+        if (-not (Get-Module -ListAvailable -Name BurntToast)) {
+            if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+                Install-PackageProvider -Name NuGet -Force -Scope CurrentUser -ErrorAction SilentlyContinue | Out-Null
+            }
+            Install-Module BurntToast -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+        }
+        Import-Module BurntToast -ErrorAction Stop
+        New-BurntToastNotification -Text $Title, $Body -AppLogo $null | Out-Null
+        Write-Log "Toast sent: $Title" -Level "INFO"
+    } catch {
+        Write-Log "Toast failed: $($_.Exception.Message)" -Level "INFO"
+    }
+}
+
+# POST a JSON summary to a generic webhook (ntfy.sh, Discord, Slack all tolerate it).
+# For ntfy, the body is the message and the title is sent via headers — detect and adapt.
+function Send-WebhookNotification {
+    param([string]$Url, [string]$Title, [string]$Body, [hashtable]$Summary)
+    try {
+        if ($Url -match 'ntfy\.sh') {
+            $headers = @{ Title = $Title; Priority = if ($Summary.Failures -gt 0) { 'high' } else { 'default' } }
+            Invoke-RestMethod -Uri $Url -Method Post -Body $Body -Headers $headers -TimeoutSec 10 -ErrorAction Stop | Out-Null
+        } else {
+            $payload = @{ title = $Title; text = $Body; body = $Body; content = $Body; summary = $Summary } |
+                ConvertTo-Json -Depth 6 -Compress
+            Invoke-RestMethod -Uri $Url -Method Post -Body $payload -ContentType 'application/json' -TimeoutSec 10 -ErrorAction Stop | Out-Null
+        }
+        Write-Log "Webhook notified: $Url" -Level "INFO"
+    } catch {
+        Write-Log "Webhook failed ($Url): $($_.Exception.Message)" -Level "INFO"
+    }
+}
+
+# Write the run result to the Windows Event Log. Registers the source on first use.
+function Write-UpdateEventLog {
+    param(
+        [Parameter(Mandatory)] [ValidateSet('Information','Warning','Error')] [string]$EntryType,
+        [Parameter(Mandatory)] [string]$Message,
+        [int]$EventId = 1000
+    )
+    try {
+        if (-not [System.Diagnostics.EventLog]::SourceExists($script:EventLogSource)) {
+            # Requires admin; skip silently if not elevated.
+            if ($script:isAdmin) {
+                New-EventLog -LogName Application -Source $script:EventLogSource -ErrorAction Stop
+            } else {
+                Write-Log "Cannot register Event Log source '$($script:EventLogSource)' — not admin." -Level "INFO"
+                return
+            }
+        }
+        Write-EventLog -LogName Application -Source $script:EventLogSource -EntryType $EntryType `
+            -EventId $EventId -Message $Message -ErrorAction Stop
+        Write-Log "Event Log written: $EntryType (id $EventId)" -Level "INFO"
+    } catch {
+        Write-Log "Event Log write failed: $($_.Exception.Message)" -Level "INFO"
+    }
+}
+
+# Aggregator: decide whether to send + fan out to all enabled channels.
+function Send-UpdateNotifications {
+    param(
+        [Parameter(Mandatory)] [hashtable]$Summary,
+        [Parameter(Mandatory)] [bool]$HasFailures
+    )
+    $should = switch ($NotifyOn) {
+        'Never'   { $false }
+        'Always'  { $true  }
+        'Failure' { $HasFailures }
+    }
+    if (-not $should) { return }
+
+    $title = if ($HasFailures) {
+        "Update script: FAILED on $env:COMPUTERNAME"
+    } else {
+        "Update script: ok on $env:COMPUTERNAME"
+    }
+    $body = @(
+        "Updated: $($Summary.Updated)  Failed: $($Summary.Failures)  Skipped: $($Summary.Skipped)"
+        "Duration: $($Summary.Duration)"
+        if ($Summary.FailedSections) { "Failed sections: $($Summary.FailedSections -join ', ')" }
+    ) -join "`n"
+
+    if ($NotifyToast)     { Send-ToastNotification   -Title $title -Body $body }
+    if ($NotifyWebhook)   { Send-WebhookNotification -Url $NotifyWebhook -Title $title -Body $body -Summary $Summary }
+    if ($NotifyEventLog)  {
+        $entryType = if ($HasFailures) { 'Error' } else { 'Information' }
+        Write-UpdateEventLog -EntryType $entryType -Message "$title`n$body" -EventId ($HasFailures ? 1001 : 1000)
+    }
+}
+
 # --- Early log initialization ---
 # Must happen before the banner, self-update, and pre-checks so that all Write-Log
 # calls land in logs/update.log rather than a relative-path file that gets archived.
@@ -566,6 +1056,8 @@ if (-not $PSBoundParameters.ContainsKey('LogFile')) {
 } elseif (-not ([System.IO.Path]::IsPathRooted($LogFile))) {
     $LogFile = Join-Path $ScriptPath $LogFile
 }
+$script:LockFilePath         = Join-Path $LogDir "update.lock"
+$script:PendingGitUpdateFlag = Join-Path $LogDir "pending-git-update.json"
 # Log rotation: rename existing log with timestamp, keep last 5 archives
 if (Test-Path $LogFile) {
     $stamp   = $scriptStartTime.ToString('yyyy-MM-dd_HHmmss')
@@ -579,33 +1071,70 @@ if (Test-Path $LogFile) {
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
-# Display startup banner
-$_bw      = 40
-$_bTop    = "  $([char]0x256D)$(([char]0x2500).ToString() * $_bw)$([char]0x256E)"
-$_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)"
-$_bBar    = [char]0x2502
-$_gem     = [char]0x25C6
-$_title   = "  $_gem  Windows Update Script  "
-$_version = "v10.21"
-$_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
-Write-Host ""
-Write-Host $_bTop -ForegroundColor DarkGray
-Write-Host "  $_bBar" -NoNewline -ForegroundColor DarkGray
-Write-Host $_title -NoNewline -ForegroundColor DarkGray
-Write-Host $_version -NoNewline -ForegroundColor Cyan
-Write-Host (" " * [Math]::Max(0, $_bw - $_title.Length - $_version.Length)) -NoNewline
-Write-Host "$_bBar" -ForegroundColor DarkGray
-Write-Host "  $_bBar" -NoNewline -ForegroundColor DarkGray
-Write-Host $_dateStr -NoNewline -ForegroundColor DarkGray
-Write-Host (" " * [Math]::Max(0, $_bw - $_dateStr.Length)) -NoNewline
-Write-Host "$_bBar" -ForegroundColor DarkGray
-Write-Host $_bBot -ForegroundColor DarkGray
-Write-Host ""
+# Display startup banner (suppressed in quiet/unattended mode)
+$_version = "v$($script:VersionString)"
+if (-not $script:QuietMode) {
+    $_bw      = 40
+    $_bTop    = "  $([char]0x256D)$(([char]0x2500).ToString() * $_bw)$([char]0x256E)"
+    $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)"
+    $_bBar    = [char]0x2502
+    $_gem     = [char]0x25C6
+    $_title   = "  $_gem  Windows Update Script  "
+    $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
+    Write-Host ""
+    Write-Host $_bTop -ForegroundColor DarkGray
+    Write-Host "  $_bBar" -NoNewline -ForegroundColor DarkGray
+    Write-Host $_title -NoNewline -ForegroundColor DarkGray
+    Write-Host $_version -NoNewline -ForegroundColor Cyan
+    Write-Host (" " * [Math]::Max(0, $_bw - $_title.Length - $_version.Length)) -NoNewline
+    Write-Host "$_bBar" -ForegroundColor DarkGray
+    Write-Host "  $_bBar" -NoNewline -ForegroundColor DarkGray
+    Write-Host $_dateStr -NoNewline -ForegroundColor DarkGray
+    Write-Host (" " * [Math]::Max(0, $_bw - $_dateStr.Length)) -NoNewline
+    Write-Host "$_bBar" -ForegroundColor DarkGray
+    Write-Host $_bBot -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+# --- Compute admin status early so schedule/event-log helpers know their privilege ---
+$myWindowsID        = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$myWindowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal($myWindowsID)
+$adminRole          = [System.Security.Principal.WindowsBuiltInRole]::Administrator
+$script:isAdmin     = $myWindowsPrincipal.IsInRole($adminRole)
+
+# --- Handle -UnregisterSchedule: remove Scheduled Task and exit ---
+if ($UnregisterSchedule) {
+    Unregister-UpdateScheduledTask | Out-Null
+    exit $script:ExitOk
+}
+
+# --- Handle -RegisterSchedule: install Scheduled Task and exit ---
+if ($RegisterSchedule) {
+    $ok = Register-UpdateScheduledTask -ScriptPath $PSCommandPath -AtTime $ScheduleTime -Frequency $ScheduleFrequency
+    exit $(if ($ok) { $script:ExitOk } else { $script:ExitHardFailure })
+}
 
 # --- Handle -RemoveFromPath: strip shim + PATH entry and exit ---
 if ($RemoveFromPath) {
     Remove-UpdateCommand -ScriptDir $ScriptPath
-    exit 0
+    exit $script:ExitOk
+}
+
+# --- Lock-File: prevent overlapping runs (e.g. Scheduled Task + manual run) ---
+if (-not $NoLock -and -not $DryRun) {
+    if (-not (Acquire-UpdateLock -LockPath $script:LockFilePath)) {
+        exit $script:ExitLockActive
+    }
+}
+
+# --- Network reachability pre-check ---
+if (-not $SkipNetworkCheck -and -not $DryRun) {
+    if (-not (Test-NetworkReachable)) {
+        Write-Status "No network reachable — update hosts unresponsive" -Type Error
+        Write-Log "Network pre-check failed — exiting." -Level "INFO"
+        Release-UpdateLock -LockPath $script:LockFilePath
+        exit $script:ExitNetworkDown
+    }
 }
 
 # --- Auto-register 'update' command on PATH (silent if already reachable) ---
@@ -620,7 +1149,7 @@ if (-not $NoSelfUpdate) {
             $pullOut = & git -C $scriptDir pull 2>&1
             if ($LASTEXITCODE -ne 0) {
                 Write-Status "git pull failed: $($pullOut -join ' ')" -Type Warning
-                Write-Log "Self-update: git pull failed (exit $LASTEXITCODE): $($pullOut -join ' ')" -Level "WARN"
+                Write-Log "Self-update: git pull failed (exit $LASTEXITCODE): $($pullOut -join ' ')" -Level "INFO"
             } elseif (($pullOut -join ' ') -match 'Already up[ -]to[ -]date') {
                 Write-Status "Script is up to date ($_version)" -Type Success
                 Write-Log "Self-update: already up to date ($_version)" -Level "INFO"
@@ -640,7 +1169,7 @@ if (-not $NoSelfUpdate) {
             }
         } catch {
             Write-Status "git pull failed: $($_.Exception.Message)" -Type Warning
-            Write-Log "Self-update: git pull exception: $($_.Exception.Message)" -Level "WARN"
+            Write-Log "Self-update: git pull exception: $($_.Exception.Message)" -Level "INFO"
         }
     }
 }
@@ -655,7 +1184,7 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
 $freeGB = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
 if ($freeGB -lt $script:DiskSpaceWarnGB) {
     Write-Status "Low disk space: ${freeGB} GB free on C: — updates may fail (threshold: $($script:DiskSpaceWarnGB) GB)" -Type Warning
-    Write-Log "WARNING: Low disk space: ${freeGB} GB free on C: (threshold: $($script:DiskSpaceWarnGB) GB)" -Level "WARN"
+    Write-Log "WARNING: Low disk space: ${freeGB} GB free on C: (threshold: $($script:DiskSpaceWarnGB) GB)" -Level "INFO"
 }
 
 Write-Log "Starting update script."
@@ -698,10 +1227,14 @@ if ($Sudo) {
     if (-not $NoWinget -and (Get-Command winget -ErrorAction SilentlyContinue)) {
         # ${Function:...} gives a ScriptBlock, but $using: serialises it to a string in the job.
         # Use [scriptblock]::Create() to reconstruct it on the other side.
-        $fnWinget = ${Function:Test-WingetHasUpdates}.ToString()
+        # Both functions must be passed: Test-WingetHasUpdates calls Get-WingetUpgradableIds.
+        $fnWingetIds = ${Function:Get-WingetUpgradableIds}.ToString()
+        $fnWinget    = ${Function:Test-WingetHasUpdates}.ToString()
         $preWingetJob = Start-Job -ScriptBlock {
             function Write-Status { param([string]$Message, [string]$Type = 'Info') }
             function Write-Log    { param([string]$Message, [string]$Level = 'INFO') }
+            # dot-source to define Get-WingetUpgradableIds in this job's scope
+            . ([scriptblock]::Create("function Get-WingetUpgradableIds { $($using:fnWingetIds) }"))
             & ([scriptblock]::Create($using:fnWinget))
         }
     }
@@ -796,11 +1329,7 @@ if ($Sudo) {
     }
 }
 
-# Compute admin status once; used later by the WSL section to gate wsl --update.
-$myWindowsID        = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-$myWindowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal($myWindowsID)
-$adminRole          = [System.Security.Principal.WindowsBuiltInRole]::Administrator
-$script:isAdmin     = $myWindowsPrincipal.IsInRole($adminRole)
+# $script:isAdmin already computed near the top (used by schedule/event-log helpers).
 
 if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -or $npmNeedsElevation)) {
     if (-not $script:isAdmin) {
@@ -827,6 +1356,8 @@ if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -o
         if ($wslNeedsElevation)   { $elevationReasons += 'WSL kernel update' }
         if ($npmNeedsElevation)   { $elevationReasons += 'npm updates' }
         Write-Log "Elevation required ($($elevationReasons -join ', ')) — re-launching as administrator." -Level "INFO"
+        # Release the lock so the elevated child process can acquire it.
+        Release-UpdateLock -LockPath $script:LockFilePath
         $sudoExists = Get-Command sudo -ErrorAction SilentlyContinue
         if ($sudoExists) {
             # Use the new Windows 'sudo' to re-launch.
@@ -873,7 +1404,7 @@ $sectionKeys = "Scoop", "Winget", "Chocolatey",
               "PowerShell Modules", "Oh My Posh",
               "WSL",
               "npm", "pnpm", "Bun", "Deno",
-              "Conda", "pipx", "uv", "Poetry", "Rye",
+              "pipx", "uv", "Poetry", "Rye",
               ".NET Global Tools", "Rust", "Ruby Gems", "Composer",
               "Google Cloud SDK", "Android SDK", "Helm plugins", "krew plugins",
               "VS Code Extensions", "GitHub CLI Extensions",
@@ -920,10 +1451,7 @@ Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPacka
         }
 
         Write-Status "Updating Scoop itself..." -Type Action
-        if (-not (Invoke-WithRetry -Action { & scoop update } -ActionName "scoop update")) {
-            Write-Status "scoop update failed after retries" -Type Error
-            $failedItems["Scoop"] += "scoop update (failed after retries)"
-        }
+        Invoke-UpdateStep -Key "Scoop" -ActionName "scoop update" -Action { & scoop update } -SuccessLabel "Scoop" | Out-Null
 
         Write-Status "Updating all installed packages..." -Type Action
         # No retry — scoop returns non-zero if ANY package fails.
@@ -931,7 +1459,7 @@ Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPacka
         & scoop update *
         if ($LASTEXITCODE -ne 0) {
             Write-Status "Some packages may have failed (exit code $LASTEXITCODE)" -Type Warning
-            Write-Log "scoop update * exited with code $LASTEXITCODE" -Level "WARN"
+            Write-Log "scoop update * exited with code $LASTEXITCODE" -Level "INFO"
         }
 
         Write-Status "Removing old package versions..." -Type Action
@@ -946,70 +1474,122 @@ Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPacka
 # --- Update Winget & Microsoft Store Apps ---
 Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $OnlyWslPackages) { Get-Command winget -ErrorAction SilentlyContinue } {
     Write-Status "Checking for outdated packages..." -Type Action
-    # We run 'winget upgrade' to get the list of upgradable packages.
     # NOTE: winget exits non-zero (0x8A150014) when there are NO updates — do NOT gate on
-    # $LASTEXITCODE here. Same approach as Test-WingetHasUpdates.
+    # $LASTEXITCODE here. We rely entirely on output text and table content.
     $wingetUpgradeOutput = & winget upgrade --include-unknown 2>&1
-    if (-not $wingetUpgradeOutput -or (($wingetUpgradeOutput -join "`n") -match 'No applicable upgrades were found')) {
-        Write-Status "All packages up-to-date" -Type Success
-        Write-Log "Winget: no applicable upgrades." -Level "INFO"
-        $upgradablePackages = @()
-    } else {
-        $upgradablePackages = @()
+    $upgradablePackages  = Get-WingetUpgradableIds $wingetUpgradeOutput
 
-        if ($wingetUpgradeOutput -and $wingetUpgradeOutput.Length -gt 2) {
-            $lines = $wingetUpgradeOutput -split [System.Environment]::NewLine
-            # Winget may emit progress lines before the table; find the real header.
-            # Same robust approach as Test-WingetHasUpdates.
-            $headerLine = $lines | Where-Object { $_ -match '\bId\b' -and $_ -match '\bVersion\b' } |
-                                   Select-Object -First 1
-            if ($headerLine) {
-                $idColIndex      = $headerLine.IndexOf('Id')
-                $versionColIndex = $headerLine.IndexOf('Version')
-                $headerIdx       = [Array]::IndexOf($lines, $headerLine)
+    if ($upgradablePackages.Count -gt 0) {
+        Write-Status "Found $($upgradablePackages.Count) upgradable packages" -Type Info
+        Write-Log "Winget: $($upgradablePackages.Count) upgradable: $($upgradablePackages -join ', ')" -Level "INFO"
 
-                if ($idColIndex -ge 0 -and $versionColIndex -gt $idColIndex) {
-                    for ($i = $headerIdx + 2; $i -lt $lines.Length; $i++) {
-                        $line = $lines[$i]
-                        if ($line.Trim().Length -eq 0)  { continue }
-                        if ($line -match '\bPinned\b')  { continue }
-                        if ($line -match '^\s*-+\s*$')  { continue }  # separator row
-                        if ($line.Length -le $versionColIndex) { continue }  # bounds guard
-                        $packageId = $line.Substring($idColIndex, $versionColIndex - $idColIndex).Trim()
-                        if (-not [string]::IsNullOrWhiteSpace($packageId)) {
-                            $upgradablePackages += $packageId
-                        }
-                    }
+        # Fast-Path: falls Git.Git von einem früheren Lauf als "pending" markiert wurde und
+        # jetzt keine Blocker-Prozesse laufen, ziehen wir das Update sofort direkt vor — so
+        # muss der User nur einmal Bash/Claude-Code schließen, dann heilt sich das Problem
+        # beim nächsten Lauf von selbst (ohne manuellen Eingriff an winget).
+        $pending = Get-PendingGitUpdate
+        if ($pending -and ($upgradablePackages -contains 'Git.Git')) {
+            $currentBlockers = Test-GitBinariesInUse
+            if ($currentBlockers.Count -eq 0) {
+                Write-Status "Pending Git.Git update from earlier run — applying now (skipCount=$($pending.skipCount))" -Type Action
+                Write-Log "Winget: consuming pending Git.Git flag (firstDetected=$($pending.firstDetected))" -Level "INFO"
+                & winget upgrade --id Git.Git --accept-source-agreements --accept-package-agreements --include-unknown
+                $gitFastCode = $LASTEXITCODE
+                if ($gitFastCode -eq 0) {
+                    Write-Status "Git.Git successfully updated" -Type Success
+                    Clear-PendingGitUpdate
+                    $updatedItems["Winget"] += 'Git.Git'
+                    $upgradablePackages = @($upgradablePackages | Where-Object { $_ -ne 'Git.Git' })
+                } else {
+                    Write-Status "Git.Git fast-path update failed (exit $gitFastCode) — falling through to normal flow" -Type Warning
+                    Write-Log "Winget: Git.Git fast-path exited $gitFastCode" -Level "INFO"
                 }
+            } else {
+                Write-Status "Git.Git update pending since $($pending.firstDetected) ($($pending.skipCount) run(s)) — still blocked by: $($currentBlockers -join ', ')" -Type Warning
+                Write-Status "  -> close these processes and re-run 'update' to clear the backlog" -Type Info
+                Write-Log "Winget: pending Git.Git still blocked by $($currentBlockers -join ', ')" -Level "INFO"
             }
+        } elseif ($pending -and ($upgradablePackages -notcontains 'Git.Git')) {
+            # Git.Git ist nicht mehr in der Upgrade-Liste → wurde irgendwie aktualisiert (oder neu genug).
+            # Alten Flag wegwerfen, damit die Nagging-Meldung nicht ewig bleibt.
+            Write-Log "Winget: pending Git.Git no longer upgradable — clearing stale flag." -Level "INFO"
+            Clear-PendingGitUpdate
         }
 
-        if ($upgradablePackages.Count -gt 0) {
-            Write-Status "Found $($upgradablePackages.Count) upgradable packages" -Type Info
-            Write-Log "Winget: $($upgradablePackages.Count) upgradable: $($upgradablePackages -join ', ')" -Level "INFO"
-            $updatedItems["Winget"] += $upgradablePackages
-        } else {
-            Write-Status "All packages up-to-date" -Type Success
-            Write-Log "Winget: all packages up-to-date." -Level "INFO"
+        # Git.Git-Schutz: Inno Setup erkennt laufende bash.exe/git.exe und bricht Silent-Install
+        # mit Exit 1 ab. Wenn update.ps1 aus einer Git-Bash läuft (z.B. Claude-Code-Terminal),
+        # würde Git.Git bei jedem Lauf reproduzierbar fehlschlagen. Lösung: temporärer --gated-Pin,
+        # im finally wieder entfernt. User-eigene Pins lassen wir unangetastet.
+        $pinAddedByUs  = $false
+        $gitSkipReason = $null
+        if ($upgradablePackages -contains 'Git.Git') {
+            $gitBlockers = Test-GitBinariesInUse
+            if ($gitBlockers.Count -gt 0) {
+                $pinList = (& winget pin list --id Git.Git 2>$null | Out-String)
+                $alreadyPinned = $pinList -match '(?im)^\s*Git\.Git\b'
+                if (-not $alreadyPinned) {
+                    Write-Status "Git.Git update would fail (running: $($gitBlockers -join ', ')) — pinning Git.Git temporarily" -Type Warning
+                    Write-Log "Winget: pinning Git.Git to skip during --all (blockers: $($gitBlockers -join ', '))" -Level "INFO"
+                    & winget pin add --id Git.Git --gated --accept-source-agreements 2>&1 |
+                        ForEach-Object { Write-Log "  [winget-pin] $_" -Level "DEBUG" }
+                    if ($LASTEXITCODE -eq 0) {
+                        $pinAddedByUs  = $true
+                        $gitSkipReason = "skipped — close $($gitBlockers -join '/') and re-run"
+                    } else {
+                        Write-Status "winget pin add failed (exit $LASTEXITCODE) — proceeding anyway, Git.Git will likely fail" -Type Warning
+                    }
+                } else {
+                    Write-Log "Winget: Git.Git already pinned by user — leaving as-is." -Level "INFO"
+                    $gitSkipReason = "already user-pinned"
+                }
+                # Pending-Flag setzen, damit der nächste Lauf ohne Blocker das Update direkt einspielt.
+                # Nur wenn der Pin nicht bereits vom User kommt — dann ist es gewollt, kein Backlog.
+                if ($gitSkipReason -ne "already user-pinned") {
+                    Set-PendingGitUpdate -Blockers $gitBlockers
+                }
+                $upgradablePackages = @($upgradablePackages | Where-Object { $_ -ne 'Git.Git' })
+            }
         }
 
         Write-Status "Refreshing winget sources..." -Type Action
         & winget source update
         if ($LASTEXITCODE -ne 0) {
             Write-Status "winget source update failed (exit $LASTEXITCODE) — package list may be stale" -Type Warning
-            Write-Log "winget source update exited $LASTEXITCODE" -Level "WARN"
+            Write-Log "winget source update exited $LASTEXITCODE" -Level "INFO"
         }
 
-        Write-Status "Upgrading all packages..." -Type Action
-        # No retry — winget returns non-zero if ANY package fails (e.g. Office).
-        # Retrying would re-run ALL upgrades unnecessarily.
-        # Pinned packages are excluded by default; we deliberately do not pass
-        # --include-pinned so user pins are preserved.
-        & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-unknown
-        if ($LASTEXITCODE -ne 0) {
-            Write-Status "Some packages may have failed, e.g. Office (exit code $LASTEXITCODE)" -Type Warning
-            Write-Log "winget upgrade --all exited with code $LASTEXITCODE" -Level "WARN"
+        try {
+            Write-Status "Upgrading all packages..." -Type Action
+            # No retry — winget returns non-zero if ANY package fails (e.g. Office).
+            # Pinned packages are excluded by default; we deliberately do not pass
+            # --include-pinned so user pins are preserved.
+            & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-unknown
+            $wingetUpgradeCode = $LASTEXITCODE
+            # Record results AFTER the upgrade so the summary reflects what actually ran.
+            $updatedItems["Winget"] += $upgradablePackages
+            if ($wingetUpgradeCode -ne 0) {
+                Write-Status "Some packages may have failed, e.g. Office (exit code $wingetUpgradeCode)" -Type Warning
+                Write-Log "winget upgrade --all exited with code $wingetUpgradeCode" -Level "INFO"
+                $failedItems["Winget"] += "Some installers failed (exit $wingetUpgradeCode)"
+            }
+            if ($gitSkipReason) {
+                $script:skippedSections += "Git.Git ($gitSkipReason)"
+            }
         }
+        finally {
+            if ($pinAddedByUs) {
+                Write-Log "Winget: removing temporary Git.Git pin." -Level "INFO"
+                & winget pin remove --id Git.Git 2>&1 |
+                    ForEach-Object { Write-Log "  [winget-unpin] $_" -Level "DEBUG" }
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Status "winget pin remove for Git.Git failed (exit $LASTEXITCODE) — run 'winget pin remove --id Git.Git' manually" -Type Warning
+                    Write-Log "Winget: pin remove failed exit $LASTEXITCODE — manual cleanup needed" -Level "INFO"
+                }
+            }
+        }
+    } else {
+        Write-Status "All packages up-to-date" -Type Success
+        Write-Log "Winget: no applicable upgrades." -Level "INFO"
     }
 }
 
@@ -1017,12 +1597,7 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
 Update-Section "Chocolatey packages" ($NoChoco -or $OnlyWsl -or $OnlyWslPackages) { Get-Command choco -ErrorAction SilentlyContinue } {
     Write-Status "Upgrading all Chocolatey packages..." -Type Action
     Write-Log "Upgrading Chocolatey packages."
-    if (Invoke-WithRetry -Action { & choco upgrade all -y } -ActionName "choco upgrade all") {
-        $updatedItems["Chocolatey"] += "All Chocolatey packages"
-    } else {
-        Write-Status "choco upgrade failed after retries" -Type Error
-        $failedItems["Chocolatey"] += "choco upgrade all (failed after retries)"
-    }
+    Invoke-UpdateStep -Key "Chocolatey" -ActionName "choco upgrade all" -Action { & choco upgrade all -y } -SuccessLabel "All Chocolatey packages" | Out-Null
 }
 
 # ══════════════════════════════════════════════════════
@@ -1054,51 +1629,93 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
     }
     Write-Status "$($modulesToUpdate.Count) of $($installedModules.Count) modules have updates available" -Type Info
 
-    # Update modules sequentially (Update-Module isn't parallel-safe on shared module store).
-    # When a module is detected as in-use, immediately launch a subprocess so it runs in
-    # parallel with any remaining sequential Update-Module calls.
-    $psExe   = (Get-Process -Id $PID).MainModule.FileName
+    $psExe    = (Get-Process -Id $PID).MainModule.FileName
     $subprocs = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $progress = 0
-    foreach ($module in $modulesToUpdate) {
-        Write-Progress -Activity "Updating PowerShell Modules" -Status "Updating $($module.Name)" -PercentComplete (($progress / $modulesToUpdate.Count) * 100)
-        try {
-            Write-Log "Updating module: $($module.Name)"
-            $warnMsgs = @()
-            Update-Module -Name $module.Name -Force -ErrorAction Stop -WarningVariable warnMsgs -WarningAction SilentlyContinue
-            if ($warnMsgs | Where-Object { $_.Message -like "*currently in use*" }) {
-                Write-Status "In use: $($module.Name) — starting subprocess..." -Type Warning
-                Write-Log "Module $($module.Name) is in use — spawning subprocess." -Level "INFO"
-                $tmpScript = Join-Path $env:TEMP "$([System.Guid]::NewGuid().ToString()).ps1"
-                $safeName  = $module.Name -replace "'", "''"
-                Set-Content $tmpScript -Encoding UTF8 -Value "Update-Module -Name '$safeName' -Force -ErrorAction Stop"
-                try {
-                    $proc = Start-Process $psExe `
-                        -ArgumentList "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $tmpScript `
-                        -PassThru -WindowStyle Hidden
-                    $subprocs.Add([PSCustomObject]@{
-                        Name      = $module.Name
-                        TmpScript = $tmpScript
-                        Process   = $proc
-                    })
-                } catch {
-                    Remove-Item $tmpScript -ErrorAction SilentlyContinue
-                    throw
-                }
-            } else {
-                $updatedItems["PowerShell Modules"] += $module.Name
-                Write-Log "Successfully updated module: $($module.Name)"
-            }
-        } catch {
-            Write-Status "Failed: $($module.Name) - $_" -Type Error
-            Write-Log "Failed to update module: $($module.Name). Error: $_" -Level "ERROR"
-            $failedItems["PowerShell Modules"] += "$($module.Name) - $($_.Exception.Message)"
-        }
-        $progress++
-    }
-    Write-Progress -Activity "Updating PowerShell Modules" -Completed
 
-    # Wait for any in-use subprocesses (already running since they were launched during the loop)
+    # PS7+: run module updates in parallel (ThrottleLimit 3 — conservative to avoid shared-dep
+    # collisions). Write-Status/Write-Log are not available in runspaces, so collect results
+    # as [PSCustomObject] and process sequentially after the parallel block.
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        $results = $modulesToUpdate | ForEach-Object -Parallel {
+            $name = $_.Name
+            try {
+                $warnMsgs = @()
+                Update-Module -Name $name -Force -ErrorAction Stop -WarningVariable warnMsgs -WarningAction SilentlyContinue
+                $inUse = ($warnMsgs | Where-Object { $_.Message -like "*currently in use*" }).Count -gt 0
+                [PSCustomObject]@{ Name = $name; Status = if ($inUse) { 'InUse' } else { 'OK' }; Error = $null }
+            } catch {
+                [PSCustomObject]@{ Name = $name; Status = 'Error'; Error = $_.Exception.Message }
+            }
+        } -ThrottleLimit 3
+
+        foreach ($r in $results) {
+            switch ($r.Status) {
+                'OK'    {
+                    $updatedItems["PowerShell Modules"] += $r.Name
+                    Write-Log "Updated module: $($r.Name)"
+                }
+                'InUse' {
+                    Write-Status "In use: $($r.Name) — starting subprocess..." -Type Warning
+                    Write-Log "Module $($r.Name) is in use — spawning subprocess." -Level "INFO"
+                    $tmpScript = Join-Path $env:TEMP "$([System.Guid]::NewGuid().ToString()).ps1"
+                    $safeName  = $r.Name -replace "'", "''"
+                    Set-Content $tmpScript -Encoding UTF8 -Value "Update-Module -Name '$safeName' -Force -ErrorAction Stop"
+                    try {
+                        $proc = Start-Process $psExe `
+                            -ArgumentList "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $tmpScript `
+                            -PassThru -WindowStyle Hidden
+                        $subprocs.Add([PSCustomObject]@{ Name = $r.Name; TmpScript = $tmpScript; Process = $proc })
+                    } catch {
+                        Remove-Item $tmpScript -ErrorAction SilentlyContinue
+                        throw
+                    }
+                }
+                'Error' {
+                    Write-Status "Failed: $($r.Name) - $($r.Error)" -Type Error
+                    Write-Log "Failed to update module: $($r.Name). Error: $($r.Error)" -Level "ERROR"
+                    $failedItems["PowerShell Modules"] += "$($r.Name) - $($r.Error)"
+                }
+            }
+        }
+    } else {
+        # PS5.1 fallback: sequential update; spawn subprocess for in-use modules
+        $progress = 0
+        foreach ($module in $modulesToUpdate) {
+            Write-Progress -Activity "Updating PowerShell Modules" -Status "Updating $($module.Name)" -PercentComplete (($progress / $modulesToUpdate.Count) * 100)
+            try {
+                Write-Log "Updating module: $($module.Name)"
+                $warnMsgs = @()
+                Update-Module -Name $module.Name -Force -ErrorAction Stop -WarningVariable warnMsgs -WarningAction SilentlyContinue
+                if ($warnMsgs | Where-Object { $_.Message -like "*currently in use*" }) {
+                    Write-Status "In use: $($module.Name) — starting subprocess..." -Type Warning
+                    Write-Log "Module $($module.Name) is in use — spawning subprocess." -Level "INFO"
+                    $tmpScript = Join-Path $env:TEMP "$([System.Guid]::NewGuid().ToString()).ps1"
+                    $safeName  = $module.Name -replace "'", "''"
+                    Set-Content $tmpScript -Encoding UTF8 -Value "Update-Module -Name '$safeName' -Force -ErrorAction Stop"
+                    try {
+                        $proc = Start-Process $psExe `
+                            -ArgumentList "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $tmpScript `
+                            -PassThru -WindowStyle Hidden
+                        $subprocs.Add([PSCustomObject]@{ Name = $module.Name; TmpScript = $tmpScript; Process = $proc })
+                    } catch {
+                        Remove-Item $tmpScript -ErrorAction SilentlyContinue
+                        throw
+                    }
+                } else {
+                    $updatedItems["PowerShell Modules"] += $module.Name
+                    Write-Log "Successfully updated module: $($module.Name)"
+                }
+            } catch {
+                Write-Status "Failed: $($module.Name) - $_" -Type Error
+                Write-Log "Failed to update module: $($module.Name). Error: $_" -Level "ERROR"
+                $failedItems["PowerShell Modules"] += "$($module.Name) - $($_.Exception.Message)"
+            }
+            $progress++
+        }
+        Write-Progress -Activity "Updating PowerShell Modules" -Completed
+    }
+
+    # Wait for any in-use subprocesses (launched during either the parallel or sequential loop)
     if ($subprocs.Count -gt 0) {
         Write-Status "Waiting for $($subprocs.Count) in-use subprocess(es)..." -Type Action
         foreach ($sp in $subprocs) {
@@ -1136,12 +1753,7 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
         if ($script:isAdmin) {
             Write-Status "Updating WSL kernel..." -Type Action
             Write-Log "Updating WSL kernel."
-            if (Invoke-WithRetry -Action { & wsl --update --web-download } -ActionName "wsl --update" -MaxRetries 2) {
-                $updatedItems["WSL"] += "WSL Kernel"
-            } else {
-                Write-Status "wsl --update failed after retries" -Type Error
-                $failedItems["WSL"] += "wsl --update (failed after retries)"
-            }
+            Invoke-UpdateStep -Key "WSL" -ActionName "wsl --update" -Action { & wsl --update --web-download } -SuccessLabel "WSL Kernel" -MaxRetries 2 | Out-Null
 
             Write-Status "Shutting down WSL to apply updates..." -Type Action
             Write-Log "Shutting down WSL."
@@ -1187,23 +1799,35 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
     if ($sudoOk) {
         Write-Status "Running apt-get update and upgrade..." -Type Action
         Write-Log "Running apt-get update and upgrade."
-        & wsl.exe sudo apt-get update
-        if ($LASTEXITCODE -ne 0) {
-            Write-Status "apt-get update failed (exit $LASTEXITCODE)" -Type Error
+        # When running as Windows admin use -u root + DEBIAN_FRONTEND=noninteractive
+        # (avoids the "unable to initialize frontend: Dialog" debconf noise).
+        # When not admin (e.g. -OnlyWslPackages without elevation) fall back to sudo.
+        # ScriptBlocks contain no variable references so they survive Invoke-WithTimeout serialisation.
+        if ($script:isAdmin) {
+            $aptUpdateBlock  = { & wsl.exe -u root sh -c "DEBIAN_FRONTEND=noninteractive apt-get update -q" }
+            $aptUpgradeBlock = { & wsl.exe -u root sh -c "DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -q" }
+            $aptRemoveBlock  = { & wsl.exe -u root sh -c "DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -q" }
+        } else {
+            $aptUpdateBlock  = { & wsl.exe sudo apt-get update }
+            $aptUpgradeBlock = { & wsl.exe sudo apt-get full-upgrade -y }
+            $aptRemoveBlock  = { & wsl.exe sudo apt-get autoremove -y }
+        }
+        if (-not (Invoke-WithRetry -Action $aptUpdateBlock -ActionName "apt-get update" -MaxRetries 2)) {
+            Write-Status "apt-get update failed after retries" -Type Error
             $failedItems["WSL"] += "apt-get update failed"
         } else {
-            & wsl.exe sudo apt-get full-upgrade -y
-            if ($LASTEXITCODE -eq 0) {
+            # full-upgrade: MaxRetries 1 — can carry partial state, retry conservatively
+            if (Invoke-WithRetry -Action $aptUpgradeBlock -ActionName "apt-get full-upgrade" -MaxRetries 1) {
                 $updatedItems["WSL"] += "Updated packages in default WSL distro"
-                $autoremoveOut = & wsl.exe sudo apt-get autoremove -y 2>&1
-                $autoremoveExitCode = $LASTEXITCODE
+                $autoremoveOut = & $aptRemoveBlock 2>&1
+                $autoremoveExit = $LASTEXITCODE
                 $autoremoveOut | ForEach-Object { Write-Log "  [autoremove] $_" -Level "DEBUG" }
-                if ($autoremoveExitCode -ne 0) {
-                    Write-Status "apt-get autoremove failed (exit $autoremoveExitCode)" -Type Warning
-                    Write-Log "apt-get autoremove exited $autoremoveExitCode" -Level "WARN"
+                if ($autoremoveExit -ne 0) {
+                    Write-Status "apt-get autoremove failed (exit $autoremoveExit)" -Type Warning
+                    Write-Log "apt-get autoremove exited $autoremoveExit" -Level "INFO"
                 }
             } else {
-                Write-Status "apt-get full-upgrade failed (exit $LASTEXITCODE)" -Type Error
+                Write-Status "apt-get full-upgrade failed after retries" -Type Error
                 $failedItems["WSL"] += "apt-get full-upgrade failed"
             }
         }
@@ -1245,7 +1869,7 @@ Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $O
     } catch { }
     if (-not $npmWritable) {
         Write-Status "npm prefix '$npmPrefix' is not writable — run as Administrator to update npm" -Type Warning
-        Write-Log "npm: prefix '$npmPrefix' not writable — skipping updates." -Level "WARN"
+        Write-Log "npm: prefix '$npmPrefix' not writable — skipping updates." -Level "INFO"
         $script:skippedSections += "npm (prefix not writable, needs elevation)"
         return
     }
@@ -1287,86 +1911,14 @@ Update-Section "Deno" ($NoDeno -or $OnlyWsl -or $OnlyWslPackages) { Get-Command 
 # ══════════════════════════════════════════════════════
 Write-GroupHeader "Python"
 
-# --- Update Miniconda ---
-Update-Section "Miniconda and conda environments" ($NoConda -or $OnlyWsl -or $OnlyWslPackages) { Get-Command conda -ErrorAction SilentlyContinue } {
-    Write-Status "Updating base environment..." -Type Action
-    if (Invoke-WithRetry -Action { & conda update -n base -c defaults conda -y } -ActionName "conda update -n base") {
-        $updatedItems["Conda"] += "Miniconda (base)"
-    } else {
-        Write-Status "conda update -n base failed after retries" -Type Error
-        $failedItems["Conda"] += "conda update -n base (failed after retries)"
-    }
-
-    # After upgrading conda itself, update all packages in the base environment
-    Write-Status "Updating all packages in base environment..." -Type Action
-    if (Invoke-WithRetry -Action { & conda update -n base --all -y } -ActionName "conda update -n base --all") {
-        $updatedItems["Conda"] += "Conda packages (base)"
-    } else {
-        Write-Status "conda update -n base --all failed after retries" -Type Error
-        $failedItems["Conda"] += "conda update -n base --all (failed after retries)"
-    }
-
-    # Enumerate all non-base environments and update each
-    # Note: conda prints its env list to both stdout and stderr; use 2>$null to avoid duplicates.
-    $condaEnvList = & conda env list 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Status "conda env list failed" -Type Error
-        $failedItems["Conda"] += "conda env list (Exit Code: $LASTEXITCODE)"
-    } else {
-        $nonBaseEnvs = $condaEnvList |
-            Where-Object { $_ -notmatch '^\s*#' -and $_ -match '^\S' -and $_ -notmatch '^base\s' } |
-            ForEach-Object { ($_ -split '\s+')[0] } |
-            Where-Object { $_ -and $_ -ne 'base' } |
-            Select-Object -Unique
-        if ($nonBaseEnvs) {
-            foreach ($envName in $nonBaseEnvs) {
-                Write-Status "Updating '$envName' environment..." -Type Action
-                if (Invoke-WithRetry -Action { & conda update -n $envName --all -y } -ActionName "conda update -n $envName") {
-                    $updatedItems["Conda"] += "Conda environment ($envName)"
-                } else {
-                    Write-Status "conda update -n $envName failed after retries" -Type Error
-                    $failedItems["Conda"] += "conda update -n $envName (failed)"
-                }
-            }
-        } else {
-            Write-Status "No additional conda environments found" -Type Info
-        }
-    }
-
-    # Ensure base environment activates automatically in new shells so tools
-    # installed there (e.g. pipx) are available on PATH without manual activation.
-    # Note: auto_activate_base was renamed to auto_activate in recent conda versions.
-    Write-Status "Ensuring auto_activate is enabled..." -Type Action
-    & conda config --set auto_activate true
-    if ($LASTEXITCODE -ne 0) {
-        Write-Status "conda config --set auto_activate failed (exit $LASTEXITCODE)" -Type Warning
-        Write-Log "conda config --set auto_activate failed (exit $LASTEXITCODE)" -Level "WARN"
-    }
-}
-
 # --- Update pipx packages ---
-Update-Section "pipx packages" ($NoPipx -or $OnlyWsl -or $OnlyWslPackages) {
-    # pipx may live in conda base even when auto_activate_base is off; accept either
-    (Get-Command pipx -ErrorAction SilentlyContinue) -or (Get-Command conda -ErrorAction SilentlyContinue)
-} {
+Update-Section "pipx packages" ($NoPipx -or $OnlyWsl -or $OnlyWslPackages) { Get-Command pipx -ErrorAction SilentlyContinue } {
     Write-Status "Upgrading all pipx packages..." -Type Action
     Write-Log "Upgrading pipx packages."
     # Force Python UTF-8 mode so pipx can print emoji in its output without crashing
     # on Windows consoles with cp1252 or other narrow code pages.
     $env:PYTHONUTF8 = '1'
-    # Prefer direct pipx; fall back to conda run -n base if pipx is only in conda base
-    $pipxAction = if (Get-Command pipx -ErrorAction SilentlyContinue) {
-        { & pipx upgrade-all }
-    } else {
-        Write-Status "pipx not on PATH — running via conda base" -Type Info
-        { & conda run -n base pipx upgrade-all }
-    }
-    if (Invoke-WithRetry -Action $pipxAction -ActionName "pipx upgrade-all") {
-        $updatedItems["pipx"] += "All pipx packages"
-    } else {
-        Write-Status "pipx upgrade-all failed after retries" -Type Error
-        $failedItems["pipx"] += "pipx upgrade-all (failed after retries)"
-    }
+    Invoke-UpdateStep -Key "pipx" -ActionName "pipx upgrade-all" -Action { & pipx upgrade-all } -SuccessLabel "All pipx packages" | Out-Null
 }
 
 # --- Update uv ---
@@ -1385,13 +1937,11 @@ Update-Section "uv" ($NoUv -or $OnlyWsl -or $OnlyWslPackages) { Get-Command uv -
         $failedItems["uv"] += "uv self update (exit $LASTEXITCODE)"
     }
 
+    Write-Status "Upgrading uv-managed Python runtimes..." -Type Action
+    Invoke-UpdateStep -Key "uv" -ActionName "uv python install --upgrade" -Action { & uv python install --upgrade } -SuccessLabel "Python runtimes" | Out-Null
+
     Write-Status "Upgrading all uv tools..." -Type Action
-    if (Invoke-WithRetry -Action { & uv tool upgrade --all } -ActionName "uv tool upgrade --all") {
-        $updatedItems["uv"] += "All uv tools"
-    } else {
-        Write-Status "uv tool upgrade --all failed after retries" -Type Error
-        $failedItems["uv"] += "uv tool upgrade --all (failed after retries)"
-    }
+    Invoke-UpdateStep -Key "uv" -ActionName "uv tool upgrade --all" -Action { & uv tool upgrade --all } -SuccessLabel "All uv tools" | Out-Null
 }
 
 # --- Update Poetry ---
@@ -1466,28 +2016,16 @@ Update-Section ".NET Global Tools" ($NoDotnet -or $OnlyWsl -or $OnlyWslPackages)
 Update-Section "Rust (rustup)" ($NoRust -or $OnlyWsl -or $OnlyWslPackages) { Get-Command rustup -ErrorAction SilentlyContinue } {
     Write-Status "Updating Rust toolchain..." -Type Action
     Write-Log "Updating Rust toolchain via rustup."
-    if (Invoke-WithRetry -Action { & rustup update } -ActionName "rustup update") {
-        $updatedItems["Rust"] += "Rust toolchain"
-    } else {
-        Write-Status "rustup update failed after retries" -Type Error
-        $failedItems["Rust"] += "rustup update (failed after retries)"
-    }
+    Invoke-UpdateStep -Key "Rust" -ActionName "rustup update" -Action { & rustup update } -SuccessLabel "Rust toolchain" | Out-Null
 }
 
 # --- Update Ruby Gems ---
 Update-Section "Ruby Gems" ($NoGem -or $OnlyWsl -or $OnlyWslPackages) { Get-Command gem -ErrorAction SilentlyContinue } {
     Write-Status "Updating RubyGems system..." -Type Action
     Write-Log "Updating Ruby Gems."
-    if (-not (Invoke-WithRetry -Action { & gem update --system } -ActionName "gem update --system")) {
-        Write-Status "gem update --system failed after retries" -Type Warning
-    }
+    Invoke-UpdateStep -Key "Ruby Gems" -ActionName "gem update --system" -Action { & gem update --system } -SuccessLabel "RubyGems system" | Out-Null
     Write-Status "Updating all gems..." -Type Action
-    if (Invoke-WithRetry -Action { & gem update } -ActionName "gem update") {
-        $updatedItems["Ruby Gems"] += "All gems"
-    } else {
-        Write-Status "gem update failed after retries" -Type Error
-        $failedItems["Ruby Gems"] += "gem update (failed after retries)"
-    }
+    Invoke-UpdateStep -Key "Ruby Gems" -ActionName "gem update" -Action { & gem update } -SuccessLabel "All gems" | Out-Null
 }
 
 # --- Update Composer ---
@@ -1518,6 +2056,28 @@ Update-Section "Google Cloud SDK" ($NoGCloud -or $OnlyWsl -or $OnlyWslPackages) 
         Write-Log "gcloud: component manager disabled (external install)" -Level "INFO"
         $script:skippedSections += "Google Cloud SDK (managed externally)"
         return
+    }
+
+    # gcloud refuses Self-Update in non-interactive mode when using bundled Python:
+    # copy it to a separate location, set CLOUDSDK_PYTHON (process-scope only), retry.
+    if ($gcloudCode -ne 0 -and $gcloudText -match 'Cannot use bundled Python installation') {
+        Write-Status "gcloud needs CLOUDSDK_PYTHON workaround — copying bundled Python..." -Type Action
+        $copyOut  = & gcloud components copy-bundled-python 2>&1
+        $copyCode = $LASTEXITCODE
+        $pythonPath = ($copyOut | Out-String).Trim()
+        if ($copyCode -eq 0 -and $pythonPath -and (Test-Path $pythonPath)) {
+            $env:CLOUDSDK_PYTHON = $pythonPath
+            Write-Log "gcloud: CLOUDSDK_PYTHON set to $pythonPath, retrying update." -Level "INFO"
+            $gcloudOut  = & gcloud components update --quiet 2>&1
+            $gcloudCode = $LASTEXITCODE
+            $gcloudText = ($gcloudOut | Out-String)
+            $gcloudOut | ForEach-Object { Write-Log "  [gcloud-retry] $_" -Level "DEBUG" }
+        } else {
+            Write-Status "gcloud copy-bundled-python failed (exit $copyCode)" -Type Error
+            Write-Log "gcloud copy-bundled-python output: $copyOut" -Level "INFO"
+            $failedItems["Google Cloud SDK"] += "copy-bundled-python failed (exit $copyCode)"
+            return
+        }
     }
 
     if ($gcloudCode -eq 0 -or $gcloudText -match 'All components are up to date') {
@@ -1578,12 +2138,7 @@ Update-Section "krew plugins" ($NoKrew -or $OnlyWsl -or $OnlyWslPackages) { Get-
         return
     }
     Write-Status "Upgrading krew plugins..." -Type Action
-    if (Invoke-WithRetry -Action { & kubectl krew upgrade 2>&1 | Out-Null } -ActionName "kubectl krew upgrade") {
-        $updatedItems["krew plugins"] += "All krew plugins"
-    } else {
-        Write-Status "kubectl krew upgrade failed" -Type Error
-        $failedItems["krew plugins"] += "kubectl krew upgrade (failed)"
-    }
+    Invoke-UpdateStep -Key "krew plugins" -ActionName "kubectl krew upgrade" -Action { & kubectl krew upgrade 2>&1 | Out-Null } -SuccessLabel "All krew plugins" | Out-Null
 }
 
 # ══════════════════════════════════════════════════════
@@ -1663,12 +2218,7 @@ Update-Section "GitHub CLI Extensions" ($NoGhExt -or $OnlyWsl -or $OnlyWslPackag
         return
     }
     Write-Status "Upgrading all GitHub CLI extensions..." -Type Action
-    if (Invoke-WithRetry -Action { & gh extension upgrade --all } -ActionName "gh extension upgrade --all") {
-        $updatedItems["GitHub CLI Extensions"] += "All extensions"
-    } else {
-        Write-Status "gh extension upgrade failed" -Type Error
-        $failedItems["GitHub CLI Extensions"] += "gh extension upgrade failed"
-    }
+    Invoke-UpdateStep -Key "GitHub CLI Extensions" -ActionName "gh extension upgrade --all" -Action { & gh extension upgrade --all } -SuccessLabel "All extensions" | Out-Null
 }
 
 # ══════════════════════════════════════════════════════
@@ -1826,11 +2376,43 @@ if ($skippedSections.Count -gt 0) {
 Write-Log "Total time: $(Format-Elapsed $totalElapsed)"
 Write-Log "==================="
 
-# Exit with appropriate code based on failures.
-# Use INFO for the exit-status log — the banner/summary already rendered it to terminal.
+# --- Exit-Code-Entscheidung: Ok / Partial / HardFailure ---
+$attemptedCount = $updatedCount + $failedCount
+$exitCode = $script:ExitOk
 if ($hasFailures) {
-    Write-Log "Script completed with failures."
-    exit 1
+    if ($attemptedCount -gt 0 -and ($failedCount / $attemptedCount) -ge 0.5) {
+        $exitCode = $script:ExitHardFailure
+        Write-Log "Script completed with hard failure ($failedCount/$attemptedCount sections failed)."
+    } else {
+        $exitCode = $script:ExitPartial
+        Write-Log "Script completed with partial failures ($failedCount/$attemptedCount sections failed)."
+    }
+} else {
+    Write-Log "Script completed successfully."
 }
-Write-Log "Script completed successfully."
-exit 0
+
+# --- Notifications ---
+$failedSectionList = @()
+foreach ($key in $failedItems.Keys) {
+    if ($failedItems[$key].Count -gt 0) { $failedSectionList += $key }
+}
+$summaryHash = @{
+    Updated        = $updatedCount
+    Failures       = $failedCount
+    Skipped        = $skippedCount
+    Duration       = Format-Elapsed $totalElapsed
+    FailedSections = $failedSectionList
+}
+Send-UpdateNotifications -HasFailures $hasFailures -Summary $summaryHash
+
+# --- Lock-Release ---
+Release-UpdateLock -LockPath $script:LockFilePath
+
+# --- Auto-Reboot bei erkenntlichem Pending Reboot ---
+if ($AutoReboot -and (Test-PendingReboot)) {
+    Write-Status "Pending reboot detected — rebooting in 60 seconds (auto-reboot)" -Type Warning
+    Write-Log "AutoReboot: pending reboot detected, triggering shutdown /r /t 60." -Level "INFO"
+    & shutdown.exe /r /t 60 /c "update.ps1 auto-reboot" | Out-Null
+}
+
+exit $exitCode

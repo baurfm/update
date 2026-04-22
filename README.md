@@ -15,8 +15,11 @@ A comprehensive PowerShell script that automates the update process for multiple
 - **Retry with Backoff**: All external commands wrapped in `Invoke-WithRetry` for transient-error resilience
 - **Automatic WSL Sudo Config**: Writes a NOPASSWD sudoers entry for `apt-get` on first run (skip with `-SkipWslSudoConfig`)
 - **Self-Update Check**: Verifies the script itself is current via GitHub on startup (disable with `-NoSelfUpdate`)
-- **Centralized Logs**: Output and past logs stored in a `logs/` subdirectory (auto-rotated, last 5 archives kept)
+- **Centralized Logs**: Output and past logs stored in a `logs/` subdirectory (auto-rotated, last 30 archives kept)
 - **Administrative Support**: Lazy elevation based on pre-checks, also supports the Windows `sudo` command and the `-Sudo` flag for immediate elevation
+- **Unattended / Scheduled Operation**: `-Unattended` flag silences all interactive prompts, suppresses progress bars, sets per-command timeouts, and enables notifications. `-RegisterSchedule` installs a SYSTEM-level Scheduled Task for nightly auto-runs. Lock-file prevents overlapping runs. Network pre-check aborts early if offline. Differentiates exit codes 0–6 for CI/monitoring use.
+- **Notifications**: BurntToast toast notifications, generic webhook (ntfy.sh compatible), or Windows Event Log (`-NotifyToast`, `-NotifyWebhook`, `-NotifyEventLog`).
+- **Auto-Reboot**: `-AutoReboot` triggers a graceful 60-second shutdown when a pending reboot is detected after updates.
 
 ## 📦 Supported Tools
 
@@ -56,9 +59,8 @@ Sections are organised into logical groups in the order they run:
 
 | Category | Tools Updated | Command Used |
 |----------|---------------|--------------|
-| **Conda** | Base environment + all named environments (dynamic) | `conda update --all` |
-| **pipx** | All pipx-installed apps (with `conda run` fallback) | `pipx upgrade-all` |
-| **uv** | uv itself **and** all uv-installed tools | `uv self update` + `uv tool upgrade --all` |
+| **pipx** | All pipx-installed apps | `pipx upgrade-all` |
+| **uv** | uv itself, uv-managed Python runtimes, and all uv-installed tools | `uv self update` + `uv python install --upgrade` + `uv tool upgrade --all` |
 | **Poetry** | Poetry itself | `poetry self update` |
 | **Rye** | Rye itself | `rye self update` |
 
@@ -114,7 +116,7 @@ Sections are organised into logical groups in the order they run:
 .\update.ps1
 
 # Skip specific sections
-.\update.ps1 -NoTex -NoConda
+.\update.ps1 -NoTex
 
 # Display help
 .\update.ps1 -h
@@ -124,7 +126,7 @@ Sections are organised into logical groups in the order they run:
 
 ```powershell
 # Update only PowerShell modules and VS Code extensions
-.\update.ps1 -NoScoop -NoWinget -NoConda -NoTex -NoWsl
+.\update.ps1 -NoScoop -NoWinget -NoTex -NoWsl
 
 # Update everything except TeX Live (requires admin privileges)
 .\update.ps1 -NoTex
@@ -149,9 +151,8 @@ Get-Help .\update.ps1 -Full
 | `-NoPnpm` | Skip pnpm self-update |
 | `-NoBun` | Skip Bun upgrade |
 | `-NoDeno` | Skip Deno upgrade |
-| `-NoConda` | Skip Conda base + named environments |
 | `-NoPipx` | Skip pipx packages |
-| `-NoUv` | Skip uv self-update and `uv tool upgrade --all` |
+| `-NoUv` | Skip uv self-update, Python runtime upgrades, and `uv tool upgrade --all` |
 | `-NoPoetry` | Skip Poetry self-update |
 | `-NoRye` | Skip Rye self-update |
 | `-NoDotnet` | Skip .NET global tools |
@@ -178,8 +179,39 @@ Get-Help .\update.ps1 -Full
 | `-OnlyWslPackages` | - | Update only WSL distro packages (skip kernel) |
 | `-SkipWslSudoConfig` | - | Skip automatic passwordless-sudo setup for WSL |
 | `-LogFile <path>` | - | Override log file path (default: `logs/update.log`) |
-| `-EnableVerbose` | - | Verbose output |
+| `-Verbose` | - | Verbose output (standard PowerShell common parameter) |
 | `-RemoveFromPath` | - | Remove the auto-registered `update.cmd` shim and strip the script dir from User PATH, then exit |
+
+### Unattended / Scheduled Operation
+
+| Parameter | Description |
+|-----------|-------------|
+| `-Unattended` | Composite: implies `-Quiet`, `-NotifyEventLog`, `CmdTimeoutSec=600`; silences all interactive prompts globally |
+| `-Quiet` | Suppress banner, section headers, and non-error terminal output |
+| `-NoLock` | Skip lock-file guard (allows parallel runs; useful when called from a wrapper) |
+| `-CmdTimeoutSec <n>` | Per-command hard timeout in seconds (0 = disabled, default 600 under `-Unattended`) |
+| `-SkipNetworkCheck` | Skip the network reachability pre-check |
+| `-AutoReboot` | Trigger `shutdown /r /t 60` if a pending reboot is detected after updates |
+| `-RegisterSchedule` | Install a SYSTEM-level Scheduled Task (`UpdateDevTools`) and exit |
+| `-UnregisterSchedule` | Remove the Scheduled Task and exit |
+| `-ScheduleTime <HH:mm>` | Daily trigger time for `-RegisterSchedule` (default: `"03:00"`) |
+| `-ScheduleFrequency <Daily/Weekly>` | Recurrence for `-RegisterSchedule` (default: `Daily`) |
+| `-NotifyToast` | Send a Windows toast notification after completion (requires BurntToast) |
+| `-NotifyWebhook <url>` | POST a JSON summary to this URL after completion (ntfy.sh compatible) |
+| `-NotifyEventLog` | Write a Windows Application Event Log entry after completion |
+| `-NotifyOn <Always/Failure/Never>` | Control when notifications fire (default: `Always`) |
+
+### Exit Codes
+
+| Code | Constant | Meaning |
+| ---- | -------- | ------- |
+| `0` | `ExitOk` | All sections succeeded |
+| `1` | `ExitPartial` | At least one section failed, but fewer than 50% |
+| `2` | `ExitHardFailure` | 50%+ of attempted sections failed |
+| `3` | `ExitElevationMissing` | Admin required but elevation failed |
+| `4` | `ExitLockActive` | Another instance is already running (lock held) |
+| `5` | `ExitNetworkDown` | No configured update host reachable |
+| `6` | `ExitTimedOut` | (reserved for future per-section hard timeout tracking) |
 
 ## 📋 Prerequisites
 
@@ -192,7 +224,6 @@ Get-Help .\update.ps1 -Full
 - **Scoop** - Windows package manager
 - **Winget** - Microsoft's package manager (Windows 10 1709+)
 - **Visual Studio Code** - Code editor
-- **Miniconda/Anaconda** - Python package manager
 - **npm (Node.js)** - JavaScript package manager
 - **TeX Live** - LaTeX distribution
 - **WSL** - Windows Subsystem for Linux
@@ -240,23 +271,29 @@ The script updates packages inside your default WSL distribution via `apt-get fu
 ### Sample Output
 
 ```
-==================================================
-  Updating PowerShell Modules
-==================================================
+  ╭────────────────────────────────────────╮
+  │  ◆  Windows Update Script  v12.0      │
+  │  ◆  2026-04-22  14:32:07              │
+  ╰────────────────────────────────────────╯
 
-Checking for installed PowerShell modules and updating them...
-Updating module: Pester...
-PowerShell module update check completed.
+  ══════════════════════════════════════════════════════════
+  ▪ Python
 
-==================================================
-  Update Summary
-==================================================
+  ▶  Updating uv
 
---- Successfully Ran: PowerShell Modules ---
-- Pester
-- PSReadLine
+  →  Updating uv...
+  ○  uv is managed by another package manager — skipping self-update
+  →  Upgrading uv-managed Python runtimes...
+  ✓  uv python install --upgrade succeeded.
+  →  Upgrading all uv tools...
+  ✓  All uv tools upgraded.
+  ✓  Done  3s
 
-No failures were reported during this run.
+  ══════════════════════════════════════════════════════════
+  ▪ Update Summary
+
+  ✓  Updated (3 sections):  uv: Python runtimes, All uv tools | pipx: All pipx packages | ...
+  ·  Skipped (2):  Conda (not installed) | TeX Live (--NoTex)
 ```
 
 ## 🔒 Security Considerations
@@ -357,7 +394,7 @@ To run the script from anywhere by simply typing `update` in PowerShell, add a f
    }
    ```
 
-   The `@args` forwards any flags you pass (e.g. `update -NoTex -NoConda`).
+   The `@args` forwards any flags you pass (e.g. `update -NoTex`).
 
 3. Save and reload your profile:
 
@@ -369,6 +406,10 @@ After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any di
 
 ## 📈 Version History
 
+- **v12.3** — Fix: winget upgrade no longer fails when `bash.exe` / `git.exe` / Claude-Code sessions are running and Git.Git has a pending update. Detected blockers trigger a temporary `winget pin add --id Git.Git --gated` (removed in a `finally` block). A pending-update flag (`logs/pending-git-update.json`) persists across runs — the next run without blockers auto-applies the pending Git update via a fast-path before the regular `--all` batch. User-pre-existing pins are detected and left untouched.
+- **v12.1** — Fix: gcloud auto-recovers from "Cannot use bundled Python installation" by running `gcloud components copy-bundled-python` and setting `CLOUDSDK_PYTHON` in-process, then retrying the update.
+- **v12.0** — New: Unattended/headless mode (`-Unattended`, `-Quiet`). New: Lock-file prevents overlapping runs (`-NoLock` to bypass). New: Network pre-check aborts early when offline (`-SkipNetworkCheck`). New: Per-command hard timeout via `Invoke-WithTimeout` (`-CmdTimeoutSec`). New: Scheduled Task installer (`-RegisterSchedule`/`-UnregisterSchedule`/`-ScheduleTime`/`-ScheduleFrequency`) using SYSTEM principal — no password storage. New: Notifications via BurntToast toast, webhook (ntfy.sh compatible), or Windows Event Log (`-NotifyToast`/`-NotifyWebhook`/`-NotifyEventLog`/`-NotifyOn`). New: Auto-reboot when pending reboot detected (`-AutoReboot`). New: Differentiates exit codes 0–6 (Ok/Partial/HardFail/ElevationMissing/LockActive/NetworkDown/TimedOut). New: Global prompt killer silences all tool telemetry/interactive prompts in unattended mode. Fixed: Lock released before elevation re-launch so elevated child can acquire it. Log rotation increased from 5 to 30 archives.
+- **v11.0** — BREAKING: Removed Conda section and `-NoConda` (migrated to uv). BREAKING: Replaced `-EnableVerbose` with standard `-Verbose` via `[CmdletBinding()]`. New: `uv python install --upgrade` in uv section (uv-managed Python runtimes). New helper `Invoke-UpdateStep` consolidates retry+result pattern across 9 call-sites. New helper `Get-WingetUpgradableIds` deduplicates winget parser. PS Modules run in parallel on PS7+ (ThrottleLimit 3). WSL apt-get now uses `Invoke-WithRetry` with retry. Fixed: 7+ log-duplication bugs (Write-Log -Level WARN after Write-Status). Fixed: `gem update --system` failures now recorded in failedItems. Fixed: Ctrl+C no longer logged as section ERROR. Docs: README Sample Output updated to reflect current UI.
 - **v10.21** — Auto-register `update` command on User PATH via `update.cmd` shim (new `-RemoveFromPath` to undo); gcloud now parses output instead of blindly trusting exit code (handles external-package-manager case); cleaner summary layout (no duplicate failure lines, group headers get trailing whitespace); silent script-directory switch
 - **v10.20** — Fix: winget upgrade check treated "no updates" exit code as failure; PS module subprocess leaked temp script on `Start-Process` exception; added `uv tool upgrade --all` so all uv-installed tools are updated alongside uv itself
 - **v10.19** — Parallel pre-checks, `-DryRun` mode, .NET tool list stderr fix, broad refactoring
