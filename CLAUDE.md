@@ -53,9 +53,26 @@ Keine automatisierte Test-Suite. Smoke-Test vor Commit:
 
 Plus für spezifische Sektionen gezielte Flags (z. B. `-NoScoop -NoWinget -NoTex` für schnellen Teil-Test).
 
+**Kritisch:** PS7-only-Syntax (Ternary `?:`, `??`, Pipeline-Chains `&&`/`||`) bricht das Parsen unter PS5.1 komplett — nicht nur zur Laufzeit. Vor jedem Commit gegen **beide** Hosts prüfen:
+
+```powershell
+$e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile('update.ps1',[ref]$null,[ref]$e); $e
+```
+
+einmal mit `powershell.exe`, einmal mit `pwsh`.
+
+`-DryRun` allein reicht bei Output-/Elevation-Änderungen nicht (überspringt Self-Update-Relaunch, echte Tool-Aufrufe). Für solche Änderungen echten Lauf testen, elevation-auslösende Sektionen aber ausschließen (`-NoWinget -NoWsl`) — ein UAC-Prompt in einer nicht-interaktiven Session hängt, `consent.exe` lässt sich nicht per `Stop-Process` beenden.
+
+CI (`.github/workflows/lint.yml`) prüft das automatisch bei jedem Push: PS5.1+PS7-Parse-Check + PSScriptAnalyzer.
+
 ## Sicherheit
 
 - **Nie** `wsl sudo ...` — zirkulär. Immer `wsl -u root sh -c "..."`.
 - Passwordless-Sudo-Setup via `Set-WslPasswordlessSudo` mit Verifikation (`sudo -n apt-get --version`)
 - Keine hardcodierten Pfade zu User-Verzeichnissen
 - Sektions-Skip bei fehlenden Tools, nie Fehler werfen weil ein Tool nicht installiert ist
+- Direkter Push auf `main` ist für dieses Solo-Repo etablierte Praxis (kein PR-Workflow) — überschreibt die globale "nie direkt auf main"-Regel für dieses Projekt
+
+## Issue-Tracking
+
+GitHub Issues aktiv genutzt (`.github/ISSUE_TEMPLATE/`). Bekannte Lücken/Follow-ups als Issue anlegen (`gh issue create`), nicht nur im Chat erwähnen und vergessen.
