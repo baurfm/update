@@ -1,0 +1,69 @@
+name: Bug Report
+description: Something in update.ps1 is broken or behaves unexpectedly
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Script version
+      description: The version shown in the banner / $script:VersionString
+      placeholder: "v12.4"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: pwsh-version
+    attributes:
+      label: PowerShell edition
+      options:
+        - Windows PowerShell 5.1
+        - PowerShell 7+ (Core)
+        - Both
+    validations:
+      required: true
+
+  - type: input
+    id: section
+    attributes:
+      label: Affected section (if applicable)
+      description: e.g. Scoop, Winget, WSL, VS Code Extensions — see the section list in README.md
+      placeholder: "Winget & Microsoft Store apps"
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command used
+      description: The exact update.ps1 invocation, including flags
+      render: powershell
+      placeholder: ".\\update.ps1 -NoTex -Verbose"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Relevant log excerpt
+      description: From logs/update.log — redact anything sensitive (paths, usernames are usually fine)
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I ran with -DryRun first to confirm the section is even reached
+        - label: I checked logs/update.log for the full error, not just the terminal summary

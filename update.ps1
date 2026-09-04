@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     This script updates a comprehensive set of development tools and packages on a Windows system.
     It provides command-line switches to skip specific update sections.
@@ -68,6 +68,21 @@
 
 .PARAMETER OnlyWslPackages
     A switch to only update WSL packages (apt-get) and skip other sections including WSL kernel.
+
+.PARAMETER Only
+    Run only sections whose name matches one of these strings (substring match, e.g.
+    -Only npm,uv). All other sections are skipped silently. Combine with -NoSelfUpdate for a
+    fast targeted run.
+
+.PARAMETER Parallel
+    Pre-launch independent, quick tool self-updates (Oh My Posh, pnpm, Bun, Deno, Poetry, Rye,
+    Composer) as background jobs before the slower Package Manager / System / npm sections run,
+    instead of running them strictly one after another. Purely an optimization — each section
+    falls back to its normal retry-wrapped update if the background job hasn't finished or failed.
+
+.PARAMETER OutputJson
+    Write a machine-readable JSON summary of the run (counts, updated/failed/skipped items,
+    exit code, duration) to this path after completion.
 
 .PARAMETER LogFile
     Path to the log file. Default is 'update.log'.
@@ -154,8 +169,8 @@
 
 .NOTES
     Author: Your Name
-    Date: 2026-04-22
-    Version: 12.0
+    Date: 2026-09-05
+    Version: 12.5
 #>
 
 [CmdletBinding()]
@@ -195,6 +210,21 @@ param(
     [switch]$RemoveFromPath, # Remove update.cmd shim and strip script dir from User PATH, then exit
     [switch]$OnlyWsl,
     [switch]$OnlyWslPackages,
+
+    # Internal: set automatically when the script re-launches itself elevated (see the
+    # Administrator Elevation Check below). The parent process already showed the banner,
+    # ran the self-update check and the elevation pre-checks — redoing all of that in the
+    # elevated child would just print everything twice. Not meant to be passed manually.
+    [switch]$Elevated,
+
+    [Parameter(HelpMessage = "Run only sections whose name matches one of these (substring match, e.g. -Only npm,uv). All other sections are skipped.")]
+    [string[]]$Only,
+
+    [Parameter(HelpMessage = "Run independent, quick tool self-updates (Oh My Posh, pnpm, Bun, Deno, Poetry, Rye, Composer) as background jobs pre-launched before the slower sections, instead of one after another.")]
+    [switch]$Parallel,
+
+    [Parameter(HelpMessage = "Write a machine-readable JSON summary of the run to this path after completion.")]
+    [string]$OutputJson,
 
     [Parameter(HelpMessage = "If set, skip any automatic configuration of WSL sudo (passwordless apt-get).")]
     [switch]$SkipWslSudoConfig,
@@ -280,13 +310,26 @@ $env:POWERSHELL_UPDATECHECK       = 'Off'
 $env:DOTNET_CLI_TELEMETRY_OPTOUT  = '1'
 $env:NEXT_TELEMETRY_DISABLED      = '1'
 $env:DO_NOT_TRACK                 = '1'
-$env:SCOOP_LAST_UPDATE            = $env:SCOOP_LAST_UPDATE   # preserve
 $env:PYTHONUTF8                   = '1'
 
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.3'
+$script:VersionString  = '12.5'
+$script:OnlyFilter     = $Only
+$script:parallelJobs   = @{}
+$script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
+
+# Prints exactly one blank separator line — never two in a row, regardless of which combination
+# of Write-GroupHeader / Write-SectionHeader / Update-Section / Write-Status calls precede it.
+# Replaces the old pattern of headers hardcoding their own leading/trailing "Write-Host ''",
+# which stacked into double blank lines wherever two of them met back to back.
+function Write-BlankLine {
+    if (-not $script:QuietMode -and -not $script:lastLineBlank) {
+        Write-Host ""
+        $script:lastLineBlank = $true
+    }
+}
 
 # Helper: format a TimeSpan as "4m 12s" / "38s" / "1h 2m"
 function Format-Elapsed {
@@ -296,14 +339,31 @@ function Format-Elapsed {
     return "$([int]$ts.TotalSeconds)s"
 }
 
-# Function to display a formatted section header (secondary level — within a group)
+# Helper: join an item list for the summary, truncated to $MaxShown with a "+N more" suffix.
+# Full lists always remain in the log file — this only affects the terminal display.
+function Format-SummaryLine {
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]]$Items,
+        [int]$MaxShown = 8
+    )
+    $count = $Items.Count
+    $text  = ($Items | Select-Object -First $MaxShown) -join ', '
+    if ($count -gt $MaxShown) { $text += " (+$($count - $MaxShown) more)" }
+    return $text
+}
+
+# Function to display a formatted section header (secondary level — within a group).
+# Uses Write-BlankLine (not a hardcoded "Write-Host ''") for its leading/trailing spacing so it
+# never stacks a double blank line with whatever printed immediately before or after it.
 function Write-SectionHeader {
-    param([string]$Title)
+    param([string]$Title, [string]$Progress)
     if ($script:QuietMode) { return }
-    Write-Host ""
+    Write-BlankLine
     Write-Host "  $([char]0x25B6)  " -NoNewline -ForegroundColor DarkCyan   # ▶
+    if ($Progress) { Write-Host "[$Progress]  " -NoNewline -ForegroundColor DarkGray }
     Write-Host $Title -ForegroundColor Cyan
-    Write-Host ""
+    $script:lastLineBlank = $false
+    Write-BlankLine
 }
 
 # Function to display a group header (primary level — separates logical categories)
@@ -313,33 +373,44 @@ function Write-GroupHeader {
     $maxLen = 54   # 58-char rule minus 4 for the ▪ prefix — truncate if longer
     if ($Title.Length -gt $maxLen) { $Title = $Title.Substring(0, $maxLen - 3) + '...' }
     $line = ([char]0x2550).ToString() * 58   # ══════════ (double rule — visually heavier)
-    Write-Host ""
+    Write-BlankLine
     Write-Host "  $line" -ForegroundColor DarkGray
     Write-Host "  $([char]0x25AA) " -NoNewline -ForegroundColor DarkYellow   # ▪
     Write-Host $Title -ForegroundColor Yellow
-    Write-Host ""
+    $script:lastLineBlank = $false
+    Write-BlankLine
 }
 
-# Function to display a status message with a consistent prefix
+# Function to display a status message with a consistent prefix.
+#
+# Verbosity tiers:
+#   -Quiet            only Warning/Error survive (plus the summary, printed separately)
+#   default           headers, Success/Skip/Warning/Error — the "what happened" level
+#   -Verbose          adds Info/Action/Detail — the "what it's doing right now" blow-by-blow
+# Info/Action/Detail are always in the log file regardless of tier (see Write-Log).
 function Write-Status {
     param(
         [string]$Message,
-        [ValidateSet("Info", "Success", "Warning", "Error", "Skip", "Action")]
+        [ValidateSet("Info", "Success", "Warning", "Error", "Skip", "Action", "Detail")]
         [string]$Type = "Info"
     )
     # In quiet mode only surface failures and warnings — callers still call this freely.
-    if ($script:QuietMode -and $Type -in @('Info','Skip','Action','Success')) { return }
+    if ($script:QuietMode -and $Type -in @('Info','Skip','Action','Success','Detail')) { return }
+    # Chatty per-step / per-item noise is verbose-only in the default (non-quiet) tier.
+    if (-not $script:QuietMode -and $Type -in @('Info','Action','Detail') -and $VerbosePreference -eq 'SilentlyContinue') { return }
     switch ($Type) {
         "Info"    { Write-Host "  $([char]0x00B7)  $Message" -ForegroundColor DarkGray }  # ·
         "Success" { Write-Host "  $([char]0x2713)  $Message" -ForegroundColor Green }     # ✓
         "Warning" { Write-Host "  $([char]0x26A0)  $Message" -ForegroundColor Yellow }    # ⚠
         "Error"   { Write-Host "  $([char]0x2717)  $Message" -ForegroundColor Red }       # ✗
         "Skip"    { Write-Host "  $([char]0x25CB)  $Message" -ForegroundColor DarkGray }  # ○
+        "Detail"  { Write-Host "  $([char]0x00B7)  $Message" -ForegroundColor DarkGray }  # · (verbose-only per-item detail)
         "Action"  {
             Write-Host "  $([char]0x2192)  " -NoNewline -ForegroundColor DarkCyan         # →
             Write-Host $Message -ForegroundColor White
         }
     }
+    $script:lastLineBlank = $false
 }
 
 
@@ -373,6 +444,23 @@ function Update-Section {
         [scriptblock]$UpdateAction
     )
 
+    $script:sectionIndex++
+    $progress = if ($script:totalSections) { "$($script:sectionIndex)/$($script:totalSections)" } else { $null }
+
+    # -Only filters the whole run down to sections whose name contains one of the given
+    # substrings (case-insensitive). Silent skip (log only) — a wall of "skipped" lines for
+    # everything not requested would defeat the point of a targeted run.
+    if ($script:OnlyFilter -and $script:OnlyFilter.Count -gt 0) {
+        $matched = $false
+        foreach ($pattern in $script:OnlyFilter) {
+            if ($SectionName -like "*$pattern*") { $matched = $true; break }
+        }
+        if (-not $matched) {
+            Write-Log "Skipping $SectionName — not matched by -Only filter." -Level "DEBUG"
+            return
+        }
+    }
+
     if ($SkipCondition) {
         Write-Status "$SectionName — skipped" -Type Skip
         Write-Log "Skipping $SectionName updates."
@@ -393,7 +481,7 @@ function Update-Section {
         return
     }
 
-    Write-SectionHeader "Updating $SectionName"
+    Write-SectionHeader "Updating $SectionName" -Progress $progress
     Write-Log "Starting $SectionName updates."
 
     $sectionStart = Get-Date
@@ -409,6 +497,27 @@ function Update-Section {
         $script:sectionTimings[$SectionName] = $elapsed
         Write-Status "Failed after $(Format-Elapsed $elapsed): $_" -Type Error
         Write-Log "Error during $SectionName updates: $_ [$(Format-Elapsed $elapsed)]" -Level "ERROR"
+    }
+    Write-BlankLine   # separates this section from whatever prints next (section or group header)
+}
+
+# Runs a native command scriptblock, capturing its stdout+stderr instead of letting it print
+# straight to the console: always fully logged, but only echoed live to the terminal in the
+# default tier when -Verbose is on. Sets $LASTEXITCODE as usual (reflects the last native exe
+# run inside $Command, unaffected by capturing its output into a variable).
+function Invoke-NativeCapture {
+    param(
+        [Parameter(Mandatory)] [scriptblock]$Command,
+        [Parameter(Mandatory)] [string]$LogTag
+    )
+    # *>&1 (not 2>&1): PowerShell-based tools like scoop write via Write-Host, which lands on the
+    # Information stream — 2>&1 only merges stderr and would let that chatter leak through anyway.
+    $out = & $Command *>&1
+    if ($out) {
+        $out | ForEach-Object { Write-Log "  [$LogTag] $_" -Level "DEBUG" }
+        if ($VerbosePreference -ne 'SilentlyContinue') {
+            $out | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
+        }
     }
 }
 
@@ -450,7 +559,7 @@ function Invoke-WithRetry {
                     Write-Log "$ActionName failed with exit code $($r.ExitCode) (attempt $attempt)" -Level "WARN"
                 }
             } else {
-                & $Action
+                Invoke-NativeCapture -Command $Action -LogTag $ActionName
                 if ($LASTEXITCODE -eq 0) {
                     Write-Log "$ActionName succeeded." -Level "INFO"
                     return $true
@@ -491,6 +600,79 @@ function Invoke-SelfUpdate {
         Write-Status "$ToolName self-update failed" -Type Error
         $failedItems[$Key] += "$ToolName self-update (failed)"
     }
+}
+
+# Helper: like Invoke-SelfUpdate, but first checks for a -Parallel prefetch job (started early via
+# Start-ParallelPrefetch, overlapping with the much slower Scoop/Winget/WSL/npm sections that run
+# before these independent leaf tools). Uses the job's result if it landed and succeeded; otherwise
+# falls back to the normal sequential retry-wrapped path — identical behavior to Invoke-SelfUpdate
+# when -Parallel wasn't requested or the prefetch didn't pan out. Can only help, never hurt.
+function Invoke-SelfUpdateWithPrefetch {
+    param(
+        [Parameter(Mandatory)] [string]$ToolName,
+        [Parameter(Mandatory)] [string]$Key,
+        [Parameter(Mandatory)] [scriptblock]$Action,
+        [string]$ActionName
+    )
+    if (-not $ActionName) { $ActionName = "$ToolName self-update" }
+    if ($script:parallelJobs.ContainsKey($Key)) {
+        $job = $script:parallelJobs[$Key]
+        $script:parallelJobs.Remove($Key)
+        Write-Status "Updating $ToolName..." -Type Action
+        $done = $job | Wait-Job -Timeout 90
+        $result = if ($done) { $job | Receive-Job -ErrorAction SilentlyContinue } else { $null }
+        $job | Stop-Job -ErrorAction SilentlyContinue
+        $job | Remove-Job -Force -ErrorAction SilentlyContinue
+        if ($result -and $result.ExitCode -eq 0) {
+            Write-Log "$ActionName succeeded (prefetched in parallel)." -Level "INFO"
+            $updatedItems[$Key] += $ToolName
+            return
+        }
+        Write-Log "$ActionName prefetch missed or failed (exit $($result.ExitCode)) — falling back to sequential retry." -Level "INFO"
+    }
+    Invoke-SelfUpdate -ToolName $ToolName -Key $Key -Action $Action -ActionName $ActionName
+}
+
+# Launches independent, quick tool self-updates as background jobs before the (much slower)
+# Package Managers / System / npm sections run. By the time each tool's own section is reached
+# later in the normal sequential order, its job has usually already finished — see
+# Invoke-SelfUpdateWithPrefetch. Only used when -Parallel is passed; a no-op otherwise.
+function Start-ParallelPrefetch {
+    $specs = [ordered]@{
+        'Oh My Posh' = @{ Cmd = { oh-my-posh upgrade *>&1 | Out-Null }; Tool = 'oh-my-posh'; Skip = $NoOhMyPosh }
+        'pnpm'       = @{ Cmd = { pnpm self-update *>&1 | Out-Null };   Tool = 'pnpm';       Skip = $NoPnpm }
+        'Bun'        = @{ Cmd = { bun upgrade *>&1 | Out-Null };        Tool = 'bun';         Skip = $NoBun }
+        'Deno'       = @{ Cmd = { deno upgrade *>&1 | Out-Null };       Tool = 'deno';        Skip = $NoDeno }
+        'Poetry'     = @{ Cmd = { poetry self update *>&1 | Out-Null }; Tool = 'poetry';      Skip = $NoPoetry }
+        'Rye'        = @{ Cmd = { rye self update *>&1 | Out-Null };    Tool = 'rye';         Skip = $NoRye }
+        'Composer'   = @{ Cmd = { composer self-update *>&1 | Out-Null }; Tool = 'composer';  Skip = $NoComposer }
+    }
+    foreach ($key in $specs.Keys) {
+        $spec = $specs[$key]
+        if ($spec.Skip -or ($script:OnlyFilter -and $script:OnlyFilter.Count -gt 0 -and -not ($script:OnlyFilter | Where-Object { $key -like "*$_*" }))) { continue }
+        if (-not (Get-Command $spec.Tool -ErrorAction SilentlyContinue)) { continue }
+        $cmdText = $spec.Cmd.ToString()
+        $script:parallelJobs[$key] = Start-Job -Name "prefetch-$key" -ScriptBlock {
+            param($cmdText)
+            $sb = [scriptblock]::Create($cmdText)
+            & $sb
+            [PSCustomObject]@{ ExitCode = $LASTEXITCODE }
+        } -ArgumentList $cmdText
+    }
+    if ($script:parallelJobs.Count -gt 0) {
+        Write-Status "Pre-launched $($script:parallelJobs.Count) independent tool self-update(s) in background (-Parallel): $($script:parallelJobs.Keys -join ', ')" -Type Info
+        Write-Log "Parallel prefetch started for: $($script:parallelJobs.Keys -join ', ')" -Level "INFO"
+    }
+}
+
+# Cleanup: stop/remove any prefetch jobs nobody consumed (e.g. -Only filtered that section out,
+# or the run stopped early). Called once at the very end of the script.
+function Stop-ParallelPrefetch {
+    foreach ($job in $script:parallelJobs.Values) {
+        $job | Stop-Job -ErrorAction SilentlyContinue
+        $job | Remove-Job -Force -ErrorAction SilentlyContinue
+    }
+    $script:parallelJobs.Clear()
 }
 
 # Helper: run Invoke-WithRetry and record success/failure into result hashtables.
@@ -550,6 +732,49 @@ function Get-WingetUpgradableIds {
         $pkg = $line.Substring($idCol, [Math]::Min($verCol - $idCol, $line.Length - $idCol)).Trim()
         # Skip summary lines like "2 upgrades available."
         if ($pkg.Length -gt 0 -and $pkg -notmatch '^\d') { $ids += $pkg }
+    }
+    return $ids
+}
+
+# Parses the separate "require explicit targeting" table that winget prints alongside the main
+# upgradable-packages table for packages it refuses to touch via --all (e.g. version-pinned
+# packages, or packages where the available version looks like a downgrade). Without this,
+# such packages are silently never upgraded and never show up anywhere in the summary — see
+# https://github.com/baurfm/update/issues/8.
+function Get-WingetExplicitTargetIds {
+    param(
+        [Parameter(Mandatory)]
+        [AllowNull()] [AllowEmptyCollection()] [AllowEmptyString()]
+        [string[]]$WingetOutput
+    )
+    $ids = @()
+    if (-not $WingetOutput -or -not ($WingetOutput -join '').Trim()) { return $ids }
+    $lines = $WingetOutput -split [System.Environment]::NewLine
+    $markerIdx = -1
+    for ($i = 0; $i -lt $lines.Length; $i++) {
+        if ($lines[$i] -match 'require explicit targeting') { $markerIdx = $i; break }
+    }
+    if ($markerIdx -lt 0) { return $ids }
+
+    $header = $null
+    for ($i = $markerIdx + 1; $i -lt $lines.Length; $i++) {
+        if ($lines[$i] -match '\bId\b' -and $lines[$i] -match '\bVersion\b') { $header = $lines[$i]; break }
+    }
+    if (-not $header) { return $ids }
+
+    $idCol  = $header.IndexOf('Id')
+    $verCol = $header.IndexOf('Version')
+    if ($idCol -lt 0 -or $verCol -le $idCol) { return $ids }
+
+    $headerIdx = [Array]::IndexOf($lines, $header)
+    for ($i = $headerIdx + 2; $i -lt $lines.Length; $i++) {
+        $line = $lines[$i]
+        if ($line.Trim().Length -eq 0) { break }         # blank line ends the table
+        if ($line -match '^\s*-+\s*$') { continue }       # separator row
+        if ($line -match '^\s*\d+\s+package')  { break }  # "N package(s) are pinned..." summary
+        if ($line.Length -le $idCol) { continue }
+        $pkg = $line.Substring($idCol, [Math]::Min($verCol - $idCol, $line.Length - $idCol)).Trim()
+        if ($pkg.Length -gt 0) { $ids += $pkg }
     }
     return $ids
 }
@@ -791,7 +1016,7 @@ function Remove-UpdateCommand {
 
 # Exclusive run lock: writes <logs>/update.lock with PID + start time. Returns $true on acquire,
 # $false if another live run already holds the lock (stale locks from dead PIDs are evicted).
-function Acquire-UpdateLock {
+function Lock-UpdateRun {
     param([string]$LockPath)
     if (Test-Path $LockPath) {
         try {
@@ -816,7 +1041,7 @@ function Acquire-UpdateLock {
     return $true
 }
 
-function Release-UpdateLock {
+function Unlock-UpdateRun {
     param([string]$LockPath)
     if ($script:LockAcquired -and $LockPath -and (Test-Path $LockPath)) {
         Remove-Item $LockPath -Force -ErrorAction SilentlyContinue
@@ -919,16 +1144,20 @@ function Register-UpdateScheduledTask {
 
 function Unregister-UpdateScheduledTask {
     try {
-        $t = Get-ScheduledTask -TaskName $script:ScheduledTaskName -ErrorAction Stop
-        if ($t) {
-            Unregister-ScheduledTask -TaskName $script:ScheduledTaskName -Confirm:$false
-            Write-Status "Scheduled Task '$($script:ScheduledTaskName)' removed" -Type Success
-            Write-Log "Scheduled Task unregistered: $($script:ScheduledTaskName)" -Level "INFO"
-            return $true
-        }
+        $null = Get-ScheduledTask -TaskName $script:ScheduledTaskName -ErrorAction Stop
     } catch {
         Write-Status "No Scheduled Task '$($script:ScheduledTaskName)' to remove." -Type Info
         return $true
+    }
+    try {
+        Unregister-ScheduledTask -TaskName $script:ScheduledTaskName -Confirm:$false -ErrorAction Stop
+        Write-Status "Scheduled Task '$($script:ScheduledTaskName)' removed" -Type Success
+        Write-Log "Scheduled Task unregistered: $($script:ScheduledTaskName)" -Level "INFO"
+        return $true
+    } catch {
+        Write-Status "Failed to remove Scheduled Task '$($script:ScheduledTaskName)': $($_.Exception.Message)" -Type Error
+        Write-Log "Scheduled Task unregister failed: $($_.Exception.Message)" -Level "ERROR"
+        return $false
     }
 }
 
@@ -1038,7 +1267,8 @@ function Send-UpdateNotifications {
     if ($NotifyWebhook)   { Send-WebhookNotification -Url $NotifyWebhook -Title $title -Body $body -Summary $Summary }
     if ($NotifyEventLog)  {
         $entryType = if ($HasFailures) { 'Error' } else { 'Information' }
-        Write-UpdateEventLog -EntryType $entryType -Message "$title`n$body" -EventId ($HasFailures ? 1001 : 1000)
+        $eventId   = if ($HasFailures) { 1001 } else { 1000 }
+        Write-UpdateEventLog -EntryType $entryType -Message "$title`n$body" -EventId $eventId
     }
 }
 
@@ -1071,9 +1301,10 @@ if (Test-Path $LogFile) {
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
-# Display startup banner (suppressed in quiet/unattended mode)
+# Display startup banner (suppressed in quiet/unattended mode, and on an elevated
+# re-launch — the parent process already showed it).
 $_version = "v$($script:VersionString)"
-if (-not $script:QuietMode) {
+if (-not $script:QuietMode -and -not $Elevated) {
     $_bw      = 40
     $_bTop    = "  $([char]0x256D)$(([char]0x2500).ToString() * $_bw)$([char]0x256E)"
     $_bBot    = "  $([char]0x2570)$(([char]0x2500).ToString() * $_bw)$([char]0x256F)"
@@ -1104,8 +1335,8 @@ $script:isAdmin     = $myWindowsPrincipal.IsInRole($adminRole)
 
 # --- Handle -UnregisterSchedule: remove Scheduled Task and exit ---
 if ($UnregisterSchedule) {
-    Unregister-UpdateScheduledTask | Out-Null
-    exit $script:ExitOk
+    $unregisterOk = Unregister-UpdateScheduledTask
+    exit $(if ($unregisterOk) { $script:ExitOk } else { $script:ExitHardFailure })
 }
 
 # --- Handle -RegisterSchedule: install Scheduled Task and exit ---
@@ -1122,7 +1353,7 @@ if ($RemoveFromPath) {
 
 # --- Lock-File: prevent overlapping runs (e.g. Scheduled Task + manual run) ---
 if (-not $NoLock -and -not $DryRun) {
-    if (-not (Acquire-UpdateLock -LockPath $script:LockFilePath)) {
+    if (-not (Lock-UpdateRun -LockPath $script:LockFilePath)) {
         exit $script:ExitLockActive
     }
 }
@@ -1132,7 +1363,7 @@ if (-not $SkipNetworkCheck -and -not $DryRun) {
     if (-not (Test-NetworkReachable)) {
         Write-Status "No network reachable — update hosts unresponsive" -Type Error
         Write-Log "Network pre-check failed — exiting." -Level "INFO"
-        Release-UpdateLock -LockPath $script:LockFilePath
+        Unlock-UpdateRun -LockPath $script:LockFilePath
         exit $script:ExitNetworkDown
     }
 }
@@ -1141,7 +1372,8 @@ if (-not $SkipNetworkCheck -and -not $DryRun) {
 Initialize-UpdateCommand -ScriptDir $ScriptPath
 
 # --- Self-update via git pull ---
-if (-not $NoSelfUpdate) {
+# Skipped on an elevated re-launch — the parent process already ran this check.
+if (-not $NoSelfUpdate -and -not $Elevated) {
     $scriptDir = Split-Path $PSCommandPath -Parent
     if ((Get-Command git -ErrorAction SilentlyContinue) -and (Test-Path (Join-Path $scriptDir ".git"))) {
         Write-Status "Checking for script updates (git pull)..." -Type Action
@@ -1160,6 +1392,10 @@ if (-not $NoSelfUpdate) {
                 if ($newVer -and $newVer -ne $_version) {
                     Write-Status "Script updated: $_version → $newVer. Re-running..." -Type Success
                     Write-Log "Self-update: script updated $_version → $newVer, re-running." -Level "INFO"
+                    # Release the lock before re-exec — the child re-invocation runs in this same
+                    # process ($PID unchanged), so without releasing first it would find its own
+                    # still-alive PID holding the lock and abort with "Another run is active".
+                    Unlock-UpdateRun -LockPath $script:LockFilePath
                     & $PSCommandPath @PSBoundParameters -NoSelfUpdate
                     exit $LASTEXITCODE
                 } else {
@@ -1210,7 +1446,11 @@ $wingetNeedsElevation = $false
 $wslNeedsElevation    = $false
 $npmNeedsElevation    = $false
 
-if ($Sudo) {
+if ($Elevated) {
+    # Re-launched elevated child: the parent already ran these pre-checks to decide whether
+    # elevation was needed at all — redoing them here would just waste time and reprint output.
+    Write-Log "Pre-check: skipped — running as the elevated re-launch of an already-checked parent." -Level "INFO"
+} elseif ($Sudo) {
     Write-Status "Sudo flag set — skipping pre-checks, will elevate immediately" -Type Info
     Write-Log "Pre-check: -Sudo specified, skipping all pre-checks." -Level "INFO"
 } elseif ($DryRun) {
@@ -1345,6 +1585,9 @@ if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -o
                 $argArray += $PSBoundParameters[$key]
             }
         }
+        # Mark the child as the elevated re-launch so it skips the banner, self-update check and
+        # pre-checks — this process (the parent) already did all of that.
+        $argArray += "-Elevated"
 
         # Not running as admin, so attempt to re-launch with elevation.
         # Use the current PowerShell executable (pwsh.exe for PS7, powershell.exe for PS5)
@@ -1355,18 +1598,19 @@ if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -o
         if ($wingetNeedsElevation){ $elevationReasons += 'winget updates' }
         if ($wslNeedsElevation)   { $elevationReasons += 'WSL kernel update' }
         if ($npmNeedsElevation)   { $elevationReasons += 'npm updates' }
+        Write-Status "Elevation needed: $($elevationReasons -join ', ')" -Type Warning
         Write-Log "Elevation required ($($elevationReasons -join ', ')) — re-launching as administrator." -Level "INFO"
         # Release the lock so the elevated child process can acquire it.
-        Release-UpdateLock -LockPath $script:LockFilePath
+        Unlock-UpdateRun -LockPath $script:LockFilePath
         $sudoExists = Get-Command sudo -ErrorAction SilentlyContinue
         if ($sudoExists) {
             # Use the new Windows 'sudo' to re-launch.
-            Write-Host "Administrator privileges are required. Re-launching with 'sudo'..." -ForegroundColor Yellow
+            Write-Status "Administrator privileges required — re-launching with 'sudo'..." -Type Action
             & sudo $psExe -ExecutionPolicy Bypass -File $MyInvocation.MyCommand.Definition @argArray
             exit
         } else {
             # Fallback to the traditional self-elevation method.
-            Write-Host "Administrator privileges are required. Re-launching as administrator..." -ForegroundColor Yellow
+            Write-Status "Administrator privileges required — re-launching as administrator..." -Type Action
             # Build a properly-quoted string for the runas path (sudo path uses @argArray directly).
             $argStrParts = @()
             foreach ($key in $PSBoundParameters.Keys) {
@@ -1377,6 +1621,7 @@ if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -o
                     $argStrParts += "-$key `"$val`""
                 }
             }
+            $argStrParts += "-Elevated"
             $argStr = $argStrParts -join ' '
             $newProcess = New-Object System.Diagnostics.ProcessStartInfo $psExe
             $newProcess.Arguments = "-ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Definition)`" $argStr"
@@ -1409,6 +1654,8 @@ $sectionKeys = "Scoop", "Winget", "Chocolatey",
               "Google Cloud SDK", "Android SDK", "Helm plugins", "krew plugins",
               "VS Code Extensions", "GitHub CLI Extensions",
               "TeX Live"
+$script:sectionIndex   = 0
+$script:totalSections  = $sectionKeys.Count
 $updatedItems = @{}
 $failedItems  = @{}
 foreach ($k in $sectionKeys) {
@@ -1418,6 +1665,8 @@ foreach ($k in $sectionKeys) {
 $skippedSections      = @()
 $script:sectionTimings = @{}   # SectionName → TimeSpan (populated by Update-Section)
 
+if ($Parallel -and -not $DryRun) { Start-ParallelPrefetch }
+
 # ══════════════════════════════════════════════════════
 # PACKAGE MANAGERS  (update foundations first)
 # ══════════════════════════════════════════════════════
@@ -1426,7 +1675,10 @@ Write-GroupHeader "Package Managers"
 # --- Update Scoop ---
 Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPackages) { Get-Command scoop -ErrorAction SilentlyContinue } {
     Write-Status "Checking for outdated packages..." -Type Action
-    $scoopStatus = & scoop status
+    # *>&1: scoop writes status chatter ("Everything is ok!" etc.) via Write-Host, which lands on
+    # the Information stream — a plain assignment wouldn't capture it and it would leak straight
+    # to the console regardless of verbosity tier.
+    $scoopStatus = & scoop status *>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Status "scoop status failed (exit code $LASTEXITCODE)" -Type Error
         $failedItems["Scoop"] += "scoop status (Exit Code: $LASTEXITCODE)"
@@ -1456,14 +1708,14 @@ Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPacka
         Write-Status "Updating all installed packages..." -Type Action
         # No retry — scoop returns non-zero if ANY package fails.
         # Retrying would re-run ALL updates unnecessarily.
-        & scoop update *
+        Invoke-NativeCapture -Command { & scoop update * } -LogTag "scoop update *"
         if ($LASTEXITCODE -ne 0) {
             Write-Status "Some packages may have failed (exit code $LASTEXITCODE)" -Type Warning
             Write-Log "scoop update * exited with code $LASTEXITCODE" -Level "INFO"
         }
 
         Write-Status "Removing old package versions..." -Type Action
-        & scoop cleanup *
+        Invoke-NativeCapture -Command { & scoop cleanup * } -LogTag "scoop cleanup *"
         if ($LASTEXITCODE -ne 0) {
             Write-Status "scoop cleanup failed (exit $LASTEXITCODE)" -Type Warning
             $failedItems["Scoop"] += "scoop cleanup (Exit Code: $LASTEXITCODE)"
@@ -1478,8 +1730,13 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
     # $LASTEXITCODE here. We rely entirely on output text and table content.
     $wingetUpgradeOutput = & winget upgrade --include-unknown 2>&1
     $upgradablePackages  = Get-WingetUpgradableIds $wingetUpgradeOutput
+    # Packages winget refuses to touch via --all (version-pinned, or the available version looks
+    # like a downgrade) — winget prints them in a separate table and suggests upgrading by --id
+    # explicitly. Without this they'd silently never update. See issue #8.
+    $explicitTargetIds  = Get-WingetExplicitTargetIds $wingetUpgradeOutput
 
-    if ($upgradablePackages.Count -gt 0) {
+    if ($upgradablePackages.Count -gt 0 -or $explicitTargetIds.Count -gt 0) {
+      if ($upgradablePackages.Count -gt 0) {
         Write-Status "Found $($upgradablePackages.Count) upgradable packages" -Type Info
         Write-Log "Winget: $($upgradablePackages.Count) upgradable: $($upgradablePackages -join ', ')" -Level "INFO"
 
@@ -1587,6 +1844,24 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
                 }
             }
         }
+      }
+
+      if ($explicitTargetIds.Count -gt 0) {
+        Write-Status "$($explicitTargetIds.Count) package(s) need explicit targeting: $($explicitTargetIds -join ', ')" -Type Info
+        Write-Log "Winget: explicit-targeting packages: $($explicitTargetIds -join ', ')" -Level "INFO"
+        foreach ($id in $explicitTargetIds) {
+            Write-Status "Upgrading $id (explicit targeting)..." -Type Action
+            & winget upgrade --id $id --accept-source-agreements --accept-package-agreements
+            if ($LASTEXITCODE -eq 0) {
+                Write-Status "$id successfully updated" -Type Success
+                $updatedItems["Winget"] += $id
+            } else {
+                Write-Status "$id explicit-targeting upgrade failed (exit $LASTEXITCODE)" -Type Warning
+                Write-Log "Winget: explicit-targeting upgrade of $id exited $LASTEXITCODE" -Level "INFO"
+                $failedItems["Winget"] += "$id (explicit targeting, exit $LASTEXITCODE)"
+            }
+        }
+      }
     } else {
         Write-Status "All packages up-to-date" -Type Success
         Write-Log "Winget: no applicable upgrades." -Level "INFO"
@@ -1736,7 +2011,7 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
 
 # --- Update Oh My Posh ---
 Update-Section "Oh My Posh" ($NoOhMyPosh -or $OnlyWsl -or $OnlyWslPackages) { Get-Command oh-my-posh -ErrorAction SilentlyContinue } {
-    Invoke-SelfUpdate -ToolName "Oh My Posh" -Key "Oh My Posh" `
+    Invoke-SelfUpdateWithPrefetch -ToolName "Oh My Posh" -Key "Oh My Posh" `
         -Action { & oh-my-posh upgrade 2>&1 | Out-Null } -ActionName "oh-my-posh upgrade"
 }
 
@@ -1891,18 +2166,18 @@ Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $O
 
 # --- Update pnpm ---
 Update-Section "pnpm" ($NoPnpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command pnpm -ErrorAction SilentlyContinue } {
-    Invoke-SelfUpdate -ToolName "pnpm" -Key "pnpm" -Action { & pnpm self-update 2>&1 | Out-Null }
+    Invoke-SelfUpdateWithPrefetch -ToolName "pnpm" -Key "pnpm" -Action { & pnpm self-update 2>&1 | Out-Null }
 }
 
 # --- Update Bun ---
 Update-Section "Bun" ($NoBun -or $OnlyWsl -or $OnlyWslPackages) { Get-Command bun -ErrorAction SilentlyContinue } {
-    Invoke-SelfUpdate -ToolName "Bun" -Key "Bun" `
+    Invoke-SelfUpdateWithPrefetch -ToolName "Bun" -Key "Bun" `
         -Action { & bun upgrade 2>&1 | Out-Null } -ActionName "bun upgrade"
 }
 
 # --- Update Deno ---
 Update-Section "Deno" ($NoDeno -or $OnlyWsl -or $OnlyWslPackages) { Get-Command deno -ErrorAction SilentlyContinue } {
-    Invoke-SelfUpdate -ToolName "Deno" -Key "Deno" `
+    Invoke-SelfUpdateWithPrefetch -ToolName "Deno" -Key "Deno" `
         -Action { & deno upgrade 2>&1 | Out-Null } -ActionName "deno upgrade"
 }
 
@@ -1946,13 +2221,13 @@ Update-Section "uv" ($NoUv -or $OnlyWsl -or $OnlyWslPackages) { Get-Command uv -
 
 # --- Update Poetry ---
 Update-Section "Poetry" ($NoPoetry -or $OnlyWsl -or $OnlyWslPackages) { Get-Command poetry -ErrorAction SilentlyContinue } {
-    Invoke-SelfUpdate -ToolName "Poetry" -Key "Poetry" `
+    Invoke-SelfUpdateWithPrefetch -ToolName "Poetry" -Key "Poetry" `
         -Action { & poetry self update 2>&1 | Out-Null } -ActionName "poetry self update"
 }
 
 # --- Update Rye ---
 Update-Section "Rye" ($NoRye -or $OnlyWsl -or $OnlyWslPackages) { Get-Command rye -ErrorAction SilentlyContinue } {
-    Invoke-SelfUpdate -ToolName "Rye" -Key "Rye" `
+    Invoke-SelfUpdateWithPrefetch -ToolName "Rye" -Key "Rye" `
         -Action { & rye self update 2>&1 | Out-Null } -ActionName "rye self update"
 }
 
@@ -1992,7 +2267,7 @@ Update-Section ".NET Global Tools" ($NoDotnet -or $OnlyWsl -or $OnlyWslPackages)
 
         foreach ($r in $results) {
             if ($r.ExitCode -eq 0) {
-                Write-Status "Updated: $($r.Id)" -Type Success
+                Write-Status "Updated: $($r.Id)" -Type Detail
                 $updatedItems[".NET Global Tools"] += $r.Id
             } else {
                 Write-Status "Failed: $($r.Id)" -Type Error
@@ -2030,7 +2305,7 @@ Update-Section "Ruby Gems" ($NoGem -or $OnlyWsl -or $OnlyWslPackages) { Get-Comm
 
 # --- Update Composer ---
 Update-Section "Composer" ($NoComposer -or $OnlyWsl -or $OnlyWslPackages) { Get-Command composer -ErrorAction SilentlyContinue } {
-    Invoke-SelfUpdate -ToolName "Composer" -Key "Composer" -Action { & composer self-update 2>&1 | Out-Null }
+    Invoke-SelfUpdateWithPrefetch -ToolName "Composer" -Key "Composer" -Action { & composer self-update 2>&1 | Out-Null }
 }
 
 # ══════════════════════════════════════════════════════
@@ -2148,6 +2423,13 @@ Write-GroupHeader "Dev Tooling"
 
 # --- Update Visual Studio Code Extensions ---
 Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $OnlyWslPackages) { Get-Command code -ErrorAction SilentlyContinue } {
+    # A running VS Code can hold its extensions directory locked, making `code --install-extension`
+    # fail with a bare exit 1 and no useful message — same class of problem as Git.Git vs. bash.exe
+    # (see Test-GitBinariesInUse). Warn up front so a failure isn't a mystery. See issue #9.
+    if (Get-Process -Name 'Code','Code - Insiders' -ErrorAction SilentlyContinue) {
+        Write-Status "VS Code is currently running — extension updates may fail while files are locked" -Type Warning
+        Write-Log "VS Code Extensions: VS Code process detected running before update." -Level "INFO"
+    }
     Write-Status "Listing installed extensions..." -Type Action
     $installedExtensions = & code --list-extensions
     if ($LASTEXITCODE -ne 0) {
@@ -2171,7 +2453,7 @@ Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $Only
                     Write-Status "Failed: $($r.Id)" -Type Error
                     $failedItems["VS Code Extensions"] += "$($r.Id) (Exit Code: $($r.ExitCode))"
                 } elseif ($r.Output -like '*successfully installed*') {
-                    Write-Status "Updated: $($r.Id)" -Type Success
+                    Write-Status "Updated: $($r.Id)" -Type Detail
                     $actuallyUpdated += $r.Id
                 }
             }
@@ -2186,7 +2468,7 @@ Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $Only
                     Write-Status "Failed: $extensionId" -Type Error
                     $failedItems["VS Code Extensions"] += "$extensionId (Exit Code: $LASTEXITCODE)"
                 } elseif ($updateOutput -join ' ' -like '*successfully installed*') {
-                    Write-Status "Updated: $extensionId" -Type Success
+                    Write-Status "Updated: $extensionId" -Type Detail
                     $actuallyUpdated += $extensionId
                 }
             }
@@ -2295,28 +2577,34 @@ Update-Section "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Comma
 $totalElapsed = (Get-Date) - $scriptStartTime
 Write-SectionHeader "Update Summary"
 
-$hasUpdates = $false
+$hasUpdates        = $false
+$totalUpdatedItems = 0
 foreach ($key in $updatedItems.Keys) {
     if ($updatedItems[$key].Count -gt 0) {
         $hasUpdates = $true
-        Write-Host "  $([char]0x2713)  $key" -ForegroundColor Green
-        $updatedItems[$key] | ForEach-Object { Write-Host "       $([char]0x2022) $_" -ForegroundColor Gray }
-        Write-Host ""
+        $totalUpdatedItems += $updatedItems[$key].Count
+        Write-Host "  $([char]0x2713)  " -NoNewline -ForegroundColor Green
+        Write-Host "$key" -NoNewline -ForegroundColor Green
+        Write-Host "  $($updatedItems[$key].Count) updated: " -NoNewline -ForegroundColor Gray
+        Write-Host (Format-SummaryLine -Items $updatedItems[$key]) -ForegroundColor Gray
     }
 }
 
 if (-not $hasUpdates) {
     Write-Status "Everything already up-to-date" -Type Info
-    Write-Host ""
 }
+Write-Host ""
 
-$hasFailures = $false
+$hasFailures      = $false
+$totalFailedItems = 0
 foreach ($key in $failedItems.Keys) {
     if ($failedItems[$key].Count -gt 0) {
         $hasFailures = $true
-        Write-Host "  $([char]0x2717)  $key" -ForegroundColor Red
-        $failedItems[$key] | ForEach-Object { Write-Host "       $([char]0x2022) $_" -ForegroundColor DarkRed }
-        Write-Host ""
+        $totalFailedItems += $failedItems[$key].Count
+        Write-Host "  $([char]0x2717)  " -NoNewline -ForegroundColor Red
+        Write-Host "$key" -NoNewline -ForegroundColor Red
+        Write-Host "  $($failedItems[$key].Count) failed: " -NoNewline -ForegroundColor DarkRed
+        Write-Host (Format-SummaryLine -Items $failedItems[$key]) -ForegroundColor DarkRed
     }
 }
 
@@ -2326,8 +2614,9 @@ if (-not $hasFailures) {
 
 if ($skippedSections.Count -gt 0) {
     Write-Host ""
-    Write-Host "  $([char]0x25CB)  Skipped" -ForegroundColor DarkGray
-    $skippedSections | ForEach-Object { Write-Host "       $([char]0x2022) $_" -ForegroundColor DarkGray }
+    Write-Host "  $([char]0x25CB)  " -NoNewline -ForegroundColor DarkGray
+    Write-Host "Skipped ($($skippedSections.Count)): " -NoNewline -ForegroundColor DarkGray
+    Write-Host (Format-SummaryLine -Items $skippedSections -MaxShown 12) -ForegroundColor DarkGray
 }
 
 # Section timings — only show sections that took 5 s or more
@@ -2347,7 +2636,7 @@ $updatedCount = ($updatedItems.Values | Where-Object { $_.Count -gt 0 }).Count
 $failedCount  = ($failedItems.Values  | Where-Object { $_.Count -gt 0 }).Count
 $skippedCount = $skippedSections.Count
 Write-Host ""
-Write-Host "  $([char]0x00B7)  $updatedCount updated  $([char]0x00B7)  $failedCount failed  $([char]0x00B7)  $skippedCount skipped" -ForegroundColor DarkGray
+Write-Host "  $([char]0x00B7)  $updatedCount categories updated ($totalUpdatedItems items)  $([char]0x00B7)  $failedCount failed ($totalFailedItems items)  $([char]0x00B7)  $skippedCount skipped" -ForegroundColor DarkGray
 
 Write-Host ""
 if ($hasFailures) {
@@ -2405,8 +2694,35 @@ $summaryHash = @{
 }
 Send-UpdateNotifications -HasFailures $hasFailures -Summary $summaryHash
 
+# --- Machine-readable JSON summary (-OutputJson) ---
+if ($OutputJson) {
+    $jsonReport = [ordered]@{
+        version         = $script:VersionString
+        startTime       = $scriptStartTime.ToString('o')
+        durationSeconds = [int]$totalElapsed.TotalSeconds
+        exitCode        = $exitCode
+        categoriesUpdated = $updatedCount
+        categoriesFailed  = $failedCount
+        categoriesSkipped = $skippedCount
+        itemsUpdated      = $totalUpdatedItems
+        itemsFailed       = $totalFailedItems
+        updated  = $updatedItems
+        failed   = $failedItems
+        skipped  = $skippedSections
+    }
+    try {
+        $jsonReport | ConvertTo-Json -Depth 6 | Set-Content -Path $OutputJson -Encoding UTF8 -ErrorAction Stop
+        Write-Log "JSON summary written to $OutputJson" -Level "INFO"
+    } catch {
+        Write-Log "Failed to write JSON summary to $OutputJson`: $($_.Exception.Message)" -Level "WARN"
+    }
+}
+
+# --- Cleanup: stop any leftover -Parallel prefetch jobs nobody consumed ---
+Stop-ParallelPrefetch
+
 # --- Lock-Release ---
-Release-UpdateLock -LockPath $script:LockFilePath
+Unlock-UpdateRun -LockPath $script:LockFilePath
 
 # --- Auto-Reboot bei erkenntlichem Pending Reboot ---
 if ($AutoReboot -and (Test-PendingReboot)) {

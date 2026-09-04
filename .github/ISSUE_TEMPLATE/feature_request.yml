@@ -1,0 +1,30 @@
+name: Feature Request
+description: Suggest a new tool section or a change to update.ps1's behavior
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's missing or annoying today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: If it's a new tool section, name the tool and the CLI command(s) that update it
+    validations:
+      required: true
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Kind of change
+      options:
+        - New tool section
+        - New flag / parameter
+        - Output / UX change
+        - Other
+    validations:
+      required: true

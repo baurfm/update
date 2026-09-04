@@ -8,10 +8,12 @@ A comprehensive PowerShell script that automates the update process for multiple
 
 ## 🚀 Features
 
-- **Comprehensive Coverage**: Updates ~27 development tool categories across package managers, language runtimes, CLIs and IDEs
-- **Selective Updates**: Skip specific sections using command-line parameters (`-NoX` flags)
+- **Comprehensive Coverage**: Updates 25 development tool categories across package managers, language runtimes, CLIs and IDEs
+- **Selective Updates**: Skip specific sections using command-line parameters (`-NoX` flags), or run only a targeted subset with `-Only <names>`
 - **Dry-Run Mode**: Preview which sections would run without making any changes (`-DryRun`)
 - **Parallel Pre-Checks**: Fast up-front detection of which sections actually need updates — reduces elevation prompts and runtime
+- **Parallel Prefetch**: `-Parallel` pre-launches independent, quick tool self-updates (Oh My Posh, pnpm, Bun, Deno, Poetry, Rye, Composer) as background jobs so their network-bound work overlaps with the slower Scoop/Winget/WSL sections
+- **Machine-Readable Output**: `-OutputJson <path>` writes a JSON run summary for scripting/dashboards
 - **Retry with Backoff**: All external commands wrapped in `Invoke-WithRetry` for transient-error resilience
 - **Automatic WSL Sudo Config**: Writes a NOPASSWD sudoers entry for `apt-get` on first run (skip with `-SkipWslSudoConfig`)
 - **Self-Update Check**: Verifies the script itself is current via GitHub on startup (disable with `-NoSelfUpdate`)
@@ -177,9 +179,12 @@ Get-Help .\update.ps1 -Full
 | `-NoSelfUpdate` | - | Skip the GitHub self-update check at startup |
 | `-OnlyWsl` | - | Update only WSL (kernel + distro packages) |
 | `-OnlyWslPackages` | - | Update only WSL distro packages (skip kernel) |
+| `-Only <names>` | - | Run only sections whose name contains one of these strings (substring match, e.g. `-Only npm,uv`); everything else is skipped silently |
+| `-Parallel` | - | Pre-launch independent, quick tool self-updates (Oh My Posh, pnpm, Bun, Deno, Poetry, Rye, Composer) as background jobs before the slower sections, instead of one after another |
+| `-OutputJson <path>` | - | Write a machine-readable JSON summary of the run to this path after completion |
 | `-SkipWslSudoConfig` | - | Skip automatic passwordless-sudo setup for WSL |
 | `-LogFile <path>` | - | Override log file path (default: `logs/update.log`) |
-| `-Verbose` | - | Verbose output (standard PowerShell common parameter) |
+| `-Verbose` | - | Full blow-by-blow output — every step and raw tool output, not just results (standard PowerShell common parameter; default output shows headers + results only, see Output section) |
 | `-RemoveFromPath` | - | Remove the auto-registered `update.cmd` shim and strip the script dir from User PATH, then exit |
 
 ### Unattended / Scheduled Operation
@@ -199,7 +204,7 @@ Get-Help .\update.ps1 -Full
 | `-NotifyToast` | Send a Windows toast notification after completion (requires BurntToast) |
 | `-NotifyWebhook <url>` | POST a JSON summary to this URL after completion (ntfy.sh compatible) |
 | `-NotifyEventLog` | Write a Windows Application Event Log entry after completion |
-| `-NotifyOn <Always/Failure/Never>` | Control when notifications fire (default: `Always`) |
+| `-NotifyOn <Always/Failure/Never>` | Control when notifications fire (default: `Failure`) |
 
 ### Exit Codes
 
@@ -241,10 +246,23 @@ The script automatically detects installed tools and skips unavailable ones. No 
 
 The script provides:
 
-- **Real-time progress updates** for each section
+- **Progress counter** per section (`[7/25]`) so a long unattended-ish run doesn't feel stuck
 - **Detailed error reporting** for failed operations
-- **Comprehensive summary** at completion
+- **Comprehensive, compact summary** at completion — one line per category with an inline,
+  truncated item list (`… (+N more)`; the full list always stays in `logs/update.log`)
 - **Color-coded output** for easy reading
+
+### Verbosity tiers
+
+| Tier | What you see |
+|------|--------------|
+| `-Quiet` | Only warnings, errors and the final summary |
+| Default | Headers, per-section results (✓/✗/○) and the summary — no per-step chatter |
+| `-Verbose` | Everything above, plus every "doing X now" step and raw tool output (Scoop, Chocolatey, apt-get, …) |
+
+Default output stays deliberately quiet about *how* a section is doing its work — only *whether*
+it succeeded. Reach for `-Verbose` when you want to watch a long-running section (WSL's
+`apt-get full-upgrade`, TeX Live) live instead of staring at a silent screen until it's done.
 
 ### WSL Package Updates
 
@@ -272,14 +290,14 @@ The script updates packages inside your default WSL distribution via `apt-get fu
 
 ```
   ╭────────────────────────────────────────╮
-  │  ◆  Windows Update Script  v12.0      │
-  │  ◆  2026-04-22  14:32:07              │
+  │  ◆  Windows Update Script  v12.4      │
+  │  ◆  2026-09-05  14:32:07              │
   ╰────────────────────────────────────────╯
 
   ══════════════════════════════════════════════════════════
   ▪ Python
 
-  ▶  Updating uv
+  ▶  [12/25]  Updating uv
 
   →  Updating uv...
   ○  uv is managed by another package manager — skipping self-update
@@ -292,9 +310,18 @@ The script updates packages inside your default WSL distribution via `apt-get fu
   ══════════════════════════════════════════════════════════
   ▪ Update Summary
 
-  ✓  Updated (3 sections):  uv: Python runtimes, All uv tools | pipx: All pipx packages | ...
-  ·  Skipped (2):  Conda (not installed) | TeX Live (--NoTex)
+  ✓  uv  2 updated: Python runtimes, All uv tools
+  ✓  pipx  1 updated: All pipx packages
+
+  ✗  WSL  1 failed: apt-get full-upgrade failed
+
+  ○  Skipped (2): Conda (not installed), TeX Live
+
+  ·  2 categories updated (3 items)  ·  1 failed (1 items)  ·  2 skipped
 ```
+
+Item lists longer than 8 entries are truncated in the terminal (`… (+N more)`) — the full list
+always stays in `logs/update.log`.
 
 ## 🔒 Security Considerations
 
@@ -406,6 +433,8 @@ After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any di
 
 ## 📈 Version History
 
+- **v12.5** — New: `-Only <names>` runs just a targeted subset of sections (substring match). New: `-Parallel` pre-launches independent tool self-updates (Oh My Posh, pnpm, Bun, Deno, Poetry, Rye, Composer) as background jobs. New: `-OutputJson <path>` writes a machine-readable run summary. New: three verbosity tiers (`-Quiet` / default / `-Verbose`) — default output now shows only headers, results, and the summary; use `-Verbose` for the full step-by-step + raw tool output. Fix ([#8](https://github.com/baurfm/update/issues/8)): winget packages that require explicit targeting (e.g. Android Studio) are no longer silently skipped by `--all` — upgraded individually and reported in the summary. Fix ([#9](https://github.com/baurfm/update/issues/9)): warns up front if VS Code is running before updating its extensions, since a locked extensions directory causes opaque exit-1 failures. Fix: elevation re-launch no longer reprints the banner/self-update check/pre-checks a second time (new internal `-Elevated` marker). Fix: the reason for elevation (e.g. "winget updates") is now shown instead of only logged. Rename: `Acquire-/Release-UpdateLock` → `Lock-/Unlock-UpdateRun` (PSScriptAnalyzer `PSUseApprovedVerbs`). Chore: added a UTF-8 BOM (fixes potential umlaut-corruption on some locales/hosts) and a GitHub Actions lint workflow (PS5.1 + PS7 parse check, PSScriptAnalyzer).
+- **v12.4** — Fix: ternary operator in the notification path (`$HasFailures ? 1001 : 1000`) crashed the script's *parsing* on Windows PowerShell 5.1 entirely — replaced with `if/else`. Fix: self-update re-exec (on detecting a newer script version via `git pull`) deadlocked against its own run-lock because it re-launched itself without releasing it first — now releases the lock before re-exec, matching the existing elevation-relaunch pattern. Fix: `-UnregisterSchedule` silently reported success even when Scheduled Task removal actually failed (permission errors were swallowed as "nothing to remove"). UX: section headers now show progress (`[12/25]`); the final summary is redesigned to one compact line per category with an inline, truncated item list (`… (+N more)`, full list still in the log) instead of a bullet per item; the closing stats line now also reports total item counts, not just category counts. Docs: `-NotifyOn` default corrected to `Failure` (was documented as `Always`); Sample Output section updated to match the real output.
 - **v12.3** — Fix: winget upgrade no longer fails when `bash.exe` / `git.exe` / Claude-Code sessions are running and Git.Git has a pending update. Detected blockers trigger a temporary `winget pin add --id Git.Git --gated` (removed in a `finally` block). A pending-update flag (`logs/pending-git-update.json`) persists across runs — the next run without blockers auto-applies the pending Git update via a fast-path before the regular `--all` batch. User-pre-existing pins are detected and left untouched.
 - **v12.1** — Fix: gcloud auto-recovers from "Cannot use bundled Python installation" by running `gcloud components copy-bundled-python` and setting `CLOUDSDK_PYTHON` in-process, then retrying the update.
 - **v12.0** — New: Unattended/headless mode (`-Unattended`, `-Quiet`). New: Lock-file prevents overlapping runs (`-NoLock` to bypass). New: Network pre-check aborts early when offline (`-SkipNetworkCheck`). New: Per-command hard timeout via `Invoke-WithTimeout` (`-CmdTimeoutSec`). New: Scheduled Task installer (`-RegisterSchedule`/`-UnregisterSchedule`/`-ScheduleTime`/`-ScheduleFrequency`) using SYSTEM principal — no password storage. New: Notifications via BurntToast toast, webhook (ntfy.sh compatible), or Windows Event Log (`-NotifyToast`/`-NotifyWebhook`/`-NotifyEventLog`/`-NotifyOn`). New: Auto-reboot when pending reboot detected (`-AutoReboot`). New: Differentiates exit codes 0–6 (Ok/Partial/HardFail/ElevationMissing/LockActive/NetworkDown/TimedOut). New: Global prompt killer silences all tool telemetry/interactive prompts in unattended mode. Fixed: Lock released before elevation re-launch so elevated child can acquire it. Log rotation increased from 5 to 30 archives.
