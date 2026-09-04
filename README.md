@@ -8,7 +8,7 @@ A comprehensive PowerShell script that automates the update process for multiple
 
 ## 🚀 Features
 
-- **Comprehensive Coverage**: Updates 25 development tool categories across package managers, language runtimes, CLIs and IDEs
+- **Comprehensive Coverage**: Updates 26 development tool categories across package managers, language runtimes, CLIs and IDEs
 - **Selective Updates**: Skip specific sections using command-line parameters (`-NoX` flags), or run only a targeted subset with `-Only <names>`
 - **Dry-Run Mode**: Preview which sections would run without making any changes (`-DryRun`)
 - **Parallel Pre-Checks**: Fast up-front detection of which sections actually need updates — reduces elevation prompts and runtime
@@ -80,6 +80,7 @@ Sections are organised into logical groups in the order they run:
 | Category | Tools Updated | Command Used |
 |----------|---------------|--------------|
 | **Google Cloud SDK** | All gcloud components | `gcloud components update --quiet` |
+| **Azure CLI** | CLI itself + all installed extensions | `az upgrade --yes --all` |
 | **Android SDK** | All installed SDK components | `sdkmanager --update` |
 | **Helm plugins** | All installed Helm plugins | `helm plugin update <name>` |
 | **krew plugins** | All kubectl plugins managed by krew | `kubectl krew upgrade` |
@@ -162,6 +163,7 @@ Get-Help .\update.ps1 -Full
 | `-NoGem` | Skip Ruby Gems |
 | `-NoComposer` | Skip Composer self-update |
 | `-NoGCloud` | Skip Google Cloud SDK components |
+| `-NoAzureCli` | Skip Azure CLI + extensions |
 | `-NoAndroid` | Skip Android SDK components |
 | `-NoHelm` | Skip Helm plugin updates |
 | `-NoKrew` | Skip krew (kubectl plugin manager) |
@@ -436,6 +438,7 @@ After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any di
 
 ## 📈 Version History
 
+- **v12.7** — New: Azure CLI section (`az upgrade --yes --all`, `-NoAzureCli` to skip) — found installed but not yet covered while scanning for missing tool support.
 - **v12.6** — Fix: `-Only` no longer triggers unrelated elevation pre-checks/UAC prompts for sections it filters out (e.g. `-Only Scoop` no longer probes/elevates for winget). UX: empty group headers are now suppressed when `-Only` narrows the run down. UX: redesigned the closing summary into a bordered card matching the startup banner's style (bookends the run visually), auto-sized to its content. Fix: "Everything already up-to-date" and other top-level summary lines were accidentally hidden by the new default-tier chatter filter — they're always shown, regardless of `-Verbose`.
 - **v12.5** — New: `-Only <names>` runs just a targeted subset of sections (substring match). New: `-Parallel` pre-launches independent tool self-updates (Oh My Posh, pnpm, Bun, Deno, Poetry, Rye, Composer) as background jobs. New: `-OutputJson <path>` writes a machine-readable run summary. New: three verbosity tiers (`-Quiet` / default / `-Verbose`) — default output now shows only headers, results, and the summary; use `-Verbose` for the full step-by-step + raw tool output. Fix ([#8](https://github.com/baurfm/update/issues/8)): winget packages that require explicit targeting (e.g. Android Studio) are no longer silently skipped by `--all` — upgraded individually and reported in the summary. Fix ([#9](https://github.com/baurfm/update/issues/9)): warns up front if VS Code is running before updating its extensions, since a locked extensions directory causes opaque exit-1 failures. Fix: elevation re-launch no longer reprints the banner/self-update check/pre-checks a second time (new internal `-Elevated` marker). Fix: the reason for elevation (e.g. "winget updates") is now shown instead of only logged. Rename: `Acquire-/Release-UpdateLock` → `Lock-/Unlock-UpdateRun` (PSScriptAnalyzer `PSUseApprovedVerbs`). Chore: added a UTF-8 BOM (fixes potential umlaut-corruption on some locales/hosts) and a GitHub Actions lint workflow (PS5.1 + PS7 parse check, PSScriptAnalyzer).
 - **v12.4** — Fix: ternary operator in the notification path (`$HasFailures ? 1001 : 1000`) crashed the script's *parsing* on Windows PowerShell 5.1 entirely — replaced with `if/else`. Fix: self-update re-exec (on detecting a newer script version via `git pull`) deadlocked against its own run-lock because it re-launched itself without releasing it first — now releases the lock before re-exec, matching the existing elevation-relaunch pattern. Fix: `-UnregisterSchedule` silently reported success even when Scheduled Task removal actually failed (permission errors were swallowed as "nothing to remove"). UX: section headers now show progress (`[12/25]`); the final summary is redesigned to one compact line per category with an inline, truncated item list (`… (+N more)`, full list still in the log) instead of a bullet per item; the closing stats line now also reports total item counts, not just category counts. Docs: `-NotifyOn` default corrected to `Failure` (was documented as `Always`); Sample Output section updated to match the real output.

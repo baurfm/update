@@ -170,7 +170,7 @@
 .NOTES
     Author: Your Name
     Date: 2026-09-05
-    Version: 12.6
+    Version: 12.7
 #>
 
 [CmdletBinding()]
@@ -191,6 +191,7 @@ param(
     [switch]$NoGem,
     [switch]$NoChoco,
     [switch]$NoGCloud,
+    [switch]$NoAzureCli,    # Skip Azure CLI (az upgrade)
     [switch]$NoGhExt,
     [switch]$NoDotnet,
     [switch]$NoAndroid,
@@ -315,7 +316,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.6'
+$script:VersionString  = '12.7'
 $script:OnlyFilter     = $Only
 $script:parallelJobs   = @{}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
@@ -1698,7 +1699,7 @@ $sectionKeys = "Scoop", "Winget", "Chocolatey",
               "npm", "pnpm", "Bun", "Deno",
               "pipx", "uv", "Poetry", "Rye",
               ".NET Global Tools", "Rust", "Ruby Gems", "Composer",
-              "Google Cloud SDK", "Android SDK", "Helm plugins", "krew plugins",
+              "Google Cloud SDK", "Azure CLI", "Android SDK", "Helm plugins", "krew plugins",
               "VS Code Extensions", "GitHub CLI Extensions",
               "TeX Live"
 $script:sectionIndex   = 0
@@ -2370,7 +2371,7 @@ Update-Section "Composer" ($NoComposer -or $OnlyWsl -or $OnlyWslPackages) { Get-
 # ══════════════════════════════════════════════════════
 # CLOUD / DEVOPS
 # ══════════════════════════════════════════════════════
-if (Test-GroupWanted 'Google Cloud SDK','Android SDK','Helm plugins','krew plugins') {
+if (Test-GroupWanted 'Google Cloud SDK','Azure CLI','Android SDK','Helm plugins','krew plugins') {
 Write-GroupHeader "Cloud / DevOps"
 }
 
@@ -2423,6 +2424,12 @@ Update-Section "Google Cloud SDK" ($NoGCloud -or $OnlyWsl -or $OnlyWslPackages) 
         Write-Log "gcloud output: $gcloudText" -Level "INFO"
         $failedItems["Google Cloud SDK"] += "gcloud components update (exit $gcloudCode)"
     }
+}
+
+# --- Update Azure CLI ---
+Update-Section "Azure CLI" ($NoAzureCli -or $OnlyWsl -or $OnlyWslPackages) { Get-Command az -ErrorAction SilentlyContinue } {
+    Write-Status "Updating Azure CLI and extensions..." -Type Action
+    Invoke-UpdateStep -Key "Azure CLI" -ActionName "az upgrade" -Action { & az upgrade --yes --all } -SuccessLabel "Azure CLI + extensions" | Out-Null
 }
 
 # --- Update Android SDK Components ---
