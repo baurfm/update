@@ -170,7 +170,7 @@
 .NOTES
     Author: Your Name
     Date: 2026-09-05
-    Version: 12.5
+    Version: 12.6
 #>
 
 [CmdletBinding()]
@@ -315,7 +315,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.5'
+$script:VersionString  = '12.6'
 $script:OnlyFilter     = $Only
 $script:parallelJobs   = @{}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
@@ -337,6 +337,35 @@ function Format-Elapsed {
     if ($ts.TotalHours -ge 1)   { return "$([int]$ts.TotalHours)h $($ts.Minutes)m" }
     if ($ts.TotalMinutes -ge 1) { return "$([int]$ts.TotalMinutes)m $($ts.Seconds)s" }
     return "$([int]$ts.TotalSeconds)s"
+}
+
+# Draws a rounded box around one or more pre-formatted lines — mirrors the startup banner's style
+# so the run visually "bookends" between an opening and a closing card. Lines longer than the box
+# width are truncated defensively (should not normally happen; callers keep lines short).
+function Write-ResultBox {
+    param(
+        [Parameter(Mandatory)] [string[]]$Lines,
+        [string[]]$LineColors,
+        [string]$BorderColor = 'DarkGray',
+        [int]$Width = 0   # 0 = auto-fit to the longest line (clamped to [40, 78])
+    )
+    if ($script:QuietMode) { return }
+    if ($Width -le 0) {
+        $longest = ($Lines | ForEach-Object Length | Measure-Object -Maximum).Maximum
+        $Width   = [Math]::Min(78, [Math]::Max(40, $longest + 4))
+    }
+    $bar = [char]0x2502
+    Write-Host "  $([char]0x256D)$(([char]0x2500).ToString() * $Width)$([char]0x256E)" -ForegroundColor $BorderColor
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $line  = $Lines[$i]
+        $color = if ($LineColors -and $LineColors.Count -gt $i) { $LineColors[$i] } else { 'White' }
+        if ($line.Length -gt $Width - 2) { $line = $line.Substring(0, $Width - 5) + '...' }
+        Write-Host "  $bar " -NoNewline -ForegroundColor $BorderColor
+        Write-Host $line -NoNewline -ForegroundColor $color
+        Write-Host (" " * [Math]::Max(0, $Width - $line.Length - 1)) -NoNewline
+        Write-Host "$bar" -ForegroundColor $BorderColor
+    }
+    Write-Host "  $([char]0x2570)$(([char]0x2500).ToString() * $Width)$([char]0x256F)" -ForegroundColor $BorderColor
 }
 
 # Helper: join an item list for the summary, truncated to $MaxShown with a "+N more" suffix.
@@ -435,6 +464,30 @@ function Write-Log {
     # INFO and DEBUG are silent in terminal unless -Verbose
 }
 
+# Shared -Only substring-match check, used both by Update-Section (to skip sections) and the
+# elevation pre-check block (to avoid probing/elevating for a section -Only would filter out
+# anyway — no point triggering a UAC prompt for winget when -Only excludes it).
+function Test-SectionWanted {
+    param([Parameter(Mandatory)] [string]$Name)
+    if (-not $script:OnlyFilter -or $script:OnlyFilter.Count -eq 0) { return $true }
+    foreach ($pattern in $script:OnlyFilter) {
+        if ($Name -like "*$pattern*") { return $true }
+    }
+    return $false
+}
+
+# Same idea as Test-SectionWanted, but for a whole group header: true if -Only is unset, or at
+# least one of the group's section names matches — avoids a wall of empty "═══ Group ═══"
+# headers with nothing under them when -Only narrows the run down to one or two sections.
+function Test-GroupWanted {
+    param([Parameter(Mandatory)] [string[]]$SectionNames)
+    if (-not $script:OnlyFilter -or $script:OnlyFilter.Count -eq 0) { return $true }
+    foreach ($name in $SectionNames) {
+        if (Test-SectionWanted -Name $name) { return $true }
+    }
+    return $false
+}
+
 # Function to handle common update section logic
 function Update-Section {
     param(
@@ -448,17 +501,11 @@ function Update-Section {
     $progress = if ($script:totalSections) { "$($script:sectionIndex)/$($script:totalSections)" } else { $null }
 
     # -Only filters the whole run down to sections whose name contains one of the given
-    # substrings (case-insensitive). Silent skip (log only) — a wall of "skipped" lines for
-    # everything not requested would defeat the point of a targeted run.
-    if ($script:OnlyFilter -and $script:OnlyFilter.Count -gt 0) {
-        $matched = $false
-        foreach ($pattern in $script:OnlyFilter) {
-            if ($SectionName -like "*$pattern*") { $matched = $true; break }
-        }
-        if (-not $matched) {
-            Write-Log "Skipping $SectionName — not matched by -Only filter." -Level "DEBUG"
-            return
-        }
+    # substrings. Silent skip (log only) — a wall of "skipped" lines for everything not
+    # requested would defeat the point of a targeted run.
+    if (-not (Test-SectionWanted -Name $SectionName)) {
+        Write-Log "Skipping $SectionName — not matched by -Only filter." -Level "DEBUG"
+        return
     }
 
     if ($SkipCondition) {
@@ -1464,7 +1511,7 @@ if ($Elevated) {
     $preWingetJob = $null
     $preWslJob    = $null
 
-    if (-not $NoWinget -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+    if (-not $NoWinget -and (Test-SectionWanted 'Winget & Microsoft Store apps') -and (Get-Command winget -ErrorAction SilentlyContinue)) {
         # ${Function:...} gives a ScriptBlock, but $using: serialises it to a string in the job.
         # Use [scriptblock]::Create() to reconstruct it on the other side.
         # Both functions must be passed: Test-WingetHasUpdates calls Get-WingetUpgradableIds.
@@ -1481,7 +1528,7 @@ if ($Elevated) {
 
     # Only wsl --update needs elevation; apt-get does not.
     # Skip when -NoWsl or -OnlyWslPackages is set (wsl --update won't run anyway).
-    if (-not $NoWsl -and -not $OnlyWslPackages -and (Get-Command wsl -ErrorAction SilentlyContinue)) {
+    if (-not $NoWsl -and -not $OnlyWslPackages -and (Test-SectionWanted 'Windows Subsystem for Linux (WSL)') -and (Get-Command wsl -ErrorAction SilentlyContinue)) {
         $fnWsl = ${Function:Test-WslHasUpdates}.ToString()
         $preWslJob = Start-Job -ScriptBlock {
             # Capture Write-Status calls so they can be replayed in the main runspace
@@ -1504,7 +1551,7 @@ if ($Elevated) {
     }
 
     # npm: prefix write-test runs inline (no network, no blocking) while the jobs are in flight
-    if (-not $NoNpm -and -not $OnlyWsl -and -not $OnlyWslPackages -and (Get-Command npm -ErrorAction SilentlyContinue)) {
+    if (-not $NoNpm -and -not $OnlyWsl -and -not $OnlyWslPackages -and (Test-SectionWanted 'npm (Node Package Manager) Packages') -and (Get-Command npm -ErrorAction SilentlyContinue)) {
         Write-Status "Pre-checking npm prefix writability..." -Type Action
         $npmPrefix = (& npm config get prefix 2>&1).Trim()
         $npmWriteTest = Join-Path $npmPrefix ".write-test-$([System.Guid]::NewGuid().ToString('N'))"
@@ -1670,7 +1717,9 @@ if ($Parallel -and -not $DryRun) { Start-ParallelPrefetch }
 # ══════════════════════════════════════════════════════
 # PACKAGE MANAGERS  (update foundations first)
 # ══════════════════════════════════════════════════════
+if (Test-GroupWanted 'Scoop and its packages','Winget & Microsoft Store apps','Chocolatey packages') {
 Write-GroupHeader "Package Managers"
+}
 
 # --- Update Scoop ---
 Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPackages) { Get-Command scoop -ErrorAction SilentlyContinue } {
@@ -1878,7 +1927,9 @@ Update-Section "Chocolatey packages" ($NoChoco -or $OnlyWsl -or $OnlyWslPackages
 # ══════════════════════════════════════════════════════
 # SHELL / TERMINAL
 # ══════════════════════════════════════════════════════
+if (Test-GroupWanted 'PowerShell Modules','Oh My Posh') {
 Write-GroupHeader "Shell / Terminal"
+}
 
 # --- Update PowerShell Modules ---
 Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPackages) { $true } {
@@ -2018,7 +2069,9 @@ Update-Section "Oh My Posh" ($NoOhMyPosh -or $OnlyWsl -or $OnlyWslPackages) { Ge
 # ══════════════════════════════════════════════════════
 # SYSTEM
 # ══════════════════════════════════════════════════════
+if (Test-GroupWanted 'Windows Subsystem for Linux (WSL)') {
 Write-GroupHeader "System"
+}
 
 # --- Update WSL ---
 Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !$OnlyWslPackages) { Get-Command wsl -ErrorAction SilentlyContinue } {
@@ -2112,7 +2165,9 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
 # ══════════════════════════════════════════════════════
 # JAVASCRIPT ECOSYSTEM
 # ══════════════════════════════════════════════════════
+if (Test-GroupWanted 'npm (Node Package Manager) Packages','pnpm','Bun','Deno') {
 Write-GroupHeader "JavaScript"
+}
 
 # --- Update npm Packages ---
 Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command npm -ErrorAction SilentlyContinue } {
@@ -2184,7 +2239,9 @@ Update-Section "Deno" ($NoDeno -or $OnlyWsl -or $OnlyWslPackages) { Get-Command 
 # ══════════════════════════════════════════════════════
 # PYTHON ECOSYSTEM
 # ══════════════════════════════════════════════════════
+if (Test-GroupWanted 'pipx packages','uv','Poetry','Rye') {
 Write-GroupHeader "Python"
+}
 
 # --- Update pipx packages ---
 Update-Section "pipx packages" ($NoPipx -or $OnlyWsl -or $OnlyWslPackages) { Get-Command pipx -ErrorAction SilentlyContinue } {
@@ -2234,7 +2291,9 @@ Update-Section "Rye" ($NoRye -or $OnlyWsl -or $OnlyWslPackages) { Get-Command ry
 # ══════════════════════════════════════════════════════
 # OTHER LANGUAGES
 # ══════════════════════════════════════════════════════
+if (Test-GroupWanted '.NET Global Tools','Rust (rustup)','Ruby Gems','Composer') {
 Write-GroupHeader "Other Languages"
+}
 
 # --- Update .NET Global Tools ---
 Update-Section ".NET Global Tools" ($NoDotnet -or $OnlyWsl -or $OnlyWslPackages) { Get-Command dotnet -ErrorAction SilentlyContinue } {
@@ -2311,7 +2370,9 @@ Update-Section "Composer" ($NoComposer -or $OnlyWsl -or $OnlyWslPackages) { Get-
 # ══════════════════════════════════════════════════════
 # CLOUD / DEVOPS
 # ══════════════════════════════════════════════════════
+if (Test-GroupWanted 'Google Cloud SDK','Android SDK','Helm plugins','krew plugins') {
 Write-GroupHeader "Cloud / DevOps"
+}
 
 # --- Update Google Cloud SDK ---
 Update-Section "Google Cloud SDK" ($NoGCloud -or $OnlyWsl -or $OnlyWslPackages) { Get-Command gcloud -ErrorAction SilentlyContinue } {
@@ -2419,7 +2480,9 @@ Update-Section "krew plugins" ($NoKrew -or $OnlyWsl -or $OnlyWslPackages) { Get-
 # ══════════════════════════════════════════════════════
 # DEV TOOLING
 # ══════════════════════════════════════════════════════
+if (Test-GroupWanted 'Visual Studio Code Extensions','GitHub CLI Extensions') {
 Write-GroupHeader "Dev Tooling"
+}
 
 # --- Update Visual Studio Code Extensions ---
 Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $OnlyWslPackages) { Get-Command code -ErrorAction SilentlyContinue } {
@@ -2506,7 +2569,9 @@ Update-Section "GitHub CLI Extensions" ($NoGhExt -or $OnlyWsl -or $OnlyWslPackag
 # ══════════════════════════════════════════════════════
 # TYPESETTING
 # ══════════════════════════════════════════════════════
+if (Test-GroupWanted 'TeX Live') {
 Write-GroupHeader "Typesetting"
+}
 
 # --- Update TeX Live ---
 Update-Section "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Command tlmgr -ErrorAction SilentlyContinue } {
@@ -2587,13 +2652,14 @@ foreach ($key in $updatedItems.Keys) {
         Write-Host "$key" -NoNewline -ForegroundColor Green
         Write-Host "  $($updatedItems[$key].Count) updated: " -NoNewline -ForegroundColor Gray
         Write-Host (Format-SummaryLine -Items $updatedItems[$key]) -ForegroundColor Gray
+        $script:lastLineBlank = $false
     }
 }
 
 if (-not $hasUpdates) {
-    Write-Status "Everything already up-to-date" -Type Info
+    Write-Status "Everything already up-to-date" -Type Success
 }
-Write-Host ""
+Write-BlankLine
 
 $hasFailures      = $false
 $totalFailedItems = 0
@@ -2605,6 +2671,7 @@ foreach ($key in $failedItems.Keys) {
         Write-Host "$key" -NoNewline -ForegroundColor Red
         Write-Host "  $($failedItems[$key].Count) failed: " -NoNewline -ForegroundColor DarkRed
         Write-Host (Format-SummaryLine -Items $failedItems[$key]) -ForegroundColor DarkRed
+        $script:lastLineBlank = $false
     }
 }
 
@@ -2613,10 +2680,11 @@ if (-not $hasFailures) {
 }
 
 if ($skippedSections.Count -gt 0) {
-    Write-Host ""
+    Write-BlankLine
     Write-Host "  $([char]0x25CB)  " -NoNewline -ForegroundColor DarkGray
     Write-Host "Skipped ($($skippedSections.Count)): " -NoNewline -ForegroundColor DarkGray
     Write-Host (Format-SummaryLine -Items $skippedSections -MaxShown 12) -ForegroundColor DarkGray
+    $script:lastLineBlank = $false
 }
 
 # Section timings — only show sections that took 5 s or more
@@ -2624,25 +2692,31 @@ $slowSections = $script:sectionTimings.GetEnumerator() |
     Where-Object { $_.Value.TotalSeconds -ge 5 } |
     Sort-Object { $_.Value } -Descending
 if ($slowSections) {
-    Write-Host ""
+    Write-BlankLine
     Write-Host "  $([char]0x25CB)  Timings" -ForegroundColor DarkGray
     $slowSections | ForEach-Object {
         Write-Host "       $([char]0x2022) $($_.Key): $(Format-Elapsed $_.Value)" -ForegroundColor DarkGray
     }
+    $script:lastLineBlank = $false
 }
 
 # One-line stats
 $updatedCount = ($updatedItems.Values | Where-Object { $_.Count -gt 0 }).Count
 $failedCount  = ($failedItems.Values  | Where-Object { $_.Count -gt 0 }).Count
 $skippedCount = $skippedSections.Count
-Write-Host ""
-Write-Host "  $([char]0x00B7)  $updatedCount categories updated ($totalUpdatedItems items)  $([char]0x00B7)  $failedCount failed ($totalFailedItems items)  $([char]0x00B7)  $skippedCount skipped" -ForegroundColor DarkGray
 
+# Closing card — bookends the startup banner with the same rounded-box style.
 Write-Host ""
 if ($hasFailures) {
-    Write-Host "  $([char]0x2570)$([char]0x2500)  $([char]0x2717)  Completed with failures in $(Format-Elapsed $totalElapsed)  $([char]0x2500)$([char]0x256F)" -ForegroundColor Red
+    Write-ResultBox -BorderColor Red -LineColors @('Red', 'Gray') -Lines @(
+        "$([char]0x2717)  Completed with failures  $([char]0x00B7)  $(Format-Elapsed $totalElapsed)"
+        "$updatedCount updated ($totalUpdatedItems items)  $([char]0x00B7)  $failedCount failed ($totalFailedItems items)  $([char]0x00B7)  $skippedCount skipped"
+    )
 } else {
-    Write-Host "  $([char]0x2570)$([char]0x2500)  $([char]0x2713)  All done in $(Format-Elapsed $totalElapsed)  $([char]0x2500)$([char]0x256F)" -ForegroundColor Green
+    Write-ResultBox -BorderColor Green -LineColors @('Green', 'Gray') -Lines @(
+        "$([char]0x2713)  All done  $([char]0x00B7)  $(Format-Elapsed $totalElapsed)"
+        "$updatedCount updated ($totalUpdatedItems items)  $([char]0x00B7)  $failedCount failed ($totalFailedItems items)  $([char]0x00B7)  $skippedCount skipped"
+    )
 }
 Write-Host ""
 

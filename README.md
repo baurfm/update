@@ -288,10 +288,12 @@ The script updates packages inside your default WSL distribution via `apt-get fu
 
 ### Sample Output
 
+Default tier — headers, per-section results, and the summary; no per-step chatter:
+
 ```
   ╭────────────────────────────────────────╮
-  │  ◆  Windows Update Script  v12.4      │
-  │  ◆  2026-09-05  14:32:07              │
+  │  ◆  Windows Update Script  v12.6       │
+  │  ◆  2026-09-05  14:32:07               │
   ╰────────────────────────────────────────╯
 
   ══════════════════════════════════════════════════════════
@@ -299,16 +301,10 @@ The script updates packages inside your default WSL distribution via `apt-get fu
 
   ▶  [12/25]  Updating uv
 
-  →  Updating uv...
   ○  uv is managed by another package manager — skipping self-update
-  →  Upgrading uv-managed Python runtimes...
-  ✓  uv python install --upgrade succeeded.
-  →  Upgrading all uv tools...
-  ✓  All uv tools upgraded.
   ✓  Done  3s
 
-  ══════════════════════════════════════════════════════════
-  ▪ Update Summary
+  ▶  Update Summary
 
   ✓  uv  2 updated: Python runtimes, All uv tools
   ✓  pipx  1 updated: All pipx packages
@@ -317,11 +313,18 @@ The script updates packages inside your default WSL distribution via `apt-get fu
 
   ○  Skipped (2): Conda (not installed), TeX Live
 
-  ·  2 categories updated (3 items)  ·  1 failed (1 items)  ·  2 skipped
+  ○  Timings
+       • WSL: 4m 12s
+
+  ╭────────────────────────────────────────────────────────────╮
+  │ ✗  Completed with failures  ·  4m 45s                      │
+  │ 2 updated (3 items)  ·  1 failed (1 items)  ·  2 skipped   │
+  ╰────────────────────────────────────────────────────────────╯
 ```
 
 Item lists longer than 8 entries are truncated in the terminal (`… (+N more)`) — the full list
-always stays in `logs/update.log`.
+always stays in `logs/update.log`. Add `-Verbose` to see every intermediate step and raw tool
+output (`→ Updating uv...`, `✓ uv python install --upgrade succeeded.`, …) instead of just results.
 
 ## 🔒 Security Considerations
 
@@ -433,6 +436,7 @@ After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any di
 
 ## 📈 Version History
 
+- **v12.6** — Fix: `-Only` no longer triggers unrelated elevation pre-checks/UAC prompts for sections it filters out (e.g. `-Only Scoop` no longer probes/elevates for winget). UX: empty group headers are now suppressed when `-Only` narrows the run down. UX: redesigned the closing summary into a bordered card matching the startup banner's style (bookends the run visually), auto-sized to its content. Fix: "Everything already up-to-date" and other top-level summary lines were accidentally hidden by the new default-tier chatter filter — they're always shown, regardless of `-Verbose`.
 - **v12.5** — New: `-Only <names>` runs just a targeted subset of sections (substring match). New: `-Parallel` pre-launches independent tool self-updates (Oh My Posh, pnpm, Bun, Deno, Poetry, Rye, Composer) as background jobs. New: `-OutputJson <path>` writes a machine-readable run summary. New: three verbosity tiers (`-Quiet` / default / `-Verbose`) — default output now shows only headers, results, and the summary; use `-Verbose` for the full step-by-step + raw tool output. Fix ([#8](https://github.com/baurfm/update/issues/8)): winget packages that require explicit targeting (e.g. Android Studio) are no longer silently skipped by `--all` — upgraded individually and reported in the summary. Fix ([#9](https://github.com/baurfm/update/issues/9)): warns up front if VS Code is running before updating its extensions, since a locked extensions directory causes opaque exit-1 failures. Fix: elevation re-launch no longer reprints the banner/self-update check/pre-checks a second time (new internal `-Elevated` marker). Fix: the reason for elevation (e.g. "winget updates") is now shown instead of only logged. Rename: `Acquire-/Release-UpdateLock` → `Lock-/Unlock-UpdateRun` (PSScriptAnalyzer `PSUseApprovedVerbs`). Chore: added a UTF-8 BOM (fixes potential umlaut-corruption on some locales/hosts) and a GitHub Actions lint workflow (PS5.1 + PS7 parse check, PSScriptAnalyzer).
 - **v12.4** — Fix: ternary operator in the notification path (`$HasFailures ? 1001 : 1000`) crashed the script's *parsing* on Windows PowerShell 5.1 entirely — replaced with `if/else`. Fix: self-update re-exec (on detecting a newer script version via `git pull`) deadlocked against its own run-lock because it re-launched itself without releasing it first — now releases the lock before re-exec, matching the existing elevation-relaunch pattern. Fix: `-UnregisterSchedule` silently reported success even when Scheduled Task removal actually failed (permission errors were swallowed as "nothing to remove"). UX: section headers now show progress (`[12/25]`); the final summary is redesigned to one compact line per category with an inline, truncated item list (`… (+N more)`, full list still in the log) instead of a bullet per item; the closing stats line now also reports total item counts, not just category counts. Docs: `-NotifyOn` default corrected to `Failure` (was documented as `Always`); Sample Output section updated to match the real output.
 - **v12.3** — Fix: winget upgrade no longer fails when `bash.exe` / `git.exe` / Claude-Code sessions are running and Git.Git has a pending update. Detected blockers trigger a temporary `winget pin add --id Git.Git --gated` (removed in a `finally` block). A pending-update flag (`logs/pending-git-update.json`) persists across runs — the next run without blockers auto-applies the pending Git update via a fast-path before the regular `--all` batch. User-pre-existing pins are detected and left untouched.
