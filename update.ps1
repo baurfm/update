@@ -170,7 +170,7 @@
 .NOTES
     Author: Your Name
     Date: 2026-09-05
-    Version: 12.9
+    Version: 12.10
 #>
 
 [CmdletBinding()]
@@ -316,7 +316,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.9'
+$script:VersionString  = '12.10'
 $script:OnlyFilter     = $Only
 $script:parallelJobs   = @{}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
@@ -773,13 +773,22 @@ function Get-WingetUpgradableIds {
     $headerIdx = [Array]::IndexOf($lines, $header)
     for ($i = $headerIdx + 2; $i -lt $lines.Length; $i++) {
         $line = $lines[$i]
-        if ($line.Trim().Length -eq 0)  { continue }   # blank
+        # A blank line ends the table — do NOT `continue` past it. winget prints follow-up
+        # sections after the table (e.g. a second "require explicit targeting" table for
+        # pinned/unsupported packages) — reading past the blank line let that free-form text
+        # get sliced by column position and misread as a garbage package "ID".
+        if ($line.Trim().Length -eq 0)  { break }
+        # Summary lines like "2 upgrades available." or "1 package(s) are pinned ...": check
+        # the FULL line for a leading digit, not the column-sliced substring below — slicing
+        # first and checking the fragment (the original approach) can land mid-word (e.g.
+        # "available" sliced at the Id/Version column boundary becomes "ble.", which doesn't
+        # start with a digit and so wasn't filtered).
+        if ($line -match '^\s*\d')      { continue }
         if ($line -match '\bPinned\b')  { continue }   # user-pinned — skip
         if ($line -match '^\s*-+\s*$')  { continue }   # separator row
         if ($line.Length -le $idCol)    { continue }
         $pkg = $line.Substring($idCol, [Math]::Min($verCol - $idCol, $line.Length - $idCol)).Trim()
-        # Skip summary lines like "2 upgrades available."
-        if ($pkg.Length -gt 0 -and $pkg -notmatch '^\d') { $ids += $pkg }
+        if ($pkg.Length -gt 0) { $ids += $pkg }
     }
     return $ids
 }
