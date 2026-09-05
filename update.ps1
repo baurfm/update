@@ -170,7 +170,7 @@
 .NOTES
     Author: Your Name
     Date: 2026-09-05
-    Version: 12.11
+    Version: 12.12
 #>
 
 [CmdletBinding()]
@@ -324,7 +324,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.11'
+$script:VersionString  = '12.12'
 $script:OnlyFilter     = $Only
 $script:parallelJobs   = @{}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
@@ -1053,15 +1053,20 @@ function Remove-UpdateCommand {
     $shimPath = Join-Path $ScriptDir "update.cmd"
     if (Test-Path $shimPath) {
         Remove-Item $shimPath -Force -ErrorAction SilentlyContinue
-        Write-Status "Removed update.cmd shim" -Type Info
+        Write-Status "Removed update.cmd shim" -Type Success
     }
 
     $resolvedDir = try { (Resolve-Path $ScriptDir).Path.TrimEnd('\') } catch { $ScriptDir.TrimEnd('\') }
     $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
     if ($userPath) {
         $kept = $userPath -split ';' | Where-Object {
-            if (-not $_) { return $false }
-            $resolved = try { (Resolve-Path $_ -ErrorAction Stop).Path.TrimEnd('\') } catch { $_.TrimEnd('\') }
+            $entry = $_
+            if (-not $entry) { return $false }
+            # NOTE: $_ inside the catch block below is the caught ErrorRecord, not this $entry —
+            # a classic PowerShell shadowing gotcha. Capture $entry first so the fallback (used
+            # when Resolve-Path can't find the path, e.g. it was already removed) trims the
+            # right string instead of throwing "ErrorRecord has no method TrimEnd".
+            $resolved = try { (Resolve-Path $entry -ErrorAction Stop).Path.TrimEnd('\') } catch { $entry.TrimEnd('\') }
             $resolved -ine $resolvedDir
         }
         $newUserPath = $kept -join ';'
@@ -1070,7 +1075,7 @@ function Remove-UpdateCommand {
             Write-Status "Removed $ScriptDir from User PATH" -Type Success
             Write-Log "PATH: removed $ScriptDir from User PATH" -Level "INFO"
         } else {
-            Write-Status "$ScriptDir was not in User PATH" -Type Info
+            Write-Status "$ScriptDir was not in User PATH" -Type Skip
         }
     }
 }
@@ -1211,7 +1216,7 @@ function Unregister-UpdateScheduledTask {
     try {
         $null = Get-ScheduledTask -TaskName $script:ScheduledTaskName -ErrorAction Stop
     } catch {
-        Write-Status "No Scheduled Task '$($script:ScheduledTaskName)' to remove." -Type Info
+        Write-Status "No Scheduled Task '$($script:ScheduledTaskName)' to remove." -Type Skip
         return $true
     }
     try {
@@ -1287,14 +1292,15 @@ function Write-UpdateEventLog {
         [int]$EventId = 1000
     )
     try {
+        # Check admin BEFORE calling SourceExists: without elevation, SourceExists itself throws
+        # ("Inaccessible logs: Security") rather than just returning $false, so checking admin
+        # first avoids a confusing exception and lets us skip with a clear reason instead.
+        if (-not $script:isAdmin) {
+            Write-Log "Cannot register Event Log source '$($script:EventLogSource)' — not admin." -Level "INFO"
+            return
+        }
         if (-not [System.Diagnostics.EventLog]::SourceExists($script:EventLogSource)) {
-            # Requires admin; skip silently if not elevated.
-            if ($script:isAdmin) {
-                New-EventLog -LogName Application -Source $script:EventLogSource -ErrorAction Stop
-            } else {
-                Write-Log "Cannot register Event Log source '$($script:EventLogSource)' — not admin." -Level "INFO"
-                return
-            }
+            New-EventLog -LogName Application -Source $script:EventLogSource -ErrorAction Stop
         }
         Write-EventLog -LogName Application -Source $script:EventLogSource -EntryType $EntryType `
             -EventId $EventId -Message $Message -ErrorAction Stop
