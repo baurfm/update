@@ -170,7 +170,7 @@
 .NOTES
     Author: Your Name
     Date: 2026-09-05
-    Version: 12.13
+    Version: 12.14
 #>
 
 [CmdletBinding()]
@@ -324,7 +324,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.13'
+$script:VersionString  = '12.14'
 $script:OnlyFilter     = $Only
 $script:parallelJobs   = @{}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
@@ -424,25 +424,24 @@ function Write-GroupHeader {
 # Verbosity tiers:
 #   -Quiet            only Warning/Error survive (plus the summary, printed separately)
 #   default           headers, Success/Skip/Warning/Error — the "what happened" level
-#   -Verbose          adds Info/Action/Detail — the "what it's doing right now" blow-by-blow
-# Info/Action/Detail are always in the log file regardless of tier (see Write-Log).
+#   -Verbose          adds Info/Action — the "what it's doing right now" blow-by-blow
+# Info/Action are always in the log file regardless of tier (see Write-Log).
 function Write-Status {
     param(
         [string]$Message,
-        [ValidateSet("Info", "Success", "Warning", "Error", "Skip", "Action", "Detail")]
+        [ValidateSet("Info", "Success", "Warning", "Error", "Skip", "Action")]
         [string]$Type = "Info"
     )
     # In quiet mode only surface failures and warnings — callers still call this freely.
-    if ($script:QuietMode -and $Type -in @('Info','Skip','Action','Success','Detail')) { return }
+    if ($script:QuietMode -and $Type -in @('Info','Skip','Action','Success')) { return }
     # Chatty per-step / per-item noise is verbose-only in the default (non-quiet) tier.
-    if (-not $script:QuietMode -and $Type -in @('Info','Action','Detail') -and $VerbosePreference -eq 'SilentlyContinue') { return }
+    if (-not $script:QuietMode -and $Type -in @('Info','Action') -and $VerbosePreference -eq 'SilentlyContinue') { return }
     switch ($Type) {
         "Info"    { Write-Host "  $([char]0x00B7)  $Message" -ForegroundColor DarkGray }  # ·
         "Success" { Write-Host "  $([char]0x2713)  $Message" -ForegroundColor Green }     # ✓
         "Warning" { Write-Host "  $([char]0x26A0)  $Message" -ForegroundColor Yellow }    # ⚠
         "Error"   { Write-Host "  $([char]0x2717)  $Message" -ForegroundColor Red }       # ✗
         "Skip"    { Write-Host "  $([char]0x25CB)  $Message" -ForegroundColor DarkGray }  # ○
-        "Detail"  { Write-Host "  $([char]0x00B7)  $Message" -ForegroundColor DarkGray }  # · (verbose-only per-item detail)
         "Action"  {
             Write-Host "  $([char]0x2192)  " -NoNewline -ForegroundColor DarkCyan         # →
             Write-Host $Message -ForegroundColor White
@@ -753,6 +752,48 @@ function Invoke-UpdateStep {
     return $false
 }
 
+# Shared row-extraction core for both Get-WingetUpgradableIds and Get-WingetExplicitTargetIds:
+# given the full output and an already-located header line, walks the table starting right
+# after it and returns package IDs by slicing each row at the Id/Version column positions.
+# Stops at the first blank line (winget always ends a table with one — reading past it risks
+# column-slicing a later section's free-form text into garbage "IDs", see #8's fix history).
+# Also stops at winget's own summary line ("N upgrades available." / "N package(s) are pinned
+# ..."), matched by its specific wording rather than a generic leading-digit check — a generic
+# check would also misfire on a legitimate digit-led package name like "7-Zip".
+# -SkipPinned additionally skips inline "Pinned" rows (only the main upgrade table marks
+# user-pinned packages this way; the explicit-targeting table has no such marker).
+function Get-WingetTableIds {
+    param(
+        # AllowEmptyString is required: $Lines legitimately contains an empty-string element for
+        # the table's own trailing blank line — without it, [Parameter(Mandatory)] on an array
+        # rejects the WHOLE array the moment any single element is empty, throwing "Cannot bind
+        # argument ... because it is an empty string" (a well-known PowerShell gotcha: mandatory
+        # array parameters validate every element, not just the array as a whole).
+        [Parameter(Mandatory)] [AllowEmptyString()] [string[]]$Lines,
+        [Parameter(Mandatory)] [string]$Header,
+        [switch]$SkipPinned
+    )
+    $ids    = @()
+    $idCol  = $Header.IndexOf('Id')
+    $verCol = $Header.IndexOf('Version')
+    if ($idCol -lt 0 -or $verCol -le $idCol) { return $ids }   # malformed header — can't parse
+
+    $headerIdx = [Array]::IndexOf($Lines, $Header)
+    for ($i = $headerIdx + 2; $i -lt $Lines.Length; $i++) {
+        $line = $Lines[$i]
+        if ($line.Trim().Length -eq 0)                       { break }
+        # NOTE: no trailing \b after the package(s) alternative — ")" and the following space
+        # are both non-word characters, so \b would never match there and silently break the match.
+        if ($line -match '^\d+\s+(upgrades?\b|package\(s\))') { break }
+        if ($SkipPinned -and $line -match '\bPinned\b')      { continue }
+        if ($line -match '^\s*-+\s*$')                       { continue }
+        if ($line.Length -le $idCol)                         { continue }
+        $pkg = $line.Substring($idCol, [Math]::Min($verCol - $idCol, $line.Length - $idCol)).Trim()
+        if ($pkg.Length -gt 0) { $ids += $pkg }
+    }
+    return $ids
+}
+
 # Parse `winget upgrade` output and return an array of upgradable package IDs.
 # Returns @() when no updates, when only pinned packages show, or when output is unparseable.
 # Used by both Test-WingetHasUpdates (pre-check) and the Winget section (update loop).
@@ -762,43 +803,17 @@ function Get-WingetUpgradableIds {
         [AllowNull()] [AllowEmptyCollection()] [AllowEmptyString()]
         [string[]]$WingetOutput
     )
-    $ids = @()
-    if (-not $WingetOutput -or -not ($WingetOutput -join '').Trim()) { return $ids }
-    if (($WingetOutput -join "`n") -match 'No applicable upgrades were found') { return $ids }
+    if (-not $WingetOutput -or -not ($WingetOutput -join '').Trim()) { return @() }
+    if (($WingetOutput -join "`n") -match 'No applicable upgrades were found') { return @() }
 
     $lines  = $WingetOutput -split [System.Environment]::NewLine
     # Winget sometimes emits progress lines before the table header; find the real header
     # by locating the first line that contains both 'Id' and 'Version' columns.
     $header = $lines | Where-Object { $_ -match '\bId\b' -and $_ -match '\bVersion\b' } |
                        Select-Object -First 1
-    if (-not $header) { return $ids }
+    if (-not $header) { return @() }
 
-    $idCol  = $header.IndexOf('Id')
-    $verCol = $header.IndexOf('Version')
-    # Malformed header = can't parse = return empty (avoid false elevation/upgrades)
-    if ($idCol -lt 0 -or $verCol -le $idCol) { return $ids }
-
-    $headerIdx = [Array]::IndexOf($lines, $header)
-    for ($i = $headerIdx + 2; $i -lt $lines.Length; $i++) {
-        $line = $lines[$i]
-        # A blank line ends the table — do NOT `continue` past it. winget prints follow-up
-        # sections after the table (e.g. a second "require explicit targeting" table for
-        # pinned/unsupported packages) — reading past the blank line let that free-form text
-        # get sliced by column position and misread as a garbage package "ID".
-        if ($line.Trim().Length -eq 0)  { break }
-        # Summary lines like "2 upgrades available." or "1 package(s) are pinned ...": check
-        # the FULL line for a leading digit, not the column-sliced substring below — slicing
-        # first and checking the fragment (the original approach) can land mid-word (e.g.
-        # "available" sliced at the Id/Version column boundary becomes "ble.", which doesn't
-        # start with a digit and so wasn't filtered).
-        if ($line -match '^\s*\d')      { continue }
-        if ($line -match '\bPinned\b')  { continue }   # user-pinned — skip
-        if ($line -match '^\s*-+\s*$')  { continue }   # separator row
-        if ($line.Length -le $idCol)    { continue }
-        $pkg = $line.Substring($idCol, [Math]::Min($verCol - $idCol, $line.Length - $idCol)).Trim()
-        if ($pkg.Length -gt 0) { $ids += $pkg }
-    }
-    return $ids
+    return Get-WingetTableIds -Lines $lines -Header $header -SkipPinned
 }
 
 # Parses the separate "require explicit targeting" table that winget prints alongside the main
@@ -812,36 +827,21 @@ function Get-WingetExplicitTargetIds {
         [AllowNull()] [AllowEmptyCollection()] [AllowEmptyString()]
         [string[]]$WingetOutput
     )
-    $ids = @()
-    if (-not $WingetOutput -or -not ($WingetOutput -join '').Trim()) { return $ids }
+    if (-not $WingetOutput -or -not ($WingetOutput -join '').Trim()) { return @() }
     $lines = $WingetOutput -split [System.Environment]::NewLine
     $markerIdx = -1
     for ($i = 0; $i -lt $lines.Length; $i++) {
         if ($lines[$i] -match 'require explicit targeting') { $markerIdx = $i; break }
     }
-    if ($markerIdx -lt 0) { return $ids }
+    if ($markerIdx -lt 0) { return @() }
 
     $header = $null
     for ($i = $markerIdx + 1; $i -lt $lines.Length; $i++) {
         if ($lines[$i] -match '\bId\b' -and $lines[$i] -match '\bVersion\b') { $header = $lines[$i]; break }
     }
-    if (-not $header) { return $ids }
+    if (-not $header) { return @() }
 
-    $idCol  = $header.IndexOf('Id')
-    $verCol = $header.IndexOf('Version')
-    if ($idCol -lt 0 -or $verCol -le $idCol) { return $ids }
-
-    $headerIdx = [Array]::IndexOf($lines, $header)
-    for ($i = $headerIdx + 2; $i -lt $lines.Length; $i++) {
-        $line = $lines[$i]
-        if ($line.Trim().Length -eq 0) { break }         # blank line ends the table
-        if ($line -match '^\s*-+\s*$') { continue }       # separator row
-        if ($line -match '^\s*\d+\s+package')  { break }  # "N package(s) are pinned..." summary
-        if ($line.Length -le $idCol) { continue }
-        $pkg = $line.Substring($idCol, [Math]::Min($verCol - $idCol, $line.Length - $idCol)).Trim()
-        if ($pkg.Length -gt 0) { $ids += $pkg }
-    }
-    return $ids
+    return Get-WingetTableIds -Lines $lines -Header $header
 }
 
 # Helper: non-elevated pre-check — returns $true if winget reports any non-pinned upgradable
@@ -1538,13 +1538,15 @@ if ($Elevated) {
     if (-not $NoWinget -and (Test-SectionWanted 'Winget & Microsoft Store apps') -and (Get-Command winget -ErrorAction SilentlyContinue)) {
         # ${Function:...} gives a ScriptBlock, but $using: serialises it to a string in the job.
         # Use [scriptblock]::Create() to reconstruct it on the other side.
-        # Both functions must be passed: Test-WingetHasUpdates calls Get-WingetUpgradableIds.
-        $fnWingetIds = ${Function:Get-WingetUpgradableIds}.ToString()
-        $fnWinget    = ${Function:Test-WingetHasUpdates}.ToString()
+        # All three must be passed: Test-WingetHasUpdates -> Get-WingetUpgradableIds -> Get-WingetTableIds.
+        $fnWingetTable = ${Function:Get-WingetTableIds}.ToString()
+        $fnWingetIds   = ${Function:Get-WingetUpgradableIds}.ToString()
+        $fnWinget      = ${Function:Test-WingetHasUpdates}.ToString()
         $preWingetJob = Start-Job -ScriptBlock {
             function Write-Status { param([string]$Message, [string]$Type = 'Info') }
             function Write-Log    { param([string]$Message, [string]$Level = 'INFO') }
-            # dot-source to define Get-WingetUpgradableIds in this job's scope
+            # dot-source to define the helper chain in this job's scope
+            . ([scriptblock]::Create("function Get-WingetTableIds { $($using:fnWingetTable) }"))
             . ([scriptblock]::Create("function Get-WingetUpgradableIds { $($using:fnWingetIds) }"))
             & ([scriptblock]::Create($using:fnWinget))
         }
@@ -2365,7 +2367,7 @@ Update-Section ".NET Global Tools" ($NoDotnet -or $OnlyWsl -or $OnlyWslPackages)
 
         foreach ($r in $results) {
             if ($r.ExitCode -eq 0) {
-                Write-Status "Updated: $($r.Id)" -Type Detail
+                Write-Status "Updated: $($r.Id)" -Type Info
                 $updatedItems[".NET Global Tools"] += $r.Id
             } else {
                 Write-Status "Failed: $($r.Id)" -Type Error
@@ -2561,7 +2563,7 @@ Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $Only
                     Write-Status "Failed: $($r.Id)" -Type Error
                     $failedItems["VS Code Extensions"] += "$($r.Id) (Exit Code: $($r.ExitCode))"
                 } elseif ($r.Output -like '*successfully installed*') {
-                    Write-Status "Updated: $($r.Id)" -Type Detail
+                    Write-Status "Updated: $($r.Id)" -Type Info
                     $actuallyUpdated += $r.Id
                 }
             }
@@ -2576,7 +2578,7 @@ Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $Only
                     Write-Status "Failed: $extensionId" -Type Error
                     $failedItems["VS Code Extensions"] += "$extensionId (Exit Code: $LASTEXITCODE)"
                 } elseif ($updateOutput -join ' ' -like '*successfully installed*') {
-                    Write-Status "Updated: $extensionId" -Type Detail
+                    Write-Status "Updated: $extensionId" -Type Info
                     $actuallyUpdated += $extensionId
                 }
             }
