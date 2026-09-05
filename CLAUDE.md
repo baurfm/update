@@ -4,7 +4,11 @@ Projekt-spezifische Anweisungen für Claude Code. Ergänzt die globale Konfigura
 
 ## Scope
 
-Einzel-Script-Projekt: `update.ps1` (~1600+ Zeilen) enthält die komplette Update-Logik für alle Dev-Tools. Keine Module, kein Build, keine automatisierte Test-Suite.
+Zwei Dateien, kein Build:
+- `update.ps1` — die komplette Update-Orchestrierung (alle Tool-Sektionen, Terminal-Output, Lock/Elevation/Notifications/Scheduling). Läuft weiterhin als einzelnes ausführbares Skript.
+- `update.functions.ps1` — reine, seiteneffektfreie Helper (Winget-Output-Parser, Format-Helper, `-Only`-Matching). Wird von `update.ps1` per Dot-Source geladen (`. (Join-Path $PSScriptRoot 'update.functions.ps1')`), existiert **nur** damit Pester-Tests diese Funktionen isoliert laden können, ohne den ganzen Update-Lauf auszulösen.
+
+**Kein volles PowerShell-Modul** (kein `.psm1`/`.psd1`, kein Export-Modelling) — bewusst kleine, gezielte Trennung, keine Modularisierung des restlichen Skripts. Neue reine Logik-Funktionen (keine Seiteneffekte, keine Abhängigkeit von `$updatedItems`/`$failedItems`/Terminal-Output) gehören nach `update.functions.ps1`; alles mit Seiteneffekten bleibt in `update.ps1`.
 
 ## Sprache & Runtime
 
@@ -45,7 +49,20 @@ Bei jeder funktionalen Änderung:
 
 ## Tests
 
-Keine automatisierte Test-Suite. Smoke-Test vor Commit:
+**Pester-Tests** (`tests/update.functions.Tests.ps1`) für alles in `update.functions.ps1` —
+Pflicht bei jeder Änderung dort, neue Testfälle für neue Bugs/Edge-Cases ergänzen (nicht nur
+manuell verifizieren und vergessen — genau das hat vor der Pester-Einführung mehrfach echte Bugs
+unentdeckt gelassen, z.B. ein PowerShell-Gotcha bei `[Parameter(Mandatory)]` auf Array-Parametern
+mit leeren Elementen, eine kaputte `\b`-Regex nach einer literalen Klammer).
+
+```powershell
+Install-Module Pester -MinimumVersion 5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+Invoke-Pester -Path .\tests -Output Detailed
+```
+
+Läuft automatisch in CI (`.github/workflows/lint.yml`, Job `test`) bei jedem Push.
+
+Für `update.ps1` selbst weiterhin kein automatisierter Test — Smoke-Test vor Commit:
 
 ```powershell
 .\update.ps1 -DryRun
