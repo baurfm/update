@@ -100,12 +100,28 @@ Sections are organised into logical groups in the order they run:
 
 ## 🛠️ Installation
 
+### Option A: Scoop (recommended)
+
+```powershell
+scoop bucket add baurfm https://github.com/baurfm/scoop-bucket
+scoop install baurfm/update
+update -h
+```
+
+Updates to new versions ship through `scoop update update` like any other Scoop package — no
+git clone, no execution-policy changes needed.
+
+### Option B: Clone the repository
+
 1. **Clone or download** this repository to your local machine
 2. **Ensure PowerShell execution policy** allows script execution:
    ```powershell
    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
    ```
 3. **Verify prerequisites** are installed (see Prerequisites section below)
+
+A git clone also gets the built-in self-update check (`git pull` on every run, disable with
+`-NoSelfUpdate`) — the Scoop package does not, since it's not a git working copy.
 
 ## 📖 Usage
 
@@ -438,6 +454,7 @@ After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any di
 
 ## 📈 Version History
 
+- **v12.11** — Repo is now public and published as a Scoop package (`scoop bucket add baurfm https://github.com/baurfm/scoop-bucket && scoop install baurfm/update`), tracking tagged GitHub Releases from here on. Fix: `-Help`/`-h`/`-?` ran through the entire lock/network/self-update/elevation pre-check flow (including a possible UAC prompt) before printing help — moved to the very top of the script so it exits immediately. Added the LICENSE file the README already referenced.
 - **v12.10** — Fix: `Get-WingetUpgradableIds` produced garbage entries (e.g. `ble.`, fragments of unrelated text) in the update summary whenever winget printed a second section after the main table (the "require explicit targeting" list, now common since v12.7). Root cause was two-fold: (1) the loop `continue`d past blank lines instead of stopping, reading straight into the next section's free-form text and column-slicing it as if it were a table row; (2) the "skip summary lines like '2 upgrades available.'" check tested the column-sliced fragment for a leading digit instead of the original line, so a slice landing mid-word (`available` → `ble.`) wasn't recognized as a summary line and slipped through. Caught live in production — thanks for flagging the garbled output.
 - **v12.9** — Fix: live run revealed the v12.7 explicit-targeting fix (#8) correctly attempts packages like Android Studio, but some publishers' winget manifests have no working upgrade mechanism at all ("The package cannot be upgraded using WinGet") — a permanent, non-retriable condition. These now show as a skip with a clear "update via the publisher's own updater" reason instead of a failure.
 - **v12.8** — First end-to-end test of `-OutputJson` and `-Parallel` since their v12.5 introduction. Fix: `-OutputJson` listed all 26 categories (most empty arrays) instead of just the ones with actual content — now only non-empty categories appear. Chore: `Start-ParallelPrefetch`'s `-Only` check now reuses `Test-SectionWanted` instead of a separate copy of the same logic.

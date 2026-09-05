@@ -170,7 +170,7 @@
 .NOTES
     Author: Your Name
     Date: 2026-09-05
-    Version: 12.10
+    Version: 12.11
 #>
 
 [CmdletBinding()]
@@ -270,6 +270,14 @@ param(
     [string]$NotifyOn = 'Failure'
 )
 
+# -Help/-h/-? exits immediately, before the lock/network/self-update/elevation-pre-check
+# machinery below — none of that should run (or risk triggering a UAC prompt) just to print
+# the help text.
+if ($Help) {
+    Get-Help $MyInvocation.MyCommand.Path -Full
+    exit 0
+}
+
 # ── Configurable constants ─────────────────────────────────────────────────
 $script:TexLiveTimeoutSec  = 1800   # max seconds to wait for tlmgr (30 min)
 $script:TexLiveLogAgeMins  = 10     # minutes back to scan for TeX Live log files
@@ -316,7 +324,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.10'
+$script:VersionString  = '12.11'
 $script:OnlyFilter     = $Only
 $script:parallelJobs   = @{}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
@@ -1691,13 +1699,6 @@ if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -o
 
 if ((Get-Location).Path -ne $ScriptPath) {
     Set-Location $ScriptPath
-}
-
-# If -Help, -h, or -? is used, show the help for this script and exit.
-if ($Help) {
-    # Use the built-in Get-Help command to display the comment-based help block from the top of this script.
-    Get-Help $MyInvocation.MyCommand.Path -Full
-    exit 0
 }
 
 
