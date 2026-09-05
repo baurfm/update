@@ -20,7 +20,7 @@ jobs:
     name: Parse check (PS5.1 + PS7)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Parse with Windows PowerShell 5.1
         shell: powershell
@@ -52,7 +52,7 @@ jobs:
     name: PSScriptAnalyzer
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Run PSScriptAnalyzer (fail on Error severity only)
         shell: pwsh
@@ -74,7 +74,7 @@ jobs:
     name: Pester tests
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Run Pester
         shell: pwsh
