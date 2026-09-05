@@ -170,7 +170,7 @@
 .NOTES
     Author: Your Name
     Date: 2026-09-05
-    Version: 12.8
+    Version: 12.9
 #>
 
 [CmdletBinding()]
@@ -316,7 +316,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.8'
+$script:VersionString  = '12.9'
 $script:OnlyFilter     = $Only
 $script:parallelJobs   = @{}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
@@ -1901,14 +1901,27 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
         Write-Log "Winget: explicit-targeting packages: $($explicitTargetIds -join ', ')" -Level "INFO"
         foreach ($id in $explicitTargetIds) {
             Write-Status "Upgrading $id (explicit targeting)..." -Type Action
-            & winget upgrade --id $id --accept-source-agreements --accept-package-agreements
-            if ($LASTEXITCODE -eq 0) {
+            # Captured (not direct passthrough) so we can tell "publisher doesn't support a
+            # winget-driven upgrade at all" apart from a real, retriable failure — still echoed
+            # so the outcome is visible without needing -Verbose.
+            $explicitOut  = & winget upgrade --id $id --accept-source-agreements --accept-package-agreements 2>&1
+            $explicitCode = $LASTEXITCODE
+            $explicitOut | ForEach-Object { Write-Host $_ }
+            if ($explicitCode -eq 0) {
                 Write-Status "$id successfully updated" -Type Success
                 $updatedItems["Winget"] += $id
+            } elseif (($explicitOut | Out-String) -match 'cannot be upgraded using WinGet') {
+                # Some publishers ship a winget manifest with no working upgrade mechanism at all
+                # (e.g. Android Studio's own self-updater) — winget says so explicitly. Retrying
+                # this every run would just repeat the same permanent failure, so treat it as a
+                # skip with a clear reason instead of a "failed" that implies retrying could help.
+                Write-Status "$id has no winget-compatible upgrade path — update via the publisher's own updater" -Type Skip
+                Write-Log "Winget: $id has no winget upgrade path (publisher-managed)." -Level "INFO"
+                $script:skippedSections += "$id (no winget upgrade path — use publisher's updater)"
             } else {
-                Write-Status "$id explicit-targeting upgrade failed (exit $LASTEXITCODE)" -Type Warning
-                Write-Log "Winget: explicit-targeting upgrade of $id exited $LASTEXITCODE" -Level "INFO"
-                $failedItems["Winget"] += "$id (explicit targeting, exit $LASTEXITCODE)"
+                Write-Status "$id explicit-targeting upgrade failed (exit $explicitCode)" -Type Warning
+                Write-Log "Winget: explicit-targeting upgrade of $id exited $explicitCode" -Level "INFO"
+                $failedItems["Winget"] += "$id (explicit targeting, exit $explicitCode)"
             }
         }
       }
