@@ -17,6 +17,15 @@ private.*
 logs/
 update.log
 
+# Runtime-generated shim (created by Initialize-UpdateCommand on first run — never hand-authored)
+update.cmd
+
+# Claude Code local settings (personal, machine-specific)
+.claude/settings.local.json
+
+# Stray debug/test output
+testout.txt
+
 # Common PowerShell module folders
 /Modules/*
 !/Modules/README.md

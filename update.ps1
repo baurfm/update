@@ -170,7 +170,7 @@
 .NOTES
     Author: Your Name
     Date: 2026-09-05
-    Version: 12.12
+    Version: 12.13
 #>
 
 [CmdletBinding()]
@@ -324,7 +324,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.12'
+$script:VersionString  = '12.13'
 $script:OnlyFilter     = $Only
 $script:parallelJobs   = @{}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
@@ -1678,7 +1678,7 @@ if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -o
             # Use the new Windows 'sudo' to re-launch.
             Write-Status "Administrator privileges required — re-launching with 'sudo'..." -Type Action
             & sudo $psExe -ExecutionPolicy Bypass -File $MyInvocation.MyCommand.Definition @argArray
-            exit
+            exit $LASTEXITCODE
         } else {
             # Fallback to the traditional self-elevation method.
             Write-Status "Administrator privileges required — re-launching as administrator..." -Type Action
@@ -1697,8 +1697,17 @@ if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -o
             $newProcess = New-Object System.Diagnostics.ProcessStartInfo $psExe
             $newProcess.Arguments = "-ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Definition)`" $argStr"
             $newProcess.Verb = "runas"
-            [System.Diagnostics.Process]::Start($newProcess)
-            exit
+            try {
+                [System.Diagnostics.Process]::Start($newProcess) | Out-Null
+                exit $script:ExitOk
+            } catch {
+                # Thrown when the user cancels the UAC prompt (or elevation otherwise can't be
+                # acquired) -- without this, that's an unhandled Win32Exception with a scary
+                # stack trace instead of a clean message and the documented exit code.
+                Write-Status "Elevation failed or was cancelled: $($_.Exception.Message)" -Type Error
+                Write-Log "Elevation failed: $($_.Exception.Message)" -Level "ERROR"
+                exit $script:ExitElevationMissing
+            }
         }
     }
 }
