@@ -170,7 +170,7 @@
 .NOTES
     Author: Your Name
     Date: 2026-09-05
-    Version: 12.14
+    Version: 12.15
 #>
 
 [CmdletBinding()]
@@ -324,7 +324,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.14'
+$script:VersionString  = '12.15'
 $script:OnlyFilter     = $Only
 $script:parallelJobs   = @{}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
@@ -1886,7 +1886,7 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
         }
 
         Write-Status "Refreshing winget sources..." -Type Action
-        & winget source update
+        Invoke-NativeCapture -Command { & winget source update } -LogTag "winget source update"
         if ($LASTEXITCODE -ne 0) {
             Write-Status "winget source update failed (exit $LASTEXITCODE) — package list may be stale" -Type Warning
             Write-Log "winget source update exited $LASTEXITCODE" -Level "INFO"
@@ -1897,7 +1897,7 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
             # No retry — winget returns non-zero if ANY package fails (e.g. Office).
             # Pinned packages are excluded by default; we deliberately do not pass
             # --include-pinned so user pins are preserved.
-            & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-unknown
+            Invoke-NativeCapture -Command { & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-unknown } -LogTag "winget upgrade --all"
             $wingetUpgradeCode = $LASTEXITCODE
             # Record results AFTER the upgrade so the summary reflects what actually ran.
             $updatedItems["Winget"] += $upgradablePackages
@@ -1929,11 +1929,12 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
         foreach ($id in $explicitTargetIds) {
             Write-Status "Upgrading $id (explicit targeting)..." -Type Action
             # Captured (not direct passthrough) so we can tell "publisher doesn't support a
-            # winget-driven upgrade at all" apart from a real, retriable failure — still echoed
-            # so the outcome is visible without needing -Verbose.
+            # winget-driven upgrade at all" apart from a real, retriable failure — logged always,
+            # only echoed live with -Verbose (consistent with every other section's raw output).
             $explicitOut  = & winget upgrade --id $id --accept-source-agreements --accept-package-agreements 2>&1
             $explicitCode = $LASTEXITCODE
-            $explicitOut | ForEach-Object { Write-Host $_ }
+            $explicitOut | ForEach-Object { Write-Log "  [winget upgrade --id $id] $_" -Level "DEBUG" }
+            if ($VerbosePreference -ne 'SilentlyContinue') { $explicitOut | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray } }
             if ($explicitCode -eq 0) {
                 Write-Status "$id successfully updated" -Type Success
                 $updatedItems["Winget"] += $id
