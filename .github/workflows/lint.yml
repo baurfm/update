@@ -58,7 +58,12 @@ jobs:
         shell: pwsh
         run: |
           Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
-          $results = Invoke-ScriptAnalyzer -Path .\update.ps1, .\update.functions.ps1 -Severity Error,Warning
+          # -Path takes a single string, not an array (Invoke-ScriptAnalyzer's PSPath parameter
+          # set is the one that accepts multiple paths) -- run once per file instead.
+          $results = @(
+            Invoke-ScriptAnalyzer -Path .\update.ps1 -Severity Error,Warning
+            Invoke-ScriptAnalyzer -Path .\update.functions.ps1 -Severity Error,Warning
+          )
           $results | Format-Table -AutoSize | Out-String | Write-Host
           $errorCount = ($results | Where-Object Severity -eq 'Error').Count
           if ($errorCount -gt 0) {
