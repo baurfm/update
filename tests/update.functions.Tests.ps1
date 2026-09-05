@@ -6,6 +6,23 @@ BeforeAll {
     . (Join-Path $PSScriptRoot '..\update.functions.ps1')
 }
 
+Describe 'Build-PendingGitUpdateRecord' {
+    It 'starts skipCount at 1 and sets firstDetected on the first detection' {
+        $record = Build-PendingGitUpdateRecord -Existing $null -Blockers @('bash.exe') -Now '2026-01-01T00:00:00'
+        $record.skipCount     | Should -Be 1
+        $record.firstDetected | Should -Be '2026-01-01T00:00:00'
+        $record.lastDetected  | Should -Be '2026-01-01T00:00:00'
+        $record.blockers      | Should -Be @('bash.exe')
+    }
+    It 'increments skipCount and preserves the original firstDetected on repeat detections' {
+        $existing = [PSCustomObject]@{ firstDetected = '2026-01-01T00:00:00'; skipCount = 2 }
+        $record = Build-PendingGitUpdateRecord -Existing $existing -Blockers @('git.exe') -Now '2026-01-03T00:00:00'
+        $record.skipCount     | Should -Be 3
+        $record.firstDetected | Should -Be '2026-01-01T00:00:00'
+        $record.lastDetected  | Should -Be '2026-01-03T00:00:00'
+    }
+}
+
 Describe 'Format-Elapsed' {
     It 'formats seconds only' {
         Format-Elapsed -ts ([TimeSpan]::FromSeconds(38)) | Should -Be '38s'

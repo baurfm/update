@@ -13,6 +13,29 @@
     deliberately narrow in scope, not a step toward a full module.
 #>
 
+# Builds the JSON-serializable record for the Git.Git pending-update flag (logs/pending-git-
+# update.json): increments skipCount on repeat detections, preserves the original firstDetected
+# timestamp across runs. Pulled out of Set-PendingGitUpdate (which does the actual file I/O) so
+# this "don't lose firstDetected, do increment skipCount" logic is unit-testable — exactly the
+# kind of small stateful-looking-but-actually-pure logic that's easy to get subtly wrong (e.g.
+# resetting firstDetected on every run, which would make skipCount duration tracking useless).
+function Build-PendingGitUpdateRecord {
+    param(
+        [AllowNull()] $Existing,
+        [Parameter(Mandatory)] [string[]]$Blockers,
+        [Parameter(Mandatory)] [string]$Now
+    )
+    $firstSeen = if ($Existing -and $Existing.firstDetected) { $Existing.firstDetected } else { $Now }
+    $count     = if ($Existing -and $Existing.skipCount)     { [int]$Existing.skipCount + 1 } else { 1 }
+    return [ordered]@{
+        package       = 'Git.Git'
+        firstDetected = $firstSeen
+        lastDetected  = $Now
+        skipCount     = $count
+        blockers      = $Blockers
+    }
+}
+
 # Helper: format a TimeSpan as "4m 12s" / "38s" / "1h 2m"
 function Format-Elapsed {
     param([TimeSpan]$ts)

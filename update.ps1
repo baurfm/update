@@ -170,7 +170,7 @@
 .NOTES
     Author: Your Name
     Date: 2026-09-05
-    Version: 12.16
+    Version: 12.17
 #>
 
 [CmdletBinding()]
@@ -330,7 +330,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.16'
+$script:VersionString  = '12.17'
 $script:OnlyFilter     = $Only
 $script:parallelJobs   = @{}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
@@ -764,17 +764,7 @@ function Set-PendingGitUpdate {
     param(
         [Parameter(Mandatory)] [string[]]$Blockers
     )
-    $existing  = Get-PendingGitUpdate
-    $now       = (Get-Date).ToString('s')
-    $firstSeen = if ($existing -and $existing.firstDetected) { $existing.firstDetected } else { $now }
-    $count     = if ($existing -and $existing.skipCount)     { [int]$existing.skipCount + 1 } else { 1 }
-    $data = [ordered]@{
-        package       = 'Git.Git'
-        firstDetected = $firstSeen
-        lastDetected  = $now
-        skipCount     = $count
-        blockers      = $Blockers
-    }
+    $data = Build-PendingGitUpdateRecord -Existing (Get-PendingGitUpdate) -Blockers $Blockers -Now (Get-Date).ToString('s')
     try {
         $data | ConvertTo-Json -Depth 3 | Set-Content -Path $script:PendingGitUpdateFlag -Encoding UTF8 -ErrorAction Stop
     } catch {

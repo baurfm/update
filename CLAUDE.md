@@ -6,7 +6,7 @@ Projekt-spezifische Anweisungen für Claude Code. Ergänzt die globale Konfigura
 
 Zwei Dateien, kein Build:
 - `update.ps1` — die komplette Update-Orchestrierung (alle Tool-Sektionen, Terminal-Output, Lock/Elevation/Notifications/Scheduling). Läuft weiterhin als einzelnes ausführbares Skript.
-- `update.functions.ps1` — reine, seiteneffektfreie Helper (Winget-Output-Parser, Format-Helper, `-Only`-Matching). Wird von `update.ps1` per Dot-Source geladen (`. (Join-Path $PSScriptRoot 'update.functions.ps1')`), existiert **nur** damit Pester-Tests diese Funktionen isoliert laden können, ohne den ganzen Update-Lauf auszulösen.
+- `update.functions.ps1` — reine, seiteneffektfreie Helper (Winget-Output-Parser, Format-Helper, `-Only`-Matching, Pending-Git-Update-Record-Aufbau). Wird von `update.ps1` per Dot-Source geladen (`. (Join-Path $PSScriptRoot 'update.functions.ps1')`), existiert **nur** damit Pester-Tests diese Funktionen isoliert laden können, ohne den ganzen Update-Lauf auszulösen.
 
 **Kein volles PowerShell-Modul** (kein `.psm1`/`.psd1`, kein Export-Modelling) — bewusst kleine, gezielte Trennung, keine Modularisierung des restlichen Skripts. Neue reine Logik-Funktionen (keine Seiteneffekte, keine Abhängigkeit von `$updatedItems`/`$failedItems`/Terminal-Output) gehören nach `update.functions.ps1`; alles mit Seiteneffekten bleibt in `update.ps1`.
 
