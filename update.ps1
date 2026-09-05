@@ -170,7 +170,7 @@
 .NOTES
     Author: Your Name
     Date: 2026-09-05
-    Version: 12.7
+    Version: 12.8
 #>
 
 [CmdletBinding()]
@@ -316,7 +316,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.7'
+$script:VersionString  = '12.8'
 $script:OnlyFilter     = $Only
 $script:parallelJobs   = @{}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
@@ -697,7 +697,7 @@ function Start-ParallelPrefetch {
     }
     foreach ($key in $specs.Keys) {
         $spec = $specs[$key]
-        if ($spec.Skip -or ($script:OnlyFilter -and $script:OnlyFilter.Count -gt 0 -and -not ($script:OnlyFilter | Where-Object { $key -like "*$_*" }))) { continue }
+        if ($spec.Skip -or -not (Test-SectionWanted -Name $key)) { continue }
         if (-not (Get-Command $spec.Tool -ErrorAction SilentlyContinue)) { continue }
         $cmdText = $spec.Cmd.ToString()
         $script:parallelJobs[$key] = Start-Job -Name "prefetch-$key" -ScriptBlock {
@@ -2777,6 +2777,13 @@ Send-UpdateNotifications -HasFailures $hasFailures -Summary $summaryHash
 
 # --- Machine-readable JSON summary (-OutputJson) ---
 if ($OutputJson) {
+    # Only non-empty categories — a JSON consumer shouldn't have to filter out 20+ empty arrays
+    # for sections that either weren't touched (-Only) or had nothing to do.
+    $jsonUpdated = @{}
+    foreach ($key in $updatedItems.Keys) { if ($updatedItems[$key].Count -gt 0) { $jsonUpdated[$key] = $updatedItems[$key] } }
+    $jsonFailed = @{}
+    foreach ($key in $failedItems.Keys)  { if ($failedItems[$key].Count -gt 0)  { $jsonFailed[$key]  = $failedItems[$key] } }
+
     $jsonReport = [ordered]@{
         version         = $script:VersionString
         startTime       = $scriptStartTime.ToString('o')
@@ -2787,8 +2794,8 @@ if ($OutputJson) {
         categoriesSkipped = $skippedCount
         itemsUpdated      = $totalUpdatedItems
         itemsFailed       = $totalFailedItems
-        updated  = $updatedItems
-        failed   = $failedItems
+        updated  = $jsonUpdated
+        failed   = $jsonFailed
         skipped  = $skippedSections
     }
     try {
