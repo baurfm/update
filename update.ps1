@@ -170,7 +170,7 @@
 .NOTES
     Author: Your Name
     Date: 2026-09-05
-    Version: 12.17
+    Version: 12.18
 #>
 
 [CmdletBinding()]
@@ -330,7 +330,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.17'
+$script:VersionString  = '12.18'
 $script:OnlyFilter     = $Only
 $script:parallelJobs   = @{}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
@@ -521,17 +521,23 @@ function Update-Section {
 # straight to the console: always fully logged, but only echoed live to the terminal in the
 # default tier when -Verbose is on. Sets $LASTEXITCODE as usual (reflects the last native exe
 # run inside $Command, unaffected by capturing its output into a variable).
+# -EchoOnFailure: also echo (regardless of -Verbose) if the command's own exit code is non-zero —
+# quiet-by-default only makes sense for successful runs; a failure is exactly when the user needs
+# to see what happened without re-running the whole thing with -Verbose. Callers pass this only
+# for a command's FINAL attempt (retries in between stay silent-unless-verbose, to avoid noise).
 function Invoke-NativeCapture {
     param(
         [Parameter(Mandatory)] [scriptblock]$Command,
-        [Parameter(Mandatory)] [string]$LogTag
+        [Parameter(Mandatory)] [string]$LogTag,
+        [switch]$EchoOnFailure
     )
     # *>&1 (not 2>&1): PowerShell-based tools like scoop write via Write-Host, which lands on the
     # Information stream — 2>&1 only merges stderr and would let that chatter leak through anyway.
-    $out = & $Command *>&1
+    $out    = & $Command *>&1
+    $failed = ($LASTEXITCODE -ne 0)
     if ($out) {
         $out | ForEach-Object { Write-Log "  [$LogTag] $_" -Level "DEBUG" }
-        if ($VerbosePreference -ne 'SilentlyContinue') {
+        if ($VerbosePreference -ne 'SilentlyContinue' -or ($EchoOnFailure -and $failed)) {
             $out | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
         }
     }
@@ -563,19 +569,28 @@ function Invoke-WithRetry {
             if ($TimeoutSec -gt 0) {
                 $r = Invoke-WithTimeout -Action $Action -TimeoutSec $TimeoutSec
                 if ($r.Output) { $r.Output | ForEach-Object { Write-Log "  [$ActionName] $_" -Level "DEBUG" } }
+                # Same "quiet unless it's the final, real failure" rule as the non-timeout branch.
+                $isFinalAttempt = ($attempt -eq $maxAttempts)
+                if ($r.ExitCode -eq 0 -and -not $r.TimedOut -and -not $r.Error) {
+                    Write-Log "$ActionName succeeded." -Level "INFO"
+                    return $true
+                }
+                if ($isFinalAttempt -and $r.Output -and $VerbosePreference -eq 'SilentlyContinue') {
+                    $r.Output | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
+                }
                 if ($r.TimedOut) {
                     Write-Status "$ActionName timed out after ${TimeoutSec}s" -Type Warning
                     Write-Log "$ActionName timed out after ${TimeoutSec}s (attempt $attempt)" -Level "INFO"
                 } elseif ($r.Error) {
                     Write-Log "$ActionName threw (attempt $attempt): $($r.Error)" -Level "WARN"
-                } elseif ($r.ExitCode -eq 0) {
-                    Write-Log "$ActionName succeeded." -Level "INFO"
-                    return $true
                 } else {
                     Write-Log "$ActionName failed with exit code $($r.ExitCode) (attempt $attempt)" -Level "WARN"
                 }
             } else {
-                Invoke-NativeCapture -Command $Action -LogTag $ActionName
+                # Echo raw output only on the FINAL attempt if it fails — retries in between are
+                # expected/silent-unless-verbose, but the terminal failure is exactly when the
+                # user needs to see what happened without re-running with -Verbose.
+                Invoke-NativeCapture -Command $Action -LogTag $ActionName -EchoOnFailure:($attempt -eq $maxAttempts)
                 if ($LASTEXITCODE -eq 0) {
                     Write-Log "$ActionName succeeded." -Level "INFO"
                     return $true
@@ -837,6 +852,31 @@ function Write-TexLiveLog {
 
 # Runs 'tlmgr update --self --all' in a background job with a 30-minute timeout.
 # Returns [PSCustomObject]@{ Lines=[string[]]; ExitCode=[int] }  (ExitCode -2 = timed out)
+# Waits for a background job, printing a periodic "still running" heartbeat so long, silent
+# operations (TeX Live's 30-min tlmgr run, a -CmdTimeoutSec-wrapped command) don't look frozen in
+# the terminal — without this, nothing prints between a section's header and its "Done"/"Failed"
+# line for however long the job takes, which reads as a hang even when it's working fine.
+function Wait-JobWithHeartbeat {
+    param(
+        [Parameter(Mandatory)] $Job,
+        [Parameter(Mandatory)] [int]$TimeoutSec,
+        [int]$HeartbeatSec = 30,
+        [string]$Label = 'still running'
+    )
+    $elapsed = 0
+    while ($true) {
+        $step = [Math]::Min($HeartbeatSec, $TimeoutSec - $elapsed)
+        if ($step -le 0) { return $null }
+        $done = $Job | Wait-Job -Timeout $step
+        if ($done) { return $done }
+        $elapsed += $step
+        if ($elapsed -ge $TimeoutSec) { return $null }
+        if (-not $script:QuietMode) {
+            Write-Host "      $([char]0x2026)  $Label ($(Format-Elapsed ([TimeSpan]::FromSeconds($elapsed))) elapsed)" -ForegroundColor DarkGray
+        }
+    }
+}
+
 function Invoke-TlMgrUpdate {
     param([int]$TimeoutSeconds = $script:TexLiveTimeoutSec)
     $envPath = $env:PATH
@@ -845,7 +885,7 @@ function Invoke-TlMgrUpdate {
         $out = tlmgr update --self --all 2>&1
         [PSCustomObject]@{ Lines = $out; ExitCode = $LASTEXITCODE }
     }
-    $completed = $job | Wait-Job -Timeout $TimeoutSeconds
+    $completed = Wait-JobWithHeartbeat -Job $job -TimeoutSec $TimeoutSeconds -Label 'tlmgr still running'
     if ($null -eq $completed) {
         $job | Stop-Job
         $job | Remove-Job -Force
@@ -1020,7 +1060,7 @@ function Invoke-WithTimeout {
             [PSCustomObject]@{ ExitCode = -1; Output = $null; Error = $_.Exception.Message }
         }
     }
-    $done = $job | Wait-Job -Timeout $TimeoutSec
+    $done = Wait-JobWithHeartbeat -Job $job -TimeoutSec $TimeoutSec
     if ($null -eq $done) {
         $job | Stop-Job -ErrorAction SilentlyContinue
         $job | Remove-Job -Force -ErrorAction SilentlyContinue
@@ -1644,14 +1684,14 @@ Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPacka
         Write-Status "Updating all installed packages..." -Type Action
         # No retry — scoop returns non-zero if ANY package fails.
         # Retrying would re-run ALL updates unnecessarily.
-        Invoke-NativeCapture -Command { & scoop update * } -LogTag "scoop update *"
+        Invoke-NativeCapture -Command { & scoop update * } -LogTag "scoop update *" -EchoOnFailure
         if ($LASTEXITCODE -ne 0) {
             Write-Status "Some packages may have failed (exit code $LASTEXITCODE)" -Type Warning
             Write-Log "scoop update * exited with code $LASTEXITCODE" -Level "INFO"
         }
 
         Write-Status "Removing old package versions..." -Type Action
-        Invoke-NativeCapture -Command { & scoop cleanup * } -LogTag "scoop cleanup *"
+        Invoke-NativeCapture -Command { & scoop cleanup * } -LogTag "scoop cleanup *" -EchoOnFailure
         if ($LASTEXITCODE -ne 0) {
             Write-Status "scoop cleanup failed (exit $LASTEXITCODE)" -Type Warning
             $failedItems["Scoop"] += "scoop cleanup (Exit Code: $LASTEXITCODE)"
@@ -1745,7 +1785,7 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
         }
 
         Write-Status "Refreshing winget sources..." -Type Action
-        Invoke-NativeCapture -Command { & winget source update } -LogTag "winget source update"
+        Invoke-NativeCapture -Command { & winget source update } -LogTag "winget source update" -EchoOnFailure
         if ($LASTEXITCODE -ne 0) {
             Write-Status "winget source update failed (exit $LASTEXITCODE) — package list may be stale" -Type Warning
             Write-Log "winget source update exited $LASTEXITCODE" -Level "INFO"
@@ -1756,7 +1796,7 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
             # No retry — winget returns non-zero if ANY package fails (e.g. Office).
             # Pinned packages are excluded by default; we deliberately do not pass
             # --include-pinned so user pins are preserved.
-            Invoke-NativeCapture -Command { & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-unknown } -LogTag "winget upgrade --all"
+            Invoke-NativeCapture -Command { & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-unknown } -LogTag "winget upgrade --all" -EchoOnFailure
             $wingetUpgradeCode = $LASTEXITCODE
             # Record results AFTER the upgrade so the summary reflects what actually ran.
             $updatedItems["Winget"] += $upgradablePackages
@@ -1793,11 +1833,16 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
             $explicitOut  = & winget upgrade --id $id --accept-source-agreements --accept-package-agreements 2>&1
             $explicitCode = $LASTEXITCODE
             $explicitOut | ForEach-Object { Write-Log "  [winget upgrade --id $id] $_" -Level "DEBUG" }
-            if ($VerbosePreference -ne 'SilentlyContinue') { $explicitOut | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray } }
+            $explicitIsSkip = ($explicitCode -ne 0) -and (($explicitOut | Out-String) -match 'cannot be upgraded using WinGet')
+            # Echo raw output live when: -Verbose is on, or it's a genuine failure (not the
+            # identified "no winget upgrade path" skip case, which already gets a clear message).
+            if ($VerbosePreference -ne 'SilentlyContinue' -or ($explicitCode -ne 0 -and -not $explicitIsSkip)) {
+                $explicitOut | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
+            }
             if ($explicitCode -eq 0) {
                 Write-Status "$id successfully updated" -Type Success
                 $updatedItems["Winget"] += $id
-            } elseif (($explicitOut | Out-String) -match 'cannot be upgraded using WinGet') {
+            } elseif ($explicitIsSkip) {
                 # Some publishers ship a winget manifest with no working upgrade mechanism at all
                 # (e.g. Android Studio's own self-updater) — winget says so explicitly. Retrying
                 # this every run would just repeat the same permanent failure, so treat it as a
@@ -2615,9 +2660,10 @@ $skippedCount = $skippedSections.Count
 # Closing card — bookends the startup banner with the same rounded-box style.
 Write-Host ""
 if ($hasFailures) {
-    Write-ResultBox -BorderColor Red -LineColors @('Red', 'Gray') -Lines @(
+    Write-ResultBox -BorderColor Red -LineColors @('Red', 'Gray', 'DarkGray') -Lines @(
         "$([char]0x2717)  Completed with failures  $([char]0x00B7)  $(Format-Elapsed $totalElapsed)"
         "$updatedCount updated ($totalUpdatedItems items)  $([char]0x00B7)  $failedCount failed ($totalFailedItems items)  $([char]0x00B7)  $skippedCount skipped"
+        "Details: $LogFile"
     )
 } else {
     Write-ResultBox -BorderColor Green -LineColors @('Green', 'Gray') -Lines @(
