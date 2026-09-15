@@ -170,7 +170,7 @@
 .NOTES
     Author: Your Name
     Date: 2026-09-05
-    Version: 12.18
+    Version: 12.19
 #>
 
 [CmdletBinding()]
@@ -1784,6 +1784,33 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
             }
         }
 
+        # Windows Terminal-Schutz: winget upgraded Microsoft.IntelligentTerminal (Windows Terminal)
+        # in-place, was den ConPTY-Host des Fensters killt — inkl. dieser pwsh-Session, wenn wir
+        # selbst innerhalb von Windows Terminal laufen. Der Lauf bricht dann kommentarlos mitten im
+        # Winget-Abschnitt ab, noch bevor die Upgrade-Liste überhaupt vollständig abgearbeitet ist
+        # (siehe Vorfall 2026-09-15). Aus einer anderen Konsole (klassisches powershell.exe/cmd.exe,
+        # kein WT_SESSION) ist das Update ungefährlich und wird nicht geskippt.
+        $terminalPinAddedByUs = $false
+        if ($upgradablePackages -contains 'Microsoft.IntelligentTerminal' -and $env:WT_SESSION) {
+            $pinList = (& winget pin list --id Microsoft.IntelligentTerminal 2>$null | Out-String)
+            $alreadyPinned = $pinList -match '(?im)^\s*Microsoft\.IntelligentTerminal\b'
+            if (-not $alreadyPinned) {
+                Write-Status "Windows Terminal update would kill this session (running inside Windows Terminal) — pinning temporarily" -Type Warning
+                Write-Log "Winget: pinning Microsoft.IntelligentTerminal — WT_SESSION set, self-upgrade would kill the host console." -Level "INFO"
+                & winget pin add --id Microsoft.IntelligentTerminal --gated --accept-source-agreements 2>&1 |
+                    ForEach-Object { Write-Log "  [winget-pin] $_" -Level "DEBUG" }
+                if ($LASTEXITCODE -eq 0) {
+                    $terminalPinAddedByUs = $true
+                } else {
+                    Write-Status "winget pin add for Microsoft.IntelligentTerminal failed (exit $LASTEXITCODE) — proceeding anyway, this session may die mid-run" -Type Warning
+                }
+            } else {
+                Write-Log "Winget: Microsoft.IntelligentTerminal already pinned by user — leaving as-is." -Level "INFO"
+            }
+            $script:skippedSections += "Microsoft.IntelligentTerminal (skipped — run from outside Windows Terminal, e.g. classic powershell.exe/cmd.exe, to update it)"
+            $upgradablePackages = @($upgradablePackages | Where-Object { $_ -ne 'Microsoft.IntelligentTerminal' })
+        }
+
         Write-Status "Refreshing winget sources..." -Type Action
         Invoke-NativeCapture -Command { & winget source update } -LogTag "winget source update" -EchoOnFailure
         if ($LASTEXITCODE -ne 0) {
@@ -1816,6 +1843,15 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
                     ForEach-Object { Write-Log "  [winget-unpin] $_" -Level "DEBUG" }
                 if ($LASTEXITCODE -ne 0) {
                     Write-Status "winget pin remove for Git.Git failed (exit $LASTEXITCODE) — run 'winget pin remove --id Git.Git' manually" -Type Warning
+                    Write-Log "Winget: pin remove failed exit $LASTEXITCODE — manual cleanup needed" -Level "INFO"
+                }
+            }
+            if ($terminalPinAddedByUs) {
+                Write-Log "Winget: removing temporary Microsoft.IntelligentTerminal pin." -Level "INFO"
+                & winget pin remove --id Microsoft.IntelligentTerminal 2>&1 |
+                    ForEach-Object { Write-Log "  [winget-unpin] $_" -Level "DEBUG" }
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Status "winget pin remove for Microsoft.IntelligentTerminal failed (exit $LASTEXITCODE) — run 'winget pin remove --id Microsoft.IntelligentTerminal' manually" -Type Warning
                     Write-Log "Winget: pin remove failed exit $LASTEXITCODE — manual cleanup needed" -Level "INFO"
                 }
             }
