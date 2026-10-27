@@ -95,6 +95,10 @@
     Register the script as a Scheduled Task running with highest privileges, then exit.
     Combine with -ScheduleTime and -ScheduleFrequency. Re-running replaces the existing task.
 
+.PARAMETER Schedule
+    Toggle the Scheduled Task, then exit. On: register it (or re-enable a disabled one).
+    Off: disable it, keeping its configuration. Status: show state, last and next run.
+
 .PARAMETER UnregisterSchedule
     Remove the Scheduled Task registered by -RegisterSchedule, then exit.
 
@@ -170,7 +174,7 @@
 .NOTES
     Author: baurfm
     Date: 2026-10-27
-    Version: 12.23
+    Version: 12.24
 #>
 
 [CmdletBinding()]
@@ -243,6 +247,9 @@ param(
     [switch]$UnregisterSchedule,
     [Parameter(HelpMessage = "Time of day for the Scheduled Task in HH:mm 24h format. Default: 03:00.")]
     [string]$ScheduleTime = '03:00',
+    [Parameter(HelpMessage = "Toggle the Scheduled Task: On (register or re-enable), Off (disable, keeps config), Status. Then exit.")]
+    [ValidateSet('On','Off','Status')]
+    [string]$Schedule,
     [Parameter(HelpMessage = "Scheduled-Task frequency.")]
     [ValidateSet('Daily','Weekly')]
     [string]$ScheduleFrequency = 'Daily',
@@ -334,7 +341,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.23'
+$script:VersionString  = '12.24'
 $script:OnlyFilter     = ConvertTo-OnlyFilter -Only $Only
 $script:parallelJobs   = @{}
 $script:prefetchVersions = @{}
@@ -1264,6 +1271,71 @@ function Unregister-UpdateScheduledTask {
     }
 }
 
+# -Schedule On|Off|Status: switch the nightly run on/off without losing its configuration
+# (Off disables, it doesn't delete — -UnregisterSchedule still removes it entirely).
+function Set-UpdateScheduleState {
+    param(
+        [Parameter(Mandatory)] [ValidateSet('On','Off','Status')] [string]$State,
+        [Parameter(Mandatory)] [string]$ScriptPath,
+        [Parameter(Mandatory)] [string]$AtTime,
+        [Parameter(Mandatory)] [string]$Frequency
+    )
+    $task = Get-ScheduledTask -TaskName $script:ScheduledTaskName -ErrorAction SilentlyContinue
+
+    if ($State -eq 'Status') {
+        if (-not $task) {
+            Write-Status "Scheduled Task '$($script:ScheduledTaskName)': not registered (enable with -Schedule On)" -Type Skip
+            return $true
+        }
+        $info = $task | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
+        $type = if ($task.State -eq 'Disabled') { 'Warning' } else { 'Success' }
+        Write-Status "Scheduled Task '$($script:ScheduledTaskName)': $($task.State) — runs as $($task.Principal.UserId)" -Type $type
+        if ($info) {
+            $last = if ($info.LastRunTime -and $info.LastRunTime.Year -gt 2000) { "$($info.LastRunTime) (result $($info.LastTaskResult))" } else { 'never' }
+            $next = if ($task.State -ne 'Disabled' -and $info.NextRunTime) { "$($info.NextRunTime)" } else { '—' }
+            Write-Status "  Last run: $last   Next run: $next" -Type Success
+        }
+        return $true
+    }
+
+    if (-not $script:isAdmin) {
+        Write-Status "-Schedule $State requires admin — re-run in an elevated shell." -Type Error
+        return $false
+    }
+
+    if ($State -eq 'On') {
+        if (-not $task) {
+            return (Register-UpdateScheduledTask -ScriptPath $ScriptPath -AtTime $AtTime -Frequency $Frequency)
+        }
+        try {
+            Enable-ScheduledTask -TaskName $script:ScheduledTaskName -ErrorAction Stop | Out-Null
+            Write-Status "Scheduled Task '$($script:ScheduledTaskName)' enabled" -Type Success
+            Write-Log "Scheduled Task enabled: $($script:ScheduledTaskName)" -Level "INFO"
+            return $true
+        } catch {
+            Write-Status "Enabling Scheduled Task failed: $($_.Exception.Message)" -Type Error
+            Write-Log "Scheduled Task enable failed: $($_.Exception.Message)" -Level "INFO"
+            return $false
+        }
+    }
+
+    # Off
+    if (-not $task) {
+        Write-Status "Scheduled Task '$($script:ScheduledTaskName)' is not registered — nothing to disable" -Type Skip
+        return $true
+    }
+    try {
+        Disable-ScheduledTask -TaskName $script:ScheduledTaskName -ErrorAction Stop | Out-Null
+        Write-Status "Scheduled Task '$($script:ScheduledTaskName)' disabled (re-enable with -Schedule On, delete with -UnregisterSchedule)" -Type Success
+        Write-Log "Scheduled Task disabled: $($script:ScheduledTaskName)" -Level "INFO"
+        return $true
+    } catch {
+        Write-Status "Disabling Scheduled Task failed: $($_.Exception.Message)" -Type Error
+        Write-Log "Scheduled Task disable failed: $($_.Exception.Message)" -Level "INFO"
+        return $false
+    }
+}
+
 # Detect pending reboot via the canonical set of Windows registry/WMI signals used by
 # Windows Update / Component Based Servicing. No reboot-is-pending key has an authoritative
 # name, so we OR a handful of well-known ones.
@@ -1465,6 +1537,12 @@ $script:isAdmin     = $myWindowsPrincipal.IsInRole($adminRole)
 if ($UnregisterSchedule) {
     $unregisterOk = Unregister-UpdateScheduledTask
     exit $(if ($unregisterOk) { $script:ExitOk } else { $script:ExitHardFailure })
+}
+
+# --- Handle -Schedule On|Off|Status: toggle/inspect the Scheduled Task and exit ---
+if ($Schedule) {
+    $scheduleOk = Set-UpdateScheduleState -State $Schedule -ScriptPath $PSCommandPath -AtTime $ScheduleTime -Frequency $ScheduleFrequency
+    exit $(if ($scheduleOk) { $script:ExitOk } else { $script:ExitHardFailure })
 }
 
 # --- Handle -RegisterSchedule: install Scheduled Task and exit ---
