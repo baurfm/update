@@ -111,6 +111,7 @@ $script:NoOpPatterns = @(
     'No packages upgraded'                                 # pipx upgrade-all
     'upgraded 0/'                                          # choco upgrade all ("Chocolatey upgraded 0/12 packages")
     'Latest version already installed'                    # gem update --system
+    '0 upgraded, 0 newly installed, 0 to remove'          # apt-get full-upgrade (WSL)
 )
 function Test-NoOpOutput {
     param([AllowNull()] [AllowEmptyCollection()] [object[]]$Output)

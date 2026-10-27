@@ -78,6 +78,25 @@ Sections are organised into logical groups in the order they run:
 |----------|---------------|--------------|
 | **TeX Live** | All TeX packages (background job with 30-min timeout, auto cross-release upgrade) | `tlmgr update --self --all` |
 
+## Cache cleanup after each run
+
+Only caches whose content is useless once the update is done — never caches that would make
+your next build or install slow.
+
+| Section | What's cleared | Command |
+|---------|----------------|---------|
+| Scoop | Downloaded installers | `scoop cache rm --all` |
+| Winget | Downloaded installers in `%TEMP%\WinGet` | (files deleted directly) |
+| Windows Update | Delivery Optimization download cache (elevated runs only) | `Delete-DeliveryOptimizationCache -Force` |
+| WSL | Downloaded `.deb` files | `apt-get clean` |
+| npm | Unreferenced cache data only | `npm cache verify` |
+| uv | Cache entries no environment uses any more — skipped while another uv process runs (prune needs the cache lock) | `uv cache prune` |
+
+Deliberately **not** cleared: Gradle caches, NuGet global packages, the full npm/uv caches
+(every later build/install would re-download everything), Docker (prune is destructive), and
+TeX Live's package backups (needed for `tlmgr restore`). A failed cleanup is a warning, never a
+failed section.
+
 ## Section notes
 
 - **Windows Update** only runs when the script is elevated anyway (winget/WSL/npm needed admin,

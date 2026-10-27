@@ -177,7 +177,7 @@
 .NOTES
     Author: baurfm
     Date: 2026-10-27
-    Version: 12.27
+    Version: 12.28
 #>
 
 [CmdletBinding()]
@@ -351,7 +351,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.27'
+$script:VersionString  = '12.28'
 $script:OnlyFilter     = ConvertTo-OnlyFilter -Only $Only
 $script:parallelJobs   = @{}
 $script:prefetchVersions = @{}
@@ -875,6 +875,21 @@ function Invoke-UpdateStep {
     Write-Status "$ActionName failed after retries" -Type Error
     $failedItems[$Key] += $FailureLabel
     return $false
+}
+
+# Helper: post-update cache cleanup. Never counts as a failed update — a cache that couldn't be
+# trimmed is worth a warning, not a red section.
+function Invoke-CacheCleanup {
+    param(
+        [Parameter(Mandatory)] [string]$Label,
+        [Parameter(Mandatory)] [scriptblock]$Command
+    )
+    Write-Status "Clearing $Label..." -Type Action
+    Invoke-NativeCapture -Command $Command -LogTag "cache: $Label" -EchoOnFailure
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "Clearing $Label failed (exit $LASTEXITCODE)" -Type Warning
+        Write-Log "Cache cleanup '$Label' exited $LASTEXITCODE" -Level "INFO"
+    }
 }
 
 # Helper: non-elevated pre-check — returns $true if winget reports any non-pinned upgradable
@@ -2038,12 +2053,7 @@ Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPacka
 
         # Downloaded installers are only needed to reinstall the exact same version — clearing them
         # every run keeps the cache from growing into gigabytes over time.
-        Write-Status "Clearing download cache..." -Type Action
-        Invoke-NativeCapture -Command { & scoop cache rm --all } -LogTag "scoop cache rm" -EchoOnFailure
-        if ($LASTEXITCODE -ne 0) {
-            Write-Status "scoop cache rm failed (exit $LASTEXITCODE)" -Type Warning
-            $failedItems["Scoop"] += "scoop cache rm (Exit Code: $LASTEXITCODE)"
-        }
+        Invoke-CacheCleanup -Label "Scoop download cache" -Command { & scoop cache rm --all }
     }
 }
 
@@ -2254,6 +2264,18 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
     } else {
         Write-Status "All packages up-to-date" -Type Success
         Write-Log "Winget: no applicable upgrades." -Level "INFO"
+    }
+
+    # winget leaves downloaded installers in %TEMP%\WinGet (0.75 GB measured) — useless once
+    # installed. Files still in use by a running installer are simply skipped.
+    $wingetTemp = Join-Path $env:TEMP 'WinGet'
+    if (Test-Path $wingetTemp) {
+        $before = (Get-ChildItem $wingetTemp -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        Get-ChildItem $wingetTemp -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        $after  = (Get-ChildItem $wingetTemp -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        $freedMB = [Math]::Round(($before - $after) / 1MB)
+        if ($freedMB -gt 0) { Write-Status "Cleared winget download cache ($freedMB MB)" -Type Success }
+        Write-Log "Winget: cleared $wingetTemp ($freedMB MB freed)." -Level "INFO"
     }
 }
 
@@ -2470,24 +2492,37 @@ Update-Section "Windows Update" ($NoWindowsUpdate -or $OnlyWsl -or $OnlyWslPacka
     if ($wuAvailable.Count -eq 0) {
         Write-Status "No Windows updates available" -Type Success
         Write-Log "Windows Update: nothing to install." -Level "INFO"
-        return
-    }
-    Write-Status "Installing $($wuAvailable.Count) Windows update(s): $(($wuAvailable | ForEach-Object { if ($_.KB) { $_.KB } else { $_.Title } }) -join ', ')" -Type Info
-    $wuAvailable | ForEach-Object { Write-Log "Windows Update: pending $($_.KB) $($_.Title)" -Level "INFO" }
-    # 6>$null: PSWindowsUpdate prints its own progress table to the information stream.
-    $wuResults = @(Install-WindowsUpdate -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction Stop 6>$null)
-    foreach ($r in $wuResults) {
-        $label = if ($r.KB) { "$($r.KB) $($r.Title)" } else { "$($r.Title)" }
-        Write-Log "Windows Update: $($r.Result) - $label" -Level "INFO"
-        if ("$($r.Result)" -match 'Fail|Abort') {
-            $failedItems["Windows Update"] += $label
-        } elseif ("$($r.Result)" -match 'Install|Download|Accept') {
-            $updatedItems["Windows Update"] += $(if ($r.KB) { $r.KB } else { $r.Title })
+    } else {
+        Write-Status "Installing $($wuAvailable.Count) Windows update(s): $(($wuAvailable | ForEach-Object { if ($_.KB) { $_.KB } else { $_.Title } }) -join ', ')" -Type Info
+        $wuAvailable | ForEach-Object { Write-Log "Windows Update: pending $($_.KB) $($_.Title)" -Level "INFO" }
+        # 6>$null: PSWindowsUpdate prints its own progress table to the information stream.
+        $wuResults = @(Install-WindowsUpdate -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction Stop 6>$null)
+        foreach ($r in $wuResults) {
+            $label = if ($r.KB) { "$($r.KB) $($r.Title)" } else { "$($r.Title)" }
+            Write-Log "Windows Update: $($r.Result) - $label" -Level "INFO"
+            if ("$($r.Result)" -match 'Fail|Abort') {
+                $failedItems["Windows Update"] += $label
+            } elseif ("$($r.Result)" -match 'Install|Download|Accept') {
+                $updatedItems["Windows Update"] += $(if ($r.KB) { $r.KB } else { $r.Title })
+            }
+        }
+        if (Get-WURebootStatus -Silent -ErrorAction SilentlyContinue) {
+            Write-Status "Windows Update requires a reboot to finish (use -AutoReboot to reboot automatically)" -Type Warning
+            Write-Log "Windows Update: reboot required." -Level "INFO"
         }
     }
-    if (Get-WURebootStatus -Silent -ErrorAction SilentlyContinue) {
-        Write-Status "Windows Update requires a reboot to finish (use -AutoReboot to reboot automatically)" -Type Warning
-        Write-Log "Windows Update: reboot required." -Level "INFO"
+
+    # Delivery Optimization keeps downloaded update/Store payloads around after installation;
+    # installed updates are already staged in the component store, so this is pure leftover.
+    # Admin-only (we are, or this section wouldn't run). Cmdlet missing on old builds → skip.
+    if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) {
+        try {
+            Delete-DeliveryOptimizationCache -Force -ErrorAction Stop
+            Write-Log "Windows Update: Delivery Optimization cache cleared." -Level "INFO"
+        } catch {
+            Write-Status "Clearing Delivery Optimization cache failed: $($_.Exception.Message)" -Type Warning
+            Write-Log "Delivery Optimization cache clear failed: $($_.Exception.Message)" -Level "INFO"
+        }
     }
 }
 
@@ -2553,18 +2588,27 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
             $aptUpdateBlock  = { & wsl.exe -u root sh -c "DEBIAN_FRONTEND=noninteractive apt-get update -q" }
             $aptUpgradeBlock = { & wsl.exe -u root sh -c "DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -q" }
             $aptRemoveBlock  = { & wsl.exe -u root sh -c "DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -q" }
+            $aptCleanBlock   = { & wsl.exe -u root sh -c "apt-get clean" }
         } else {
             $aptUpdateBlock  = { & wsl.exe sudo apt-get update }
             $aptUpgradeBlock = { & wsl.exe sudo apt-get full-upgrade -y }
             $aptRemoveBlock  = { & wsl.exe sudo apt-get autoremove -y }
+            $aptCleanBlock   = { & wsl.exe sudo apt-get clean }
         }
         if (-not (Invoke-WithRetry -Action $aptUpdateBlock -ActionName "apt-get update" -MaxRetries 2)) {
             Write-Status "apt-get update failed after retries" -Type Error
             $failedItems["WSL"] += "apt-get update failed"
         } else {
             # full-upgrade: MaxRetries 1 — can carry partial state, retry conservatively
+            $script:LastActionOutput = $null
             if (Invoke-WithRetry -Action $aptUpgradeBlock -ActionName "apt-get full-upgrade" -MaxRetries 1) {
-                $updatedItems["WSL"] += "Updated packages in default WSL distro"
+                if (Test-NoOpOutput -Output $script:LastActionOutput) {
+                    Write-Status "WSL distro packages already up-to-date" -Type Success
+                } else {
+                    $updatedItems["WSL"] += "Updated packages in default WSL distro"
+                }
+                # Downloaded .deb files are useless once installed.
+                Invoke-CacheCleanup -Label "apt package cache (WSL)" -Command $aptCleanBlock
                 $autoremoveOut = & $aptRemoveBlock 2>&1
                 $autoremoveExit = $LASTEXITCODE
                 Write-LogBlock -Lines $autoremoveOut -Prefix "  [autoremove] "
@@ -2596,6 +2640,11 @@ Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $O
     $npmOutdated = $null
     try { $npmOutdated = $outdatedNpmJson | ConvertFrom-Json -ErrorAction Stop } catch {}
     $npmToUpdate = if ($npmOutdated) { @($npmOutdated.PSObject.Properties.Name) } else { @() }
+
+    # Runs before the early returns below (the cache lives in the user profile, so it's unaffected
+    # by an unwritable global prefix). `verify` garbage-collects unreferenced data and keeps the
+    # rest — `npm cache clean --force` would only make every later install re-download.
+    Invoke-CacheCleanup -Label "npm cache (unreferenced data)" -Command { & npm cache verify }
 
     if ($npmToUpdate.Count -eq 0) {
         Write-Status "All global packages up-to-date" -Type Success
@@ -2708,6 +2757,22 @@ Update-Section "uv" ($NoUv -or $OnlyWsl -or $OnlyWslPackages) { Get-Command uv -
 
     Write-Status "Upgrading all uv tools..." -Type Action
     Invoke-UpdateStep -Key "uv" -ActionName "uv tool upgrade --all" -Action { & uv tool upgrade --all } -SuccessLabel "All uv tools" | Out-Null
+
+    # prune, not clean: drops only entries no environment uses any more — a full `uv cache clean`
+    # would make every project's next venv rebuild download everything again.
+    # Prune needs the cache lock exclusively: with any other uv process running (an editor's
+    # `uv run`, a test suite, a hook) it waited uv's full 300 s lock timeout and then failed —
+    # live run 2026-10-27. So skip it for this run instead of stalling the whole update.
+    $uvBusy = @(Get-Process -Name uv -ErrorAction SilentlyContinue).Count
+    if ($uvBusy -gt 0) {
+        Write-Status "uv cache in use by $uvBusy other uv process(es) — prune skipped this run" -Type Skip
+        Write-Log "uv: cache prune skipped, $uvBusy uv process(es) running." -Level "INFO"
+    } else {
+        # Safety net for a uv process starting right after the check: give up after 15 s.
+        $env:UV_LOCK_TIMEOUT = '15'
+        try     { Invoke-CacheCleanup -Label "uv cache (unused entries)" -Command { & uv cache prune } }
+        finally { Remove-Item Env:UV_LOCK_TIMEOUT -ErrorAction SilentlyContinue }
+    }
 }
 
 # --- Update Poetry ---
