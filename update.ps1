@@ -4,17 +4,15 @@
     It provides command-line switches to skip specific update sections.
 
 .DESCRIPTION
-    The script automates the process of updating:
-    - PowerShell Modules
-    - Scoop packages
-    - Winget packages (using the 'winget upgrade --all' command)
-    - Visual Studio Code extensions
-    - TeX Live
-    - WSL (Windows Subsystem for Linux)
+    Updates everything installed on a Windows dev machine in one run: Scoop, winget, Chocolatey,
+    PowerShell modules, Windows Update, WSL, npm/pnpm/Bun/Deno, pipx/uv/Poetry/Rye, .NET tools,
+    Rust, Ruby, Composer, Google Cloud/Azure/Android SDKs, Helm/krew plugins, VS Code and Cursor
+    extensions, GitHub CLI extensions, Claude Code and TeX Live. Tools that aren't installed are
+    skipped; admin rights are requested only when something actually needs them.
 
-    The script is designed to be flexible. You can skip any section by providing its corresponding
-    '--No<Section>' parameter when you run the script. Failed operations are automatically retried
-    up to 2 times before being marked as failed.
+    Skip a section with its -No<Section> switch (e.g. -NoTex), or run a subset with -Only.
+    Failed commands are retried up to 2 times. Full reference:
+    https://github.com/baurfm/update/tree/main/docs
 
 .PARAMETER Help
     A switch to display this detailed help message and exit. Aliases: -h, -?
@@ -179,7 +177,7 @@
 .NOTES
     Author: baurfm
     Date: 2026-10-27
-    Version: 12.25
+    Version: 12.26
 #>
 
 [CmdletBinding()]
@@ -353,7 +351,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.25'
+$script:VersionString  = '12.26'
 $script:OnlyFilter     = ConvertTo-OnlyFilter -Only $Only
 $script:parallelJobs   = @{}
 $script:prefetchVersions = @{}
@@ -646,6 +644,7 @@ function Invoke-NativeCapture {
     # Information stream — 2>&1 only merges stderr and would let that chatter leak through anyway.
     $out    = & $Command *>&1
     $failed = ($LASTEXITCODE -ne 0)
+    $script:LastActionOutput = $out   # read by Invoke-UpdateStep for "nothing to do" detection
     if ($out) {
         Write-LogBlock -Lines $out -Prefix "  [$LogTag] "
         if ($VerbosePreference -ne 'SilentlyContinue' -or ($EchoOnFailure -and $failed)) {
@@ -679,6 +678,7 @@ function Invoke-WithRetry {
         try {
             if ($TimeoutSec -gt 0) {
                 $r = Invoke-WithTimeout -Action $Action -TimeoutSec $TimeoutSec
+                $script:LastActionOutput = $r.Output
                 if ($r.Output) { Write-LogBlock -Lines $r.Output -Prefix "  [$ActionName] " }
                 # Same "quiet unless it's the final, real failure" rule as the non-timeout branch.
                 $isFinalAttempt = ($attempt -eq $maxAttempts)
@@ -862,8 +862,14 @@ function Invoke-UpdateStep {
         [int]$MaxRetries = 2
     )
     if (-not $FailureLabel) { $FailureLabel = "$ActionName (failed after retries)" }
+    $script:LastActionOutput = $null
     if (Invoke-WithRetry -Action $Action -ActionName $ActionName -MaxRetries $MaxRetries) {
-        $updatedItems[$Key] += $SuccessLabel
+        if (Test-NoOpOutput -Output $script:LastActionOutput) {
+            Write-Status "$SuccessLabel already up-to-date" -Type Success
+            Write-Log "${ActionName}: nothing to do." -Level "INFO"
+        } else {
+            $updatedItems[$Key] += $SuccessLabel
+        }
         return $true
     }
     Write-Status "$ActionName failed after retries" -Type Error
@@ -2009,7 +2015,10 @@ Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPacka
         }
 
         Write-Status "Updating Scoop itself..." -Type Action
-        Invoke-UpdateStep -Key "Scoop" -ActionName "scoop update" -Action { & scoop update } -SuccessLabel "Scoop" | Out-Null
+        # "Scoop was updated successfully!" is printed even when nothing changed — compare the
+        # core version instead (first two lines of `scoop --version`; the rest lists buckets).
+        Invoke-SelfUpdate -ToolName "Scoop" -Key "Scoop" -Action { & scoop update } -ActionName "scoop update" `
+            -VersionCommand { scoop --version *>&1 | Select-Object -First 2 }
 
         Write-Status "Updating all installed packages..." -Type Action
         # No retry — scoop returns non-zero if ANY package fails.
@@ -2736,29 +2745,29 @@ Update-Section ".NET Global Tools" ($NoDotnet -or $OnlyWsl -or $OnlyWslPackages)
     if ($PSVersionTable.PSVersion.Major -ge 7) {
         Write-Status "Updating $($toolIds.Count) tool(s) in parallel..." -Type Action
         $results = $toolIds | ForEach-Object -Parallel {
-            & dotnet tool update -g $_ 2>&1 | Out-Null
-            [PSCustomObject]@{ Id = $_; ExitCode = $LASTEXITCODE }
+            $out = & dotnet tool update -g $_ 2>&1
+            [PSCustomObject]@{ Id = $_; ExitCode = $LASTEXITCODE; Output = ($out -join ' ') }
         } -ThrottleLimit 4
-
-        foreach ($r in $results) {
-            if ($r.ExitCode -eq 0) {
-                Write-Status "Updated: $($r.Id)" -Type Info
-                $updatedItems[".NET Global Tools"] += $r.Id
-            } else {
-                Write-Status "Failed: $($r.Id)" -Type Error
-                $failedItems[".NET Global Tools"] += $r.Id
-            }
-        }
     } else {
-        foreach ($toolId in $toolIds) {
-            Write-Status "Updating: $toolId..." -Type Action
-            & dotnet tool update -g $toolId 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                $updatedItems[".NET Global Tools"] += $toolId
-            } else {
-                $failedItems[".NET Global Tools"] += $toolId
-            }
+        $results = foreach ($toolId in $toolIds) {
+            $out = & dotnet tool update -g $toolId 2>&1
+            [PSCustomObject]@{ Id = $toolId; ExitCode = $LASTEXITCODE; Output = ($out -join ' ') }
         }
+    }
+    # Only "successfully updated from version X to Y" is a real update — an unchanged tool is
+    # merely "reinstalled with the stable version" and used to be counted as updated every run.
+    foreach ($r in $results) {
+        Write-Log "  [dotnet tool update $($r.Id)] $($r.Output)" -Level "DEBUG"
+        if ($r.ExitCode -ne 0) {
+            Write-Status "Failed: $($r.Id)" -Type Error
+            $failedItems[".NET Global Tools"] += "$($r.Id) (exit $($r.ExitCode))"
+        } elseif ($r.Output -match 'successfully updated') {
+            Write-Status "Updated: $($r.Id)" -Type Info
+            $updatedItems[".NET Global Tools"] += $r.Id
+        }
+    }
+    if (-not @($updatedItems[".NET Global Tools"]).Count -and -not @($failedItems[".NET Global Tools"]).Count) {
+        Write-Status "All $(@($toolIds).Count) tool(s) already up-to-date" -Type Success
     }
 }
 
@@ -2832,7 +2841,9 @@ Update-Section "Google Cloud SDK" ($NoGCloud -or $OnlyWsl -or $OnlyWslPackages) 
         }
     }
 
-    if ($gcloudCode -eq 0 -or $gcloudText -match 'All components are up to date') {
+    if (Test-NoOpOutput -Output $gcloudOut) {
+        Write-Status "All components already up-to-date" -Type Success
+    } elseif ($gcloudCode -eq 0) {
         $updatedItems["Google Cloud SDK"] += "All components"
     } else {
         Write-Status "gcloud components update failed (exit $gcloudCode)" -Type Error
@@ -2856,13 +2867,16 @@ Update-Section "Android SDK" ($NoAndroid -or $OnlyWsl -or $OnlyWslPackages) { Ge
         return
     }
     Write-Status "Updating Android SDK components..." -Type Action
-    $sdkOut = & sdkmanager --update 2>&1
+    $sdkOut  = & sdkmanager --update 2>&1
+    $sdkCode = $LASTEXITCODE
     Write-LogBlock -Lines $sdkOut -Prefix "  [sdkmanager] "
-    if ($LASTEXITCODE -eq 0) {
+    if ($sdkCode -eq 0 -and (Test-NoOpOutput -Output $sdkOut)) {
+        Write-Status "All SDK components already up-to-date" -Type Success
+    } elseif ($sdkCode -eq 0) {
         $updatedItems["Android SDK"] += "All SDK components"
     } else {
-        Write-Status "sdkmanager --update failed (exit $LASTEXITCODE)" -Type Error
-        $failedItems["Android SDK"] += "sdkmanager --update (Exit Code: $LASTEXITCODE)"
+        Write-Status "sdkmanager --update failed (exit $sdkCode)" -Type Error
+        $failedItems["Android SDK"] += "sdkmanager --update (Exit Code: $sdkCode)"
     }
 }
 
@@ -3176,20 +3190,23 @@ if ($slowSections) {
 $updatedCount = ($updatedItems.Values | Where-Object { $_.Count -gt 0 }).Count
 $failedCount  = ($failedItems.Values  | Where-Object { $_.Count -gt 0 }).Count
 $skippedCount = $skippedSections.Count
+# For the closing box: "not installed" isn't a skip the user has to think about.
+$notInstalledCount = @($skippedSections | Where-Object { $_ -like '* (not installed)' }).Count
+$skipText = "$($skippedCount - $notInstalledCount) skipped$(if ($notInstalledCount) { " · $notInstalledCount not installed" })"
 
 # Closing card — bookends the startup banner with the same rounded-box style.
 Write-Host ""
 if ($hasFailures) {
     Write-ResultBox -BorderColor Red -LineColors @('Red', 'Gray', 'DarkGray') -Lines @(
         "$([char]0x2717)  Completed with failures  $([char]0x00B7)  $(Format-Elapsed $totalElapsed)"
-        "$updatedCount updated ($totalUpdatedItems items)  $([char]0x00B7)  $failedCount failed ($totalFailedItems items)  $([char]0x00B7)  $skippedCount skipped"
+        "$updatedCount updated ($totalUpdatedItems items)  $([char]0x00B7)  $failedCount failed ($totalFailedItems items)  $([char]0x00B7)  $skipText"
         "Details: $LogFile"
     )
 } else {
     $doneIcon = if ($script:UseEmoji) { [char]::ConvertFromUtf32(0x1F389) } else { [char]0x2713 }   # party popper
     Write-ResultBox -BorderColor Green -LineColors @('Green', 'Gray') -Lines @(
         "$doneIcon  All done  $([char]0x00B7)  $(Format-Elapsed $totalElapsed)"
-        "$updatedCount updated ($totalUpdatedItems items)  $([char]0x00B7)  $failedCount failed ($totalFailedItems items)  $([char]0x00B7)  $skippedCount skipped"
+        "$updatedCount updated ($totalUpdatedItems items)  $([char]0x00B7)  $failedCount failed ($totalFailedItems items)  $([char]0x00B7)  $skipText"
     )
 }
 Write-Host ""

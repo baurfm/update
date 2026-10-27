@@ -96,6 +96,32 @@ function Get-SelfUpdateOutcome {
     return 'Updated'
 }
 
+# True if a successful update command's output says it had nothing to do. Every phrase below was
+# taken from real tool output (live run 2026-10-27) — without this, "Python runtimes",
+# "All components", "Azure CLI + extensions" etc. were counted as updated on every single run.
+$script:NoOpPatterns = @(
+    'Nothing to upgrade'                                   # uv tool upgrade --all
+    'already on the latest supported patch release'       # uv python install --upgrade
+    'All requested versions already installed'            # uv python install --upgrade (older uv)
+    'All components are up to date'                       # gcloud components update
+    'You already have the latest azure-cli version'       # az upgrade
+    'No updates available'                                 # sdkmanager --update
+    'Latest versions for all apps are installed'          # scoop update *
+    'Versions did not change after running'               # pipx upgrade-all
+    'No packages upgraded'                                 # pipx upgrade-all
+    'upgraded 0/'                                          # choco upgrade all ("Chocolatey upgraded 0/12 packages")
+    'Latest version already installed'                    # gem update --system
+)
+function Test-NoOpOutput {
+    param([AllowNull()] [AllowEmptyCollection()] [object[]]$Output)
+    if (-not $Output) { return $false }
+    $text = ($Output | ForEach-Object { "$_" }) -join "`n"
+    foreach ($p in $script:NoOpPatterns) {
+        if ($text -match [regex]::Escape($p)) { return $true }
+    }
+    return $false
+}
+
 # Extracts extension IDs from `code --update-extensions` output. VS Code prints either
 # "No extension to update" or an "Updating extensions: a.b, c.d" line followed by one
 # "Extension 'a.b' v1.2.3 was successfully updated." line per extension.

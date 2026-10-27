@@ -136,6 +136,29 @@ Describe 'Get-SelfUpdateOutcome' {
     }
 }
 
+Describe 'Test-NoOpOutput' {
+    It 'recognizes real "nothing to do" outputs' -TestCases @(
+        @{ Out = 'Nothing to upgrade' }
+        @{ Out = 'The default Python installation is already on the latest supported patch release. Use `uv python install 3.14` to install' }
+        @{ Out = 'All components are up to date.' }
+        @{ Out = 'WARNING: You already have the latest azure-cli version: 2.91.0' }
+        @{ Out = 'No updates available' }
+        @{ Out = "Latest versions for all apps are installed! For more information try 'scoop status'" }
+        @{ Out = 'Chocolatey upgraded 0/12 packages.' }
+    ) {
+        param($Out)
+        Test-NoOpOutput -Output @('some preamble', $Out) | Should -BeTrue
+    }
+    It 'is false for output that reports real work' {
+        Test-NoOpOutput -Output @('Updated ruff v0.17.3 -> v0.17.4', 'Installed 1 executable: ruff') | Should -BeFalse
+        Test-NoOpOutput -Output @('Chocolatey upgraded 2/12 packages.') | Should -BeFalse
+    }
+    It 'is false for empty output' {
+        Test-NoOpOutput -Output $null | Should -BeFalse
+        Test-NoOpOutput -Output @() | Should -BeFalse
+    }
+}
+
 Describe 'Get-VsCodeUpdatedExtensionIds' {
     It 'returns nothing for "No extension to update"' {
         @(Get-VsCodeUpdatedExtensionIds -Output @('No extension to update')).Count | Should -Be 0
