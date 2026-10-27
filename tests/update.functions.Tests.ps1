@@ -33,6 +33,16 @@ Describe 'Format-Elapsed' {
     It 'formats hours and minutes' {
         Format-Elapsed -ts ([TimeSpan]::FromMinutes(62)) | Should -Be '1h 2m'
     }
+    It 'does not round half-minutes up (90s was shown as "2m 30s")' {
+        Format-Elapsed -ts ([TimeSpan]::FromSeconds(90))  | Should -Be '1m 30s'
+        Format-Elapsed -ts ([TimeSpan]::FromSeconds(150)) | Should -Be '2m 30s'
+    }
+    It 'does not round half-hours up' {
+        Format-Elapsed -ts ([TimeSpan]::FromMinutes(90)) | Should -Be '1h 30m'
+    }
+    It 'does not round 59.6s up to "60s"' {
+        Format-Elapsed -ts ([TimeSpan]::FromMilliseconds(59600)) | Should -Be '59s'
+    }
 }
 
 Describe 'Format-SummaryLine' {
@@ -74,6 +84,42 @@ Describe 'Test-SectionWanted / Test-GroupWanted' {
         $script:OnlyFilter = @('Azure')
         Test-GroupWanted -SectionNames @('Google Cloud SDK', 'Azure CLI', 'Android SDK') | Should -BeTrue
         Test-GroupWanted -SectionNames @('Scoop and its packages', 'Winget & Microsoft Store apps') | Should -BeFalse
+    }
+}
+
+Describe 'ConvertTo-OnlyFilter' {
+    It 'splits a single comma-joined string (how -File / the update.cmd shim passes -Only npm,uv)' {
+        ConvertTo-OnlyFilter -Only @('npm,uv') | Should -Be @('npm', 'uv')
+    }
+    It 'keeps an already-split array as-is' {
+        ConvertTo-OnlyFilter -Only @('npm', 'uv') | Should -Be @('npm', 'uv')
+    }
+    It 'trims whitespace and drops empty entries' {
+        ConvertTo-OnlyFilter -Only @(' npm , ', ',uv') | Should -Be @('npm', 'uv')
+    }
+    It 'returns an empty array for null' {
+        @(ConvertTo-OnlyFilter -Only $null).Count | Should -Be 0
+    }
+}
+
+Describe 'Test-VersionNewer' {
+    It 'detects a plain newer version' {
+        Test-VersionNewer -Installed '1.2.0' -Latest '1.10.0' | Should -BeTrue
+    }
+    It 'is false for equal versions' {
+        Test-VersionNewer -Installed '2.0.0' -Latest '2.0.0' | Should -BeFalse
+    }
+    It 'is false when the installed version is newer' {
+        Test-VersionNewer -Installed '3.1' -Latest '3.0' | Should -BeFalse
+    }
+    It 'does not throw on prerelease versions (plain [version] cast would)' {
+        Test-VersionNewer -Installed '3.0.0-preview1' -Latest '3.0.1' | Should -BeTrue
+        Test-VersionNewer -Installed '3.0.0-preview1' -Latest '3.0.0' | Should -BeTrue
+        Test-VersionNewer -Installed '3.0.0' -Latest '3.0.0-preview2' | Should -BeFalse
+    }
+    It 'falls back to string inequality for unparseable versions' {
+        Test-VersionNewer -Installed 'abc' -Latest 'abd' | Should -BeTrue
+        Test-VersionNewer -Installed 'abc' -Latest 'abc' | Should -BeFalse
     }
 }
 

@@ -6,6 +6,7 @@ on:
       - 'update.ps1'
       - 'update.functions.ps1'
       - 'tests/**'
+      - 'PSScriptAnalyzerSettings.psd1'
       - '.github/workflows/lint.yml'
   pull_request:
     paths:
@@ -61,8 +62,8 @@ jobs:
           # -Path takes a single string, not an array (Invoke-ScriptAnalyzer's PSPath parameter
           # set is the one that accepts multiple paths) -- run once per file instead.
           $results = @(
-            Invoke-ScriptAnalyzer -Path .\update.ps1 -Severity Error,Warning
-            Invoke-ScriptAnalyzer -Path .\update.functions.ps1 -Severity Error,Warning
+            Invoke-ScriptAnalyzer -Path .\update.ps1 -Severity Error,Warning -Settings .\PSScriptAnalyzerSettings.psd1
+            Invoke-ScriptAnalyzer -Path .\update.functions.ps1 -Severity Error,Warning -Settings .\PSScriptAnalyzerSettings.psd1
           )
           $results | Format-Table -AutoSize | Out-String | Write-Host
           $errorCount = ($results | Where-Object Severity -eq 'Error').Count

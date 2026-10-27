@@ -37,11 +37,13 @@ function Build-PendingGitUpdateRecord {
 }
 
 # Helper: format a TimeSpan as "4m 12s" / "38s" / "1h 2m"
+# Floor, not [int]: [int] rounds half-to-even, so 90s rendered as "2m 30s" and the heartbeat
+# visibly jumped backwards ("2m 30s" -> "2m 0s").
 function Format-Elapsed {
     param([TimeSpan]$ts)
-    if ($ts.TotalHours -ge 1)   { return "$([int]$ts.TotalHours)h $($ts.Minutes)m" }
-    if ($ts.TotalMinutes -ge 1) { return "$([int]$ts.TotalMinutes)m $($ts.Seconds)s" }
-    return "$([int]$ts.TotalSeconds)s"
+    if ($ts.TotalHours -ge 1)   { return "$([Math]::Floor($ts.TotalHours))h $($ts.Minutes)m" }
+    if ($ts.TotalMinutes -ge 1) { return "$([Math]::Floor($ts.TotalMinutes))m $($ts.Seconds)s" }
+    return "$([Math]::Floor($ts.TotalSeconds))s"
 }
 
 # Helper: join an item list for the summary, truncated to $MaxShown with a "+N more" suffix.
@@ -55,6 +57,33 @@ function Format-SummaryLine {
     $text  = ($Items | Select-Object -First $MaxShown) -join ', '
     if ($count -gt $MaxShown) { $text += " (+$($count - $MaxShown) more)" }
     return $text
+}
+
+# Normalizes the raw -Only argument into a flat list of non-empty patterns. Needed because
+# "-Only npm,uv" only arrives as a 2-element array when the script is invoked from a PowerShell
+# prompt — via `pwsh -File` (the update.cmd shim, Scheduled Task, sudo/runas elevation re-launch)
+# it arrives as the single literal string "npm,uv", which matched nothing at all.
+function ConvertTo-OnlyFilter {
+    param([AllowNull()] [AllowEmptyCollection()] [string[]]$Only)
+    return @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+# True if $Latest is a newer version than $Installed. PowerShellGet reports prerelease versions
+# as strings like "3.0.0-preview1", which a plain [version] cast rejects with an exception — so
+# compare the numeric part, and fall back to plain string inequality if that still can't parse.
+function Test-VersionNewer {
+    param(
+        [Parameter(Mandatory)] [string]$Installed,
+        [Parameter(Mandatory)] [string]$Latest
+    )
+    $i = $null; $l = $null
+    if ([version]::TryParse(($Installed -split '[-+]')[0], [ref]$i) -and
+        [version]::TryParse(($Latest    -split '[-+]')[0], [ref]$l)) {
+        if ($l -ne $i) { return ($l -gt $i) }
+        # Same numeric version: only a prerelease -> stable transition counts as newer.
+        return ($Installed -match '-' -and $Latest -notmatch '-')
+    }
+    return ($Latest -ne $Installed)
 }
 
 # Shared -Only substring-match check, used both by Update-Section (to skip sections) and the

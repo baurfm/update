@@ -168,9 +168,9 @@
     Runs fully unattended: prompts silenced, strict timeouts, summary pushed to the given webhook.
 
 .NOTES
-    Author: Your Name
-    Date: 2026-09-05
-    Version: 12.19
+    Author: baurfm
+    Date: 2026-10-27
+    Version: 12.20
 #>
 
 [CmdletBinding()]
@@ -207,6 +207,7 @@ param(
     [switch]$NoRye,         # Skip Rye self-update
     [switch]$NoComposer,    # Skip Composer self-update
     [switch]$NoKrew,        # Skip krew (kubectl plugin manager) upgrade
+    [switch]$NoClaude,      # Skip Claude Code self-update
     [switch]$DryRun,        # Show what would be updated without running updates
     [switch]$RemoveFromPath, # Remove update.cmd shim and strip script dir from User PATH, then exit
     [switch]$OnlyWsl,
@@ -330,8 +331,8 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.18'
-$script:OnlyFilter     = $Only
+$script:VersionString  = '12.20'
+$script:OnlyFilter     = ConvertTo-OnlyFilter -Only $Only
 $script:parallelJobs   = @{}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
 
@@ -512,7 +513,11 @@ function Update-Section {
         $elapsed = (Get-Date) - $sectionStart
         $script:sectionTimings[$SectionName] = $elapsed
         Write-Status "Failed after $(Format-Elapsed $elapsed): $_" -Type Error
-        Write-Log "Error during $SectionName updates: $_ [$(Format-Elapsed $elapsed)]" -Level "ERROR"
+        Write-Log "Error during $SectionName updates: $_ [$(Format-Elapsed $elapsed)]" -Level "INFO"
+        # Without this an exception that aborts a whole section never reached $failedItems, so the
+        # summary said "No failures" and the run exited 0.
+        if (-not $failedItems.Contains($SectionName)) { $failedItems[$SectionName] = @() }
+        $failedItems[$SectionName] += "Section aborted: $($_.Exception.Message)"
     }
     Write-BlankLine   # separates this section from whatever prints next (section or group header)
 }
@@ -738,7 +743,8 @@ function Test-WingetHasUpdates {
     # --all cannot actually install them ("No installed package found matching input criteria").
     # NOTE: winget exits non-zero (0x8A150014) when there are NO updates — do NOT gate on
     # $LASTEXITCODE here. We rely entirely on the output text and table content.
-    $output = & winget upgrade 2>$null
+    # --accept-source-agreements: on a fresh profile winget otherwise blocks on a Y/N prompt.
+    $output = & winget upgrade --accept-source-agreements 2>$null
     return ((Get-WingetUpgradableIds $output).Count -gt 0)
 }
 
@@ -903,20 +909,29 @@ function Invoke-TlMgrUpdate {
 function Initialize-UpdateCommand {
     param([string]$ScriptDir)
 
-    # Respect existing setups (profile function, scoop shim, manual entry, …)
-    if (Get-Command update -ErrorAction SilentlyContinue) { return }
-
+    # -ExecutionPolicy Bypass: Windows PowerShell 5.1's default policy on client SKUs is
+    # Restricted, so the powershell.exe fallback refused to run the script at all.
     $shimPath = Join-Path $ScriptDir "update.cmd"
-    if (-not (Test-Path $shimPath)) {
-        $shimBody = @'
+    $shimBody = @'
 @echo off
 where /q pwsh >nul 2>&1
 if %errorlevel%==0 (
-    pwsh -File "%~dp0update.ps1" %*
+    pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0update.ps1" %*
 ) else (
-    powershell -File "%~dp0update.ps1" %*
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0update.ps1" %*
 )
 '@
+    # Refresh a shim we generated earlier with an older body — runs before the early return below,
+    # since once our own shim is on PATH, Get-Command update always finds it.
+    if ((Test-Path $shimPath) -and (((Get-Content $shimPath -Raw) -replace '\r', '').Trim() -ne ($shimBody -replace '\r', '').Trim())) {
+        Set-Content -Path $shimPath -Value $shimBody -Encoding ASCII
+        Write-Log "Refreshed outdated update.cmd shim." -Level "INFO"
+    }
+
+    # Respect existing setups (profile function, scoop shim, manual entry, …)
+    if (Get-Command update -ErrorAction SilentlyContinue) { return }
+
+    if (-not (Test-Path $shimPath)) {
         Set-Content -Path $shimPath -Value $shimBody -Encoding ASCII
         Write-Status "Created update.cmd shim" -Type Info
     }
@@ -1024,16 +1039,17 @@ function Test-NetworkReachable {
         [string[]]$Hosts = $script:NetCheckHosts,
         [int]$TimeoutSec = $script:NetCheckTimeoutSec
     )
+    # TCP connect to 443 instead of ICMP ping: corporate firewalls/VPNs commonly drop ICMP, which
+    # made ping report "offline" on perfectly working connections. 443 is what the updates actually
+    # need. Also identical on PS5.1 and 7 (Test-Connection's parameters differ between them).
     foreach ($h in $Hosts) {
+        $client = New-Object System.Net.Sockets.TcpClient
         try {
-            $reply = Test-Connection -TargetName $h -Count 1 -TimeoutSeconds $TimeoutSec -Quiet -ErrorAction SilentlyContinue
-            if ($reply) { return $true }
+            if ($client.ConnectAsync($h, 443).Wait($TimeoutSec * 1000) -and $client.Connected) { return $true }
         } catch {
-            # Test-Connection on PS5.1 has different parameters — fallback:
-            try {
-                $ok = [bool](Test-Connection -ComputerName $h -Count 1 -Quiet -ErrorAction SilentlyContinue)
-                if ($ok) { return $true }
-            } catch { }
+            Write-Log "Network probe $h failed: $($_.Exception.InnerException.Message)" -Level "DEBUG"
+        } finally {
+            $client.Dispose()
         }
     }
     return $false
@@ -1091,7 +1107,11 @@ function Register-UpdateScheduledTask {
         'Daily'  { New-ScheduledTaskTrigger -Daily  -At $AtTime }
         'Weekly' { New-ScheduledTaskTrigger -Weekly -At $AtTime -DaysOfWeek Monday }
     }
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    # Runs as the registering user (S4U: no stored password, runs whether logged on or not), NOT as
+    # SYSTEM — Scoop, npm/pnpm globals, pipx, uv, rustup, VS Code extensions and WSL distros are all
+    # per-user, so under SYSTEM those sections either found nothing or updated SYSTEM's own profile.
+    $taskUser  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType S4U -RunLevel Highest
     $settings  = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
         -WakeToRun -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5) `
@@ -1101,8 +1121,8 @@ function Register-UpdateScheduledTask {
             -Trigger $trigger -Principal $principal -Settings $settings `
             -Description "Windows Update Script — unattended daily dev-tool refresh (v$script:VersionString)" `
             -Force | Out-Null
-        Write-Status "Scheduled Task '$($script:ScheduledTaskName)' registered ($Frequency at $AtTime, SYSTEM, elevated)" -Type Success
-        Write-Log "Scheduled Task registered: name=$($script:ScheduledTaskName) freq=$Frequency at=$AtTime" -Level "INFO"
+        Write-Status "Scheduled Task '$($script:ScheduledTaskName)' registered ($Frequency at $AtTime, $taskUser, elevated)" -Type Success
+        Write-Log "Scheduled Task registered: name=$($script:ScheduledTaskName) freq=$Frequency at=$AtTime user=$taskUser" -Level "INFO"
         return $true
     } catch {
         Write-Status "Scheduled Task registration failed: $($_.Exception.Message)" -Type Error
@@ -1258,7 +1278,7 @@ if (-not $PSBoundParameters.ContainsKey('LogFile')) {
 }
 $script:LockFilePath         = Join-Path $LogDir "update.lock"
 $script:PendingGitUpdateFlag = Join-Path $LogDir "pending-git-update.json"
-# Log rotation: rename existing log with timestamp, keep last 5 archives
+# Log rotation: rename existing log with timestamp, keep the last $LogArchiveCount archives
 if (Test-Path $LogFile) {
     $stamp   = $scriptStartTime.ToString('yyyy-MM-dd_HHmmss')
     $logBase = [System.IO.Path]::GetFileNameWithoutExtension($LogFile)
@@ -1343,11 +1363,13 @@ Initialize-UpdateCommand -ScriptDir $ScriptPath
 
 # --- Self-update via git pull ---
 # Skipped on an elevated re-launch — the parent process already ran this check.
-if (-not $NoSelfUpdate -and -not $Elevated) {
+# Also skipped on -DryRun — a dry run shouldn't modify the checkout either.
+if (-not $NoSelfUpdate -and -not $Elevated -and -not $DryRun) {
     $scriptDir = Split-Path $PSCommandPath -Parent
     if ((Get-Command git -ErrorAction SilentlyContinue) -and (Test-Path (Join-Path $scriptDir ".git"))) {
         Write-Status "Checking for script updates (git pull)..." -Type Action
         try {
+            $headBefore = (& git -C $scriptDir rev-parse HEAD 2>$null)
             $pullOut = & git -C $scriptDir pull 2>&1
             if ($LASTEXITCODE -ne 0) {
                 Write-Status "git pull failed: $($pullOut -join ' ')" -Type Warning
@@ -1356,12 +1378,15 @@ if (-not $NoSelfUpdate -and -not $Elevated) {
                 Write-Status "Script is up to date ($_version)" -Type Success
                 Write-Log "Self-update: already up to date ($_version)" -Level "INFO"
             } else {
-                # Repo changed — check if the script file itself was updated
-                $newVerMatch = Select-String '^\$_version\s*=\s*"(v[\d.]+)"' $PSCommandPath
-                $newVer = if ($newVerMatch) { $newVerMatch.Matches[0].Groups[1].Value } else { $null }
-                if ($newVer -and $newVer -ne $_version) {
+                # Repo changed — re-run if either script file changed. Diffing the pulled commit range
+                # replaces an old version-string regex that never matched the actual assignment
+                # line, so a pulled script update was silently never picked up until the next run.
+                $changedScripts = @(& git -C $scriptDir diff --name-only $headBefore HEAD -- update.ps1 update.functions.ps1 2>$null)
+                $newVerMatch = Select-String "^\`$script:VersionString\s*=\s*'([\d.]+)'" $PSCommandPath
+                $newVer = if ($newVerMatch) { "v$($newVerMatch.Matches[0].Groups[1].Value)" } else { '(new)' }
+                if ($headBefore -and $changedScripts.Count -gt 0) {
                     Write-Status "Script updated: $_version → $newVer. Re-running..." -Type Success
-                    Write-Log "Self-update: script updated $_version → $newVer, re-running." -Level "INFO"
+                    Write-Log "Self-update: script updated $_version → $newVer ($($changedScripts -join ', ')), re-running." -Level "INFO"
                     # Release the lock before re-exec — the child re-invocation runs in this same
                     # process ($PID unchanged), so without releasing first it would find its own
                     # still-alive PID holding the lock and abort with "Another run is active".
@@ -1553,8 +1578,11 @@ if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -o
                     $argArray += "-$key"
                 }
             } else {
+                # Arrays (-Only) are comma-joined: passed as separate argv entries, the second
+                # element would bind positionally to the next free parameter (-OutputJson!) in
+                # the child. The child re-splits via ConvertTo-OnlyFilter.
                 $argArray += "-$key"
-                $argArray += $PSBoundParameters[$key]
+                $argArray += (@($PSBoundParameters[$key]) -join ',')
             }
         }
         # Mark the child as the elevated re-launch so it skips the banner, self-update check and
@@ -1590,7 +1618,7 @@ if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -o
                 if ($val -is [switch]) {
                     if ($val) { $argStrParts += "-$key" }
                 } else {
-                    $argStrParts += "-$key `"$val`""
+                    $argStrParts += "-$key `"$(@($val) -join ',')`""
                 }
             }
             $argStrParts += "-Elevated"
@@ -1626,12 +1654,13 @@ $sectionKeys = "Scoop", "Winget", "Chocolatey",
               "pipx", "uv", "Poetry", "Rye",
               ".NET Global Tools", "Rust", "Ruby Gems", "Composer",
               "Google Cloud SDK", "Azure CLI", "Android SDK", "Helm plugins", "krew plugins",
-              "VS Code Extensions", "GitHub CLI Extensions",
+              "VS Code Extensions", "GitHub CLI Extensions", "Claude Code",
               "TeX Live"
 $script:sectionIndex   = 0
 $script:totalSections  = $sectionKeys.Count
-$updatedItems = @{}
-$failedItems  = @{}
+# Ordered so the summary lists categories in run order instead of random hashtable order.
+$updatedItems = [ordered]@{}
+$failedItems  = [ordered]@{}
 foreach ($k in $sectionKeys) {
     $updatedItems[$k] = @()
     $failedItems[$k]  = @()
@@ -1704,7 +1733,7 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
     Write-Status "Checking for outdated packages..." -Type Action
     # NOTE: winget exits non-zero (0x8A150014) when there are NO updates — do NOT gate on
     # $LASTEXITCODE here. We rely entirely on output text and table content.
-    $wingetUpgradeOutput = & winget upgrade --include-unknown 2>&1
+    $wingetUpgradeOutput = & winget upgrade --include-unknown --accept-source-agreements 2>&1
     $upgradablePackages  = Get-WingetUpgradableIds $wingetUpgradeOutput
     # Packages winget refuses to touch via --all (version-pinned, or the available version looks
     # like a downgrade) — winget prints them in a separate table and suggests upgrading by --id
@@ -1726,7 +1755,7 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
             if ($currentBlockers.Count -eq 0) {
                 Write-Status "Pending Git.Git update from earlier run — applying now (skipCount=$($pending.skipCount))" -Type Action
                 Write-Log "Winget: consuming pending Git.Git flag (firstDetected=$($pending.firstDetected))" -Level "INFO"
-                & winget upgrade --id Git.Git --accept-source-agreements --accept-package-agreements --include-unknown
+                Invoke-NativeCapture -Command { & winget upgrade --id Git.Git --accept-source-agreements --accept-package-agreements --include-unknown } -LogTag "winget upgrade --id Git.Git" -EchoOnFailure
                 $gitFastCode = $LASTEXITCODE
                 if ($gitFastCode -eq 0) {
                     Write-Status "Git.Git successfully updated" -Type Success
@@ -1929,7 +1958,7 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
     } catch {}
     $modulesToUpdate = @($installedModules | Where-Object {
         $latest = $latestInGallery[$_.Name]
-        $latest -and ([version]$latest -gt [version]$_.Version)
+        $latest -and (Test-VersionNewer -Installed "$($_.Version)" -Latest "$latest")
     })
     if ($modulesToUpdate.Count -eq 0) {
         Write-Status "All $($installedModules.Count) modules already at latest version" -Type Success
@@ -2468,7 +2497,7 @@ Update-Section "krew plugins" ($NoKrew -or $OnlyWsl -or $OnlyWslPackages) { Get-
 # ══════════════════════════════════════════════════════
 # DEV TOOLING
 # ══════════════════════════════════════════════════════
-if (Test-GroupWanted 'Visual Studio Code Extensions','GitHub CLI Extensions') {
+if (Test-GroupWanted 'Visual Studio Code Extensions','GitHub CLI Extensions','Claude Code') {
 Write-GroupHeader "Dev Tooling"
 }
 
@@ -2500,8 +2529,13 @@ Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $Only
             } -ThrottleLimit 6
 
             foreach ($r in $results) {
-                if ($r.ExitCode -ne 0) {
+                if ($r.ExitCode -ne 0 -and $r.Output -like '*not found*') {
+                    Write-Status "$($r.Id) no longer exists in the Marketplace — uninstall it with 'code --uninstall-extension $($r.Id)'" -Type Skip
+                    Write-Log "VS Code: $($r.Id) not found in Marketplace (delisted)." -Level "INFO"
+                    $script:skippedSections += "$($r.Id) (delisted from Marketplace)"
+                } elseif ($r.ExitCode -ne 0) {
                     Write-Status "Failed: $($r.Id)" -Type Error
+                    Write-Log "VS Code: $($r.Id) failed: $($r.Output)" -Level "INFO"
                     $failedItems["VS Code Extensions"] += "$($r.Id) (Exit Code: $($r.ExitCode))"
                 } elseif ($r.Output -like '*successfully installed*') {
                     Write-Status "Updated: $($r.Id)" -Type Info
@@ -2515,8 +2549,13 @@ Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $Only
                 $progress++
                 Write-Progress -Activity "Checking VS Code Extensions" -Status "$extensionId ($progress/$($validExtensions.Count))" -PercentComplete (($progress / $validExtensions.Count) * 100)
                 $updateOutput = & code --install-extension $extensionId --force 2>&1
-                if ($LASTEXITCODE -ne 0) {
+                if ($LASTEXITCODE -ne 0 -and ($updateOutput -join ' ') -like '*not found*') {
+                    Write-Status "$extensionId no longer exists in the Marketplace — uninstall it with 'code --uninstall-extension $extensionId'" -Type Skip
+                    Write-Log "VS Code: $extensionId not found in Marketplace (delisted)." -Level "INFO"
+                    $script:skippedSections += "$extensionId (delisted from Marketplace)"
+                } elseif ($LASTEXITCODE -ne 0) {
                     Write-Status "Failed: $extensionId" -Type Error
+                    Write-Log "VS Code: $extensionId failed: $($updateOutput -join ' ')" -Level "INFO"
                     $failedItems["VS Code Extensions"] += "$extensionId (Exit Code: $LASTEXITCODE)"
                 } elseif ($updateOutput -join ' ' -like '*successfully installed*') {
                     Write-Status "Updated: $extensionId" -Type Info
@@ -2552,6 +2591,15 @@ Update-Section "GitHub CLI Extensions" ($NoGhExt -or $OnlyWsl -or $OnlyWslPackag
     }
     Write-Status "Upgrading all GitHub CLI extensions..." -Type Action
     Invoke-UpdateStep -Key "GitHub CLI Extensions" -ActionName "gh extension upgrade --all" -Action { & gh extension upgrade --all } -SuccessLabel "All extensions" | Out-Null
+}
+
+# --- Update Claude Code ---
+# The native installer's background auto-updater only runs while a session is open; this keeps
+# rarely-used machines and unattended runs current too. npm-installed copies are also handled by
+# the npm section — `claude update` detects the install method itself.
+Update-Section "Claude Code" ($NoClaude -or $OnlyWsl -or $OnlyWslPackages) { Get-Command claude -ErrorAction SilentlyContinue } {
+    Write-Status "Updating Claude Code..." -Type Action
+    Invoke-UpdateStep -Key "Claude Code" -ActionName "claude update" -Action { & claude update } -SuccessLabel "Claude Code" | Out-Null
 }
 
 # ══════════════════════════════════════════════════════

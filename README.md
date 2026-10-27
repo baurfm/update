@@ -19,7 +19,7 @@ A comprehensive PowerShell script that automates the update process for multiple
 - **Self-Update Check**: Verifies the script itself is current via GitHub on startup (disable with `-NoSelfUpdate`)
 - **Centralized Logs**: Output and past logs stored in a `logs/` subdirectory (auto-rotated, last 30 archives kept)
 - **Administrative Support**: Lazy elevation based on pre-checks, also supports the Windows `sudo` command and the `-Sudo` flag for immediate elevation
-- **Unattended / Scheduled Operation**: `-Unattended` flag silences all interactive prompts, suppresses progress bars, sets per-command timeouts, and enables notifications. `-RegisterSchedule` installs a SYSTEM-level Scheduled Task for nightly auto-runs. Lock-file prevents overlapping runs. Network pre-check aborts early if offline. Differentiates exit codes 0–6 for CI/monitoring use.
+- **Unattended / Scheduled Operation**: `-Unattended` flag silences all interactive prompts, suppresses progress bars, sets per-command timeouts, and enables notifications. `-RegisterSchedule` installs an elevated Scheduled Task (running as the registering user, no stored password) for nightly auto-runs. Lock-file prevents overlapping runs. Network pre-check aborts early if offline. Differentiates exit codes 0–6 for CI/monitoring use.
 - **Notifications**: BurntToast toast notifications, generic webhook (ntfy.sh compatible), or Windows Event Log (`-NotifyToast`, `-NotifyWebhook`, `-NotifyEventLog`).
 - **Auto-Reboot**: `-AutoReboot` triggers a graceful 60-second shutdown when a pending reboot is detected after updates.
 
@@ -91,6 +91,7 @@ Sections are organised into logical groups in the order they run:
 |----------|---------------|--------------|
 | **VS Code Extensions** | All installed extensions (parallel on PS7+) | `code --install-extension` |
 | **GitHub CLI Extensions** | All `gh` extensions | `gh extension upgrade --all` |
+| **Claude Code** | Claude Code CLI (native or npm install) | `claude update` |
 
 ### Typesetting
 
@@ -185,6 +186,7 @@ Get-Help .\update.ps1 -Full
 | `-NoKrew` | Skip krew (kubectl plugin manager) |
 | `-NoVsCode` | Skip VS Code extensions |
 | `-NoGhExt` | Skip GitHub CLI extensions |
+| `-NoClaude` | Skip Claude Code self-update |
 | `-NoTex` | Skip TeX Live |
 
 ### Mode flags
@@ -215,7 +217,7 @@ Get-Help .\update.ps1 -Full
 | `-CmdTimeoutSec <n>` | Per-command hard timeout in seconds (0 = disabled, default 600 under `-Unattended`) |
 | `-SkipNetworkCheck` | Skip the network reachability pre-check |
 | `-AutoReboot` | Trigger `shutdown /r /t 60` if a pending reboot is detected after updates |
-| `-RegisterSchedule` | Install a SYSTEM-level Scheduled Task (`UpdateDevTools`) and exit |
+| `-RegisterSchedule` | Install an elevated Scheduled Task (`UpdateScript-Daily`, runs as the registering user via S4U — no stored password) and exit. Register from an elevated shell of the user whose tools should be updated |
 | `-UnregisterSchedule` | Remove the Scheduled Task and exit |
 | `-ScheduleTime <HH:mm>` | Daily trigger time for `-RegisterSchedule` (default: `"03:00"`) |
 | `-ScheduleFrequency <Daily/Weekly>` | Recurrence for `-RegisterSchedule` (default: `Daily`) |
@@ -454,6 +456,7 @@ After this, you can run `update`, `update -NoTex`, `update -h`, etc. from any di
 
 ## 📈 Version History
 
+- **v12.20** — Audit fixes. Fix: self-update never re-ran a pulled script update — the version regex looked for a `$_version = "v…"` literal that doesn't exist, so the run always continued with the old in-memory code; now diffs the pulled commit range for `update.ps1`/`update.functions.ps1` (and no longer pulls during `-DryRun`). Fix: `-Only npm,uv` matched nothing when invoked via `pwsh -File` (the `update.cmd` shim, Scheduled Task, elevation re-launch) because it arrives as one literal string `"npm,uv"` — now split on commas (`ConvertTo-OnlyFilter`); the elevation re-launch also passed array values as separate arguments, binding the second one positionally to `-OutputJson`. Fix: a section aborted by an unhandled exception was never recorded as failed — the summary said "No failures" and the run exited 0. Fix: `-RegisterSchedule` ran as SYSTEM, where all per-user tools (Scoop, npm/pnpm globals, pipx, uv, rustup, VS Code extensions, WSL distros) were either not found or updated SYSTEM's own profile — now runs as the registering user (S4U, elevated, no stored password); re-register to apply. Fix: network pre-check used ICMP ping, which many corporate firewalls/VPNs drop (false "offline", exit 5) — now a TCP connect to port 443. Fix: PowerShell module check crashed on prerelease versions (`3.0.0-preview1` isn't a valid `[version]`). Fix: `update.cmd` shim now passes `-NoProfile -ExecutionPolicy Bypass` (the `powershell.exe` fallback failed under the default `Restricted` policy); existing generated shims are refreshed automatically. Fix: winget listing calls pass `--accept-source-agreements` so a fresh profile can't block on a prompt. Fix: `Format-Elapsed` rounded half-to-even (`[int]1.5` = 2), so 90s showed as "2m 30s" and the tlmgr heartbeat jumped backwards ("2m 30s" → "2m 0s") — caught in a live run. Fix: VS Code extensions delisted from the Marketplace ("not found") failed every single run — now reported as skipped with the uninstall command; real failures now log the CLI output. New: Claude Code section (`claude update`, `-NoClaude`). UX: summary lists categories in run order. Chore: script-header and internal version strings were out of sync (12.19 vs 12.18); `PSScriptAnalyzerSettings.psd1` excludes the ~80 by-design warnings (Write-Host etc.) so real ones show up in CI.
 - **v12.19** — Fix: a live run inside Windows Terminal had winget upgrade `Microsoft.IntelligentTerminal` (Windows Terminal) itself mid-`--all`, which restarts the ConPTY host and silently killed the elevated `update.ps1` session right after the source refresh — no error, no summary, just back to the prompt, leaving a stale lock behind (already self-healed by the existing dead-PID eviction, but confusing). Now mirrors the existing Git.Git-blocker pattern: when `$env:WT_SESSION` is set (i.e. we're running inside Windows Terminal), Microsoft.IntelligentTerminal is temporarily pinned out of `--all` and reported as skipped instead — run from a classic `powershell.exe`/`cmd.exe` console (or let the Store auto-update it) to actually update it.
 - **v12.18** — Three UX improvements aimed at the biggest remaining pain points: (1) commands now echo their raw output live on a genuine final failure, even without `-Verbose` — quiet-on-success stays quiet, but you no longer have to re-run a possibly-long section just to see what broke. (2) The closing summary card adds a `Details: <log path>` line whenever there were failures. (3) Long, silent background-job waits (TeX Live's `tlmgr` run, any `-CmdTimeoutSec`-wrapped command) now print a periodic "still running (Xm elapsed)" heartbeat every 30s instead of going quiet for minutes, which could look like a hang.
 - **v12.17** — Extracted the Git.Git pending-update record logic (increment `skipCount`, preserve `firstDetected` across runs) into a pure `Build-PendingGitUpdateRecord` in `update.functions.ps1`, with tests. Evaluated further modularization (full PowerShell module, per-category files) and deliberately held off — not justified for a single-maintainer, single-entry-point tool.
