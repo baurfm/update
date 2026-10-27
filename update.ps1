@@ -170,7 +170,7 @@
 .NOTES
     Author: baurfm
     Date: 2026-10-27
-    Version: 12.21
+    Version: 12.23
 #>
 
 [CmdletBinding()]
@@ -209,6 +209,7 @@ param(
     [switch]$NoKrew,        # Skip krew (kubectl plugin manager) upgrade
     [switch]$NoClaude,      # Skip Claude Code self-update
     [switch]$NoCursor,      # Skip Cursor extension updates
+    [switch]$NoWindowsUpdate, # Skip Windows Update (PSWindowsUpdate; only runs when elevated anyway)
     [switch]$DryRun,        # Show what would be updated without running updates
     [switch]$RemoveFromPath, # Remove update.cmd shim and strip script dir from User PATH, then exit
     [switch]$OnlyWsl,
@@ -296,6 +297,7 @@ $script:EventLogSource     = 'UpdateScript'
 $script:ScheduledTaskName  = 'UpdateScript-Daily'
 $script:NetCheckHosts      = @('github.com','registry.npmjs.org','ghcr.io')
 $script:NetCheckTimeoutSec = 5
+$script:PreCheckTimeoutSec = 120    # max wait for the background winget/WSL elevation pre-checks
 
 # ── Exit codes ─────────────────────────────────────────────────────────────
 # Consumed by Scheduled-Task history, wrappers, and monitoring.
@@ -332,7 +334,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.21'
+$script:VersionString  = '12.23'
 $script:OnlyFilter     = ConvertTo-OnlyFilter -Only $Only
 $script:parallelJobs   = @{}
 $script:prefetchVersions = @{}
@@ -482,6 +484,39 @@ function Write-Status {
 }
 
 
+# Raw append to the log file. A locked/unwritable log (AV scan, OneDrive sync, full disk) must
+# never break the update run — warn once on the terminal, then keep going without file logging.
+function Write-LogFileText {
+    param([string]$Text)
+    if ($script:LogWriteFailed) { return }
+    try {
+        [System.IO.File]::AppendAllText($LogFile, $Text, $script:Utf8NoBom)
+    } catch {
+        $script:LogWriteFailed = $true
+        Write-Host "  $([char]0x26A0)  Cannot write log file '$LogFile' ($($_.Exception.Message)) — continuing without file logging" -ForegroundColor Yellow
+    }
+}
+$script:Utf8NoBom      = New-Object System.Text.UTF8Encoding($false)
+$script:LogWriteFailed = $false
+
+# Bulk variant for many lines at once (tool output, TeX Live log files): one file write for the
+# whole block instead of one per line.
+function Write-LogBlock {
+    param(
+        [AllowNull()] [AllowEmptyCollection()] [object[]]$Lines,
+        [string]$Prefix = '',
+        [string]$Level = 'DEBUG'
+    )
+    if (-not $Lines -or -not $LogFile) { return }
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($l in $Lines) { [void]$sb.Append("[$timestamp] [$Level] $Prefix$l`r`n") }
+    Write-LogFileText $sb.ToString()
+    if ($VerbosePreference -ne 'SilentlyContinue') {
+        $Lines | ForEach-Object { Write-Host "[$timestamp] [$Level] $Prefix$_" -ForegroundColor DarkGray }
+    }
+}
+
 # Function to write log messages
 function Write-Log {
     param(
@@ -490,8 +525,10 @@ function Write-Log {
     )
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logMessage = "[$timestamp] [$Level] $Message"
-    # Always write to file
-    if ($LogFile) { Add-Content -Path $LogFile -Value $logMessage }
+    # Always write to file. AppendAllText instead of Add-Content: Add-Content measured ~30 ms per
+    # call (provider overhead + AV/OneDrive scanning on each open), i.e. ~90 s for a 3000-line
+    # tlmgr run. Also gives UTF-8 on PS5.1 too (Add-Content wrote ANSI there, mangling umlauts).
+    if ($LogFile) { Write-LogFileText "$logMessage`r`n" }
     # Terminal: raw log lines only in verbose mode; WARN/ERROR shown via Write-Status otherwise
     if ($VerbosePreference -ne 'SilentlyContinue') {
         Write-Host $logMessage -ForegroundColor DarkGray
@@ -544,7 +581,8 @@ function Update-Section {
     }
 
     Write-SectionHeader "Updating $SectionName" -Progress $progress
-    Write-Log "Starting $SectionName updates."
+    # Visual section marker so a long log is easy to navigate / grep.
+    Write-Log "──────── [$progress] $SectionName ────────"
 
     $sectionStart = Get-Date
     try {
@@ -586,7 +624,7 @@ function Invoke-NativeCapture {
     $out    = & $Command *>&1
     $failed = ($LASTEXITCODE -ne 0)
     if ($out) {
-        $out | ForEach-Object { Write-Log "  [$LogTag] $_" -Level "DEBUG" }
+        Write-LogBlock -Lines $out -Prefix "  [$LogTag] "
         if ($VerbosePreference -ne 'SilentlyContinue' -or ($EchoOnFailure -and $failed)) {
             $out | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
         }
@@ -618,7 +656,7 @@ function Invoke-WithRetry {
         try {
             if ($TimeoutSec -gt 0) {
                 $r = Invoke-WithTimeout -Action $Action -TimeoutSec $TimeoutSec
-                if ($r.Output) { $r.Output | ForEach-Object { Write-Log "  [$ActionName] $_" -Level "DEBUG" } }
+                if ($r.Output) { Write-LogBlock -Lines $r.Output -Prefix "  [$ActionName] " }
                 # Same "quiet unless it's the final, real failure" rule as the non-timeout branch.
                 $isFinalAttempt = ($attempt -eq $maxAttempts)
                 if ($r.ExitCode -eq 0 -and -not $r.TimedOut -and -not $r.Error) {
@@ -928,8 +966,7 @@ function Write-TexLiveLog {
             Sort-Object LastWriteTime -Descending
     foreach ($log in $logs) {
         Write-Log "--- TeX Live log: $($log.FullName) ---" -Level "INFO"
-        Get-Content $log.FullName -ErrorAction SilentlyContinue |
-            ForEach-Object { Write-Log "  $_" -Level "INFO" }
+        Write-LogBlock -Lines @(Get-Content $log.FullName -ErrorAction SilentlyContinue) -Prefix "  " -Level "INFO"
     }
 }
 
@@ -1356,7 +1393,11 @@ if (-not $PSBoundParameters.ContainsKey('LogFile')) {
 $script:LockFilePath         = Join-Path $LogDir "update.lock"
 $script:PendingGitUpdateFlag = Join-Path $LogDir "pending-git-update.json"
 # Log rotation: rename existing log with timestamp, keep the last $LogArchiveCount archives
-if (Test-Path $LogFile) {
+# Not on an elevated re-launch or a self-update re-exec: those continue the SAME logical run, and
+# rotating there archived the parent's first half (pre-checks, elevation reason) away from the
+# rest of the run's log.
+$isContinuation = $Elevated -or ($env:UPDATE_SCRIPT_REEXEC -eq '1')
+if ((Test-Path $LogFile) -and -not $isContinuation) {
     $stamp   = $scriptStartTime.ToString('yyyy-MM-dd_HHmmss')
     $logBase = [System.IO.Path]::GetFileNameWithoutExtension($LogFile)
     if ([string]::IsNullOrWhiteSpace($logBase)) { $logBase = 'update' }
@@ -1366,6 +1407,17 @@ if (Test-Path $LogFile) {
         Sort-Object LastWriteTime -Descending |
         Select-Object -Skip $script:LogArchiveCount |
         Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
+# Last line of defence for an error outside the per-section try/catch (pre-checks, summary,
+# notifications): previously it printed a raw error record and left no trace in the log. Now it
+# is logged with its script position and the run continues with the next statement, so one
+# broken step can't cost all remaining sections their updates. Ctrl+C still stops the run.
+trap {
+    if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { break }
+    Write-Log "UNHANDLED: $($_.Exception.Message) $($_.InvocationInfo.PositionMessage)" -Level "INFO"
+    Write-Status "Unexpected error: $($_.Exception.Message) — continuing, details in $LogFile" -Type Error
+    continue
 }
 
 # Display startup banner (suppressed in quiet/unattended mode, and on an elevated
@@ -1477,8 +1529,11 @@ if (-not $NoSelfUpdate -and -not $Elevated -and -not $DryRun) {
                     # process ($PID unchanged), so without releasing first it would find its own
                     # still-alive PID holding the lock and abort with "Another run is active".
                     Unlock-UpdateRun -LockPath $script:LockFilePath
+                    $env:UPDATE_SCRIPT_REEXEC = '1'
                     & $PSCommandPath @PSBoundParameters -NoSelfUpdate
-                    exit $LASTEXITCODE
+                    $reexecCode = $LASTEXITCODE
+                    Remove-Item Env:UPDATE_SCRIPT_REEXEC -ErrorAction SilentlyContinue
+                    exit $reexecCode
                 } else {
                     Write-Status "Repo updated (non-script files only)" -Type Info
                     Write-Log "Self-update: repo updated (non-script files only)" -Level "INFO"
@@ -1504,7 +1559,7 @@ if ($freeGB -lt $script:DiskSpaceWarnGB) {
     Write-Log "WARNING: Low disk space: ${freeGB} GB free on C: (threshold: $($script:DiskSpaceWarnGB) GB)" -Level "INFO"
 }
 
-Write-Log "Starting update script."
+Write-Log "════════ update.ps1 v$($script:VersionString) — PID $PID, $(if ($script:isAdmin) { 'elevated' } else { 'not elevated' })$(if ($isContinuation) { ', continuation of previous process' }) ════════"
 Write-Log "OS: $([System.Environment]::OSVersion.VersionString)"
 Write-Log "PowerShell: $($PSVersionTable.PSVersion)"
 Write-Log "User: $([System.Environment]::UserName)"
@@ -1622,8 +1677,15 @@ if ($Elevated) {
 
     # Collect background job results (jobs were running while npm check ran above)
     if ($preWingetJob) {
-        $preWingetJob | Wait-Job | Out-Null
-        $wingetNeedsElevation = [bool]($preWingetJob | Receive-Job)
+        # Bounded wait: winget occasionally hangs on its source refresh, which previously blocked
+        # the whole script at startup forever. Timeout = assume no elevation; the Winget section
+        # itself still runs (and can still update whatever doesn't need admin).
+        if (-not ($preWingetJob | Wait-Job -Timeout $script:PreCheckTimeoutSec)) {
+            Write-Status "winget pre-check timed out after $($script:PreCheckTimeoutSec)s — continuing without elevation" -Type Warning
+            Write-Log "Pre-check: winget job timed out after $($script:PreCheckTimeoutSec)s." -Level "INFO"
+            $preWingetJob | Stop-Job -ErrorAction SilentlyContinue
+        }
+        $wingetNeedsElevation = [bool]($preWingetJob | Receive-Job -ErrorAction SilentlyContinue)
         $preWingetJob | Remove-Job -Force
         if ($wingetNeedsElevation) {
             Write-Log "Pre-check: winget has updates — elevation needed." -Level "INFO"
@@ -1634,8 +1696,12 @@ if ($Elevated) {
     }
 
     if ($preWslJob) {
-        $preWslJob | Wait-Job | Out-Null
-        $wslJobResult = $preWslJob | Receive-Job
+        if (-not ($preWslJob | Wait-Job -Timeout $script:PreCheckTimeoutSec)) {
+            Write-Status "WSL pre-check timed out after $($script:PreCheckTimeoutSec)s — continuing without elevation" -Type Warning
+            Write-Log "Pre-check: WSL job timed out after $($script:PreCheckTimeoutSec)s." -Level "INFO"
+            $preWslJob | Stop-Job -ErrorAction SilentlyContinue
+        }
+        $wslJobResult = $preWslJob | Receive-Job -ErrorAction SilentlyContinue
         $preWslJob | Remove-Job -Force
         # Replay status messages captured inside the job (version strings, warnings)
         if ($wslJobResult -and $wslJobResult.Messages) {
@@ -1735,7 +1801,7 @@ if ((Get-Location).Path -ne $ScriptPath) {
 # Initialize hashtables to store results for the final summary
 $sectionKeys = "Scoop", "Winget", "Chocolatey",
               "PowerShell Modules", "Oh My Posh",
-              "WSL",
+              "Windows Update", "WSL",
               "npm", "pnpm", "Bun", "Deno",
               "pipx", "uv", "Poetry", "Rye",
               ".NET Global Tools", "Rust", "Ruby Gems", "Composer",
@@ -1983,7 +2049,7 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
             # only echoed live with -Verbose (consistent with every other section's raw output).
             $explicitOut  = & winget upgrade --id $id --accept-source-agreements --accept-package-agreements 2>&1
             $explicitCode = $LASTEXITCODE
-            $explicitOut | ForEach-Object { Write-Log "  [winget upgrade --id $id] $_" -Level "DEBUG" }
+            Write-LogBlock -Lines $explicitOut -Prefix "  [winget upgrade --id $id] "
             $explicitIsSkip = ($explicitCode -ne 0) -and (($explicitOut | Out-String) -match 'cannot be upgraded using WinGet')
             # Echo raw output live when: -Verbose is on, or it's a genuine failure (not the
             # identified "no winget upgrade path" skip case, which already gets a clear message).
@@ -2044,9 +2110,20 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
             Where-Object { $_.Name -notin $v2Names } | Select-Object -ExpandProperty Name -Unique)
         Write-Log "PSResourceGet-only resources: $($psrOnly.Count)" -Level "INFO"
         foreach ($name in $psrOnly) {
-            $before = (Get-InstalledPSResource -Name $name -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).Version
+            $installed = Get-InstalledPSResource -Name $name -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
+            $before    = $installed.Version
+            # Pin to the repository it came from and only auto-trust PSGallery (which Update-Module
+            # -Force above already trusts) or repos the user explicitly marked trusted — never let
+            # an update silently resolve from some other, untrusted registered repository.
+            $repo      = $installed.Repository
+            $repoInfo  = if ($repo) { Get-PSResourceRepository -Name $repo -ErrorAction SilentlyContinue } else { $null }
+            if (-not $repoInfo -or -not ($repo -eq 'PSGallery' -or $repoInfo.Trusted)) {
+                Write-Log "PSResourceGet: skipping $name — source repository '$repo' unknown or not trusted." -Level "INFO"
+                $script:skippedSections += "$name (PSResourceGet repo '$repo' not trusted)"
+                continue
+            }
             try {
-                Update-PSResource -Name $name -TrustRepository -ErrorAction Stop -WarningAction SilentlyContinue
+                Update-PSResource -Name $name -Repository $repo -TrustRepository -ErrorAction Stop -WarningAction SilentlyContinue
                 $after = (Get-InstalledPSResource -Name $name -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).Version
                 if ("$after" -ne "$before") {
                     $updatedItems["PowerShell Modules"] += $name
@@ -2071,6 +2148,12 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
         $latest = $latestInGallery[$_.Name]
         $latest -and (Test-VersionNewer -Installed "$($_.Version)" -Latest "$latest")
     })
+    if (@($installedModules).Count -eq 0) {
+        # Windows PowerShell and PowerShell 7 keep separate module folders — modules installed
+        # from pwsh are invisible here (and vice versa). Not an error, just nothing to do.
+        Write-Status "No PowerShellGet-installed modules for PowerShell $($PSVersionTable.PSVersion.Major)" -Type Success
+        return
+    }
     if ($modulesToUpdate.Count -eq 0) {
         Write-Status "All $($installedModules.Count) modules already at latest version" -Type Success
         return
@@ -2191,8 +2274,46 @@ Update-Section "Oh My Posh" ($NoOhMyPosh -or $OnlyWsl -or $OnlyWslPackages) { Ge
 # ══════════════════════════════════════════════════════
 # SYSTEM
 # ══════════════════════════════════════════════════════
-if (Test-GroupWanted 'Windows Subsystem for Linux (WSL)') {
+if (Test-GroupWanted 'Windows Update','Windows Subsystem for Linux (WSL)') {
 Write-GroupHeader "System"
+}
+
+# --- Windows Update (PSWindowsUpdate) ---
+# Runs automatically whenever the script is elevated anyway (winget/WSL/npm/-Sudo), but never
+# triggers elevation by itself — a plain run stays fast and UAC-free. Never reboots on its own
+# (-IgnoreReboot); -AutoReboot at the end of the run handles that if requested.
+Update-Section "Windows Update" ($NoWindowsUpdate -or $OnlyWsl -or $OnlyWslPackages) { Get-Module -ListAvailable -Name PSWindowsUpdate } {
+    if (-not $script:isAdmin) {
+        Write-Status "Windows Update needs admin — run 'update -Sudo' to include it" -Type Skip
+        Write-Log "Windows Update skipped: not elevated." -Level "INFO"
+        $script:skippedSections += "Windows Update (needs admin, use -Sudo)"
+        return
+    }
+    Import-Module PSWindowsUpdate -ErrorAction Stop
+    Write-Status "Searching for Windows updates..." -Type Action
+    $wuAvailable = @(Get-WindowsUpdate -ErrorAction Stop)
+    if ($wuAvailable.Count -eq 0) {
+        Write-Status "No Windows updates available" -Type Success
+        Write-Log "Windows Update: nothing to install." -Level "INFO"
+        return
+    }
+    Write-Status "Installing $($wuAvailable.Count) Windows update(s): $(($wuAvailable | ForEach-Object { if ($_.KB) { $_.KB } else { $_.Title } }) -join ', ')" -Type Info
+    $wuAvailable | ForEach-Object { Write-Log "Windows Update: pending $($_.KB) $($_.Title)" -Level "INFO" }
+    # 6>$null: PSWindowsUpdate prints its own progress table to the information stream.
+    $wuResults = @(Install-WindowsUpdate -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction Stop 6>$null)
+    foreach ($r in $wuResults) {
+        $label = if ($r.KB) { "$($r.KB) $($r.Title)" } else { "$($r.Title)" }
+        Write-Log "Windows Update: $($r.Result) - $label" -Level "INFO"
+        if ("$($r.Result)" -match 'Fail|Abort') {
+            $failedItems["Windows Update"] += $label
+        } elseif ("$($r.Result)" -match 'Install|Download|Accept') {
+            $updatedItems["Windows Update"] += $(if ($r.KB) { $r.KB } else { $r.Title })
+        }
+    }
+    if (Get-WURebootStatus -Silent -ErrorAction SilentlyContinue) {
+        Write-Status "Windows Update requires a reboot to finish (use -AutoReboot to reboot automatically)" -Type Warning
+        Write-Log "Windows Update: reboot required." -Level "INFO"
+    }
 }
 
 # --- Update WSL ---
@@ -2271,7 +2392,7 @@ Update-Section "Windows Subsystem for Linux (WSL)" ($NoWsl -and !$OnlyWsl -and !
                 $updatedItems["WSL"] += "Updated packages in default WSL distro"
                 $autoremoveOut = & $aptRemoveBlock 2>&1
                 $autoremoveExit = $LASTEXITCODE
-                $autoremoveOut | ForEach-Object { Write-Log "  [autoremove] $_" -Level "DEBUG" }
+                Write-LogBlock -Lines $autoremoveOut -Prefix "  [autoremove] "
                 if ($autoremoveExit -ne 0) {
                     Write-Status "apt-get autoremove failed (exit $autoremoveExit)" -Type Warning
                     Write-Log "apt-get autoremove exited $autoremoveExit" -Level "INFO"
@@ -2521,7 +2642,7 @@ Update-Section "Google Cloud SDK" ($NoGCloud -or $OnlyWsl -or $OnlyWslPackages) 
     $gcloudOut  = & gcloud components update --quiet 2>&1
     $gcloudCode = $LASTEXITCODE
     $gcloudText = ($gcloudOut | Out-String)
-    $gcloudOut | ForEach-Object { Write-Log "  [gcloud] $_" -Level "DEBUG" }
+    Write-LogBlock -Lines $gcloudOut -Prefix "  [gcloud] "
 
     if ($gcloudText -match 'disabled for this installation' -or
         $gcloudText -match 'managed by an external package manager' -or
@@ -2545,7 +2666,7 @@ Update-Section "Google Cloud SDK" ($NoGCloud -or $OnlyWsl -or $OnlyWslPackages) 
             $gcloudOut  = & gcloud components update --quiet 2>&1
             $gcloudCode = $LASTEXITCODE
             $gcloudText = ($gcloudOut | Out-String)
-            $gcloudOut | ForEach-Object { Write-Log "  [gcloud-retry] $_" -Level "DEBUG" }
+            Write-LogBlock -Lines $gcloudOut -Prefix "  [gcloud-retry] "
         } else {
             Write-Status "gcloud copy-bundled-python failed (exit $copyCode)" -Type Error
             Write-Log "gcloud copy-bundled-python output: $copyOut" -Level "INFO"
@@ -2579,7 +2700,7 @@ Update-Section "Android SDK" ($NoAndroid -or $OnlyWsl -or $OnlyWslPackages) { Ge
     }
     Write-Status "Updating Android SDK components..." -Type Action
     $sdkOut = & sdkmanager --update 2>&1
-    $sdkOut | ForEach-Object { Write-Log "  [sdkmanager] $_" -Level "DEBUG" }
+    Write-LogBlock -Lines $sdkOut -Prefix "  [sdkmanager] "
     if ($LASTEXITCODE -eq 0) {
         $updatedItems["Android SDK"] += "All SDK components"
     } else {
@@ -2650,7 +2771,7 @@ function Update-EditorExtension {
         Write-Status "Updating outdated extensions ($Cli --update-extensions)..." -Type Action
         $out  = @(& $Cli --update-extensions 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -notmatch 'DeprecationWarning|--trace-deprecation' })
         $exit = $LASTEXITCODE
-        $out | ForEach-Object { Write-Log "  [$Cli --update-extensions] $_" -Level "DEBUG" }
+        Write-LogBlock -Lines $out -Prefix "  [$Cli --update-extensions] "
         if ($exit -ne 0) {
             $out | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
             Write-Status "$Cli --update-extensions failed (exit $exit)" -Type Error
@@ -2754,7 +2875,7 @@ Update-Section "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Comma
     Write-Status "Updating tlmgr and all packages (30 min timeout)..." -Type Action
     # Run in a background job so we can enforce a timeout (tlmgr can hang indefinitely).
     $tl1 = Invoke-TlMgrUpdate
-    $tl1.Lines | ForEach-Object { Write-Log "  [tlmgr] $_" -Level "DEBUG" }
+    Write-LogBlock -Lines $tl1.Lines -Prefix "  [tlmgr] "
     Write-TexLiveLog
     if ($tl1.ExitCode -eq -2) {
         Write-Status "tlmgr timed out after 30 min — run tlmgr manually" -Type Error
@@ -2770,14 +2891,14 @@ Update-Section "TeX Live" ($NoTex -or $OnlyWsl -or $OnlyWslPackages) { Get-Comma
             Write-Status "Running update-tlmgr-latest.exe --update..." -Type Action
             $updaterOutput   = & $updaterPath --update 2>&1
             $updaterExitCode = $LASTEXITCODE
-            $updaterOutput | ForEach-Object { Write-Log "  [updater] $_" -Level "DEBUG" }
+            Write-LogBlock -Lines $updaterOutput -Prefix "  [updater] "
             Remove-Item $updaterPath -ErrorAction SilentlyContinue   # clean up temp file
             Write-TexLiveLog
             if ($updaterExitCode -eq 0) {
                 Write-Log "update-tlmgr-latest.exe succeeded. Retrying tlmgr update." -Level "INFO"
                 Write-Status "tlmgr upgraded — retrying full update (30 min timeout)..." -Type Action
                 $tl2 = Invoke-TlMgrUpdate
-                $tl2.Lines | ForEach-Object { Write-Log "  [tlmgr] $_" -Level "DEBUG" }
+                Write-LogBlock -Lines $tl2.Lines -Prefix "  [tlmgr] "
                 Write-TexLiveLog
                 if ($tl2.ExitCode -eq -2) {
                     Write-Status "tlmgr timed out after 30 min on retry — run tlmgr manually" -Type Error
@@ -2857,9 +2978,19 @@ if (-not $hasFailures) {
 
 if ($skippedSections.Count -gt 0) {
     Write-BlankLine
-    Write-Host "  $([char]0x25CB)  " -NoNewline -ForegroundColor DarkGray
-    Write-Host "Skipped ($($skippedSections.Count)): " -NoNewline -ForegroundColor DarkGray
-    Write-Host (Format-SummaryLine -Items $skippedSections -MaxShown 12) -ForegroundColor DarkGray
+    # Actionable skips (needs admin, delisted extension, Git.Git blocked ...) first and readable;
+    # tools that simply aren't installed collapsed into one dim line — they used to make up most
+    # of the list and buried the skips that actually need attention.
+    $notInstalled = @($skippedSections | Where-Object { $_ -like '* (not installed)' } | ForEach-Object { $_ -replace ' \(not installed\)$', '' })
+    $otherSkipped = @($skippedSections | Where-Object { $_ -notlike '* (not installed)' })
+    if ($otherSkipped.Count -gt 0) {
+        Write-Host "  $([char]0x25CB)  " -NoNewline -ForegroundColor Yellow
+        Write-Host "Skipped ($($otherSkipped.Count)): " -NoNewline -ForegroundColor Gray
+        Write-Host (Format-SummaryLine -Items $otherSkipped -MaxShown 12) -ForegroundColor Gray
+    }
+    if ($notInstalled.Count -gt 0) {
+        Write-Host "  $([char]0x25CB)  Not installed ($($notInstalled.Count)): $(Format-SummaryLine -Items $notInstalled -MaxShown 20)" -ForegroundColor DarkGray
+    }
     $script:lastLineBlank = $false
 }
 
@@ -2939,6 +3070,7 @@ if ($hasFailures) {
 } else {
     Write-Log "Script completed successfully."
 }
+Write-Log "Exit code: $exitCode"
 
 # --- Notifications ---
 $failedSectionList = @()
