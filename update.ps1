@@ -177,7 +177,7 @@
 .NOTES
     Author: baurfm
     Date: 2026-10-27
-    Version: 12.26
+    Version: 12.27
 #>
 
 [CmdletBinding()]
@@ -351,7 +351,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.26'
+$script:VersionString  = '12.27'
 $script:OnlyFilter     = ConvertTo-OnlyFilter -Only $Only
 $script:parallelJobs   = @{}
 $script:prefetchVersions = @{}
@@ -2034,6 +2034,15 @@ Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPacka
         if ($LASTEXITCODE -ne 0) {
             Write-Status "scoop cleanup failed (exit $LASTEXITCODE)" -Type Warning
             $failedItems["Scoop"] += "scoop cleanup (Exit Code: $LASTEXITCODE)"
+        }
+
+        # Downloaded installers are only needed to reinstall the exact same version — clearing them
+        # every run keeps the cache from growing into gigabytes over time.
+        Write-Status "Clearing download cache..." -Type Action
+        Invoke-NativeCapture -Command { & scoop cache rm --all } -LogTag "scoop cache rm" -EchoOnFailure
+        if ($LASTEXITCODE -ne 0) {
+            Write-Status "scoop cache rm failed (exit $LASTEXITCODE)" -Type Warning
+            $failedItems["Scoop"] += "scoop cache rm (Exit Code: $LASTEXITCODE)"
         }
     }
 }

@@ -8,7 +8,7 @@ Sections are organised into logical groups in the order they run:
 
 | Category | Tools Updated | Command Used |
 |----------|---------------|--------------|
-| **Scoop** | Scoop itself + all packages | `scoop update *`, `scoop cleanup *` |
+| **Scoop** | Scoop itself + all packages; removes old versions and clears the download cache | `scoop update *`, `scoop cleanup *`, `scoop cache rm --all` |
 | **Winget** | All Microsoft Store / winget apps (pinned packages ignored) | `winget upgrade --all` |
 | **Chocolatey** | All Chocolatey packages | `choco upgrade all -y` |
 
