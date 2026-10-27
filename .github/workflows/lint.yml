@@ -58,7 +58,12 @@ jobs:
       - name: Run PSScriptAnalyzer (fail on Error severity only)
         shell: pwsh
         run: |
-          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+          # Retry: PSGallery has transient outages ("failed to download" / "No match was found")
+          # that turned v12.25's CI red without any code problem.
+          foreach ($i in 1..3) {
+            try { Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop; break }
+            catch { if ($i -eq 3) { throw }; Write-Host "Install attempt $i failed: $_ — retrying in 20s"; Start-Sleep 20 }
+          }
           # -Path takes a single string, not an array (Invoke-ScriptAnalyzer's PSPath parameter
           # set is the one that accepts multiple paths) -- run once per file instead.
           $results = @(
@@ -80,7 +85,10 @@ jobs:
       - name: Run Pester
         shell: pwsh
         run: |
-          Install-Module -Name Pester -MinimumVersion 5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          foreach ($i in 1..3) {
+            try { Install-Module -Name Pester -MinimumVersion 5.0 -Force -SkipPublisherCheck -Scope CurrentUser -ErrorAction Stop; break }
+            catch { if ($i -eq 3) { throw }; Write-Host "Install attempt $i failed: $_ — retrying in 20s"; Start-Sleep 20 }
+          }
           Import-Module Pester -MinimumVersion 5.0
           $config = New-PesterConfiguration
           $config.Run.Path = 'tests'
