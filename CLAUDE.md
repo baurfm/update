@@ -22,7 +22,7 @@ Zwei Dateien, kein Build:
 - Neue Sektions-Keys in `$sectionKeys` eintragen, sonst crashed die Summary
 - Sektion in die passende **logische Gruppe** einsortieren (Package Managers → Shell/Terminal → System → JavaScript → Python → Other Languages → Cloud/DevOps → Dev Tooling → Typesetting), nicht am Ende anhängen
 - Neuen `[switch]$NoX`-Parameter in der Parameter-Liste ergänzen, mit kurzem Kommentar
-- Dokumentieren in `README.md`: Tool-Tabelle + Parameter-Tabelle
+- Dokumentieren in `docs/tools.md` (Tool-Tabelle) + `docs/parameters.md` (Parameter-Tabelle). `README.md` bleibt kurz und aufgabenorientiert — nur bei wirklich nutzerrelevanten Neuerungen anfassen, keine Referenztabellen dorthin zurückholen
 
 ## Logging-Regel (wichtig!)
 
@@ -44,7 +44,7 @@ Write-Log "msg" -Level "INFO"   # ← INFO, NICHT WARN (sonst Doppelausgabe im T
 Bei jeder funktionalen Änderung:
 
 1. Script-Header-Version in `update.ps1` erhöhen
-2. README.md Version History Eintrag ergänzen
+2. `CHANGELOG.md` Eintrag ergänzen (oben)
 3. Commit-Message-Format: `vX.Y: <kurz-summary>`
 
 ## Tests

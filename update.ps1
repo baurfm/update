@@ -128,6 +128,11 @@
 .PARAMETER NotifyOn
     Controls when notifications fire: Always, Failure (default), or Never.
 
+.PARAMETER PathSetup
+    Controls the auto-registered 'update' command, then exits. On: create the update.cmd shim and
+    add the script dir to User PATH (only if 'update' isn't already reachable some other way).
+    Off: remove both and keep them off on future runs. Status: show what 'update' resolves to.
+
 .PARAMETER SkipNetworkCheck
     Skip the network reachability pre-check at startup.
 
@@ -174,7 +179,7 @@
 .NOTES
     Author: baurfm
     Date: 2026-10-27
-    Version: 12.24
+    Version: 12.25
 #>
 
 [CmdletBinding()]
@@ -215,7 +220,8 @@ param(
     [switch]$NoCursor,      # Skip Cursor extension updates
     [switch]$NoWindowsUpdate, # Skip Windows Update (PSWindowsUpdate; only runs when elevated anyway)
     [switch]$DryRun,        # Show what would be updated without running updates
-    [switch]$RemoveFromPath, # Remove update.cmd shim and strip script dir from User PATH, then exit
+    [ValidateSet('On','Off','Status')]
+    [string]$PathSetup,     # 'update' command on PATH: On (create + keep), Off (remove + stay off), Status; then exit
     [switch]$OnlyWsl,
     [switch]$OnlyWslPackages,
 
@@ -224,6 +230,12 @@ param(
     # ran the self-update check and the elevation pre-checks — redoing all of that in the
     # elevated child would just print everything twice. Not meant to be passed manually.
     [switch]$Elevated,
+    # Internal: the elevated child can't detect its terminal itself — WT_SESSION/TERM_PROGRAM
+    # aren't inherited across sudo/runas. The parent passes down whether emoji render (-Emoji)
+    # and whether we're inside Windows Terminal (-InWindowsTerminal, needed for the winget
+    # Windows-Terminal self-upgrade protection, which otherwise never fired in the elevated run).
+    [switch]$Emoji,
+    [switch]$InWindowsTerminal,
 
     [Parameter(HelpMessage = "Run only sections whose name matches one of these (substring match, e.g. -Only npm,uv). All other sections are skipped.")]
     [string[]]$Only,
@@ -341,7 +353,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.24'
+$script:VersionString  = '12.25'
 $script:OnlyFilter     = ConvertTo-OnlyFilter -Only $Only
 $script:parallelJobs   = @{}
 $script:prefetchVersions = @{}
@@ -361,7 +373,8 @@ $script:lastLineBlank  = $true   # avoids a spurious leading blank before the ve
 
 # Emoji only where the terminal reliably renders them (Windows Terminal, VS Code's terminal) —
 # classic conhost shows boxes instead. UPDATE_NO_EMOJI=1 forces the plain-symbol fallback.
-$script:UseEmoji = (-not $env:UPDATE_NO_EMOJI) -and [bool]($env:WT_SESSION -or $env:TERM_PROGRAM -eq 'vscode')
+$script:InWindowsTerminal = [bool]($env:WT_SESSION -or $InWindowsTerminal)
+$script:UseEmoji = (-not $env:UPDATE_NO_EMOJI) -and [bool]($Emoji -or $script:InWindowsTerminal -or $env:TERM_PROGRAM -eq 'vscode')
 # Built via ConvertFromUtf32 rather than literal emoji so the source stays readable/safe on PS5.1.
 $script:GroupStyles = @{
     'Package Managers' = @{ Icon = [char]::ConvertFromUtf32(0x1F4E6); Color = 'Yellow';  Dark = 'DarkYellow' }   # package
@@ -553,7 +566,9 @@ function Update-Section {
         [string]$SectionName,
         [bool]$SkipCondition,
         [scriptblock]$ToolCheck,
-        [scriptblock]$UpdateAction
+        [scriptblock]$UpdateAction,
+        # Optional: shown/recorded with the skip, e.g. "needs admin, use -Sudo"
+        [string]$SkipReason
     )
 
     $script:sectionIndex++
@@ -568,9 +583,10 @@ function Update-Section {
     }
 
     if ($SkipCondition) {
-        Write-Status "$SectionName — skipped" -Type Skip
-        Write-Log "Skipping $SectionName updates."
-        $script:skippedSections += $SectionName
+        $label = if ($SkipReason) { "$SectionName ($SkipReason)" } else { $SectionName }
+        Write-Status "$SectionName — skipped$(if ($SkipReason) { " ($SkipReason)" })" -Type Skip
+        Write-Log "Skipping $label."
+        $script:skippedSections += $label
         return
     }
 
@@ -1024,6 +1040,34 @@ function Invoke-TlMgrUpdate {
     return $result
 }
 
+# True if $Dir is already an entry of the persistent User PATH (path-normalized, case-insensitive).
+function Test-DirInUserPath {
+    param([string]$Dir)
+    $resolvedDir = try { (Resolve-Path $Dir -ErrorAction Stop).Path.TrimEnd('\') } catch { $Dir.TrimEnd('\') }
+    $userPath    = [Environment]::GetEnvironmentVariable('PATH', 'User')
+    foreach ($entry in @($userPath -split ';' | Where-Object { $_ })) {
+        $resolved = try { (Resolve-Path $entry -ErrorAction Stop).Path.TrimEnd('\') } catch { $entry.TrimEnd('\') }
+        if ($resolved -ieq $resolvedDir) { return $true }
+    }
+    return $false
+}
+
+# -PathSetup Status: what 'update' resolves to and whether our own shim/PATH entry/opt-out exist.
+function Show-UpdateCommandStatus {
+    param([string]$ScriptDir)
+    $cmd = Get-Command update -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) {
+        $src = if ($cmd.Source) { $cmd.Source } else { "$($cmd.CommandType) '$($cmd.Name)'" }
+        Write-Status "'update' resolves to: $src" -Type Success
+    } else {
+        Write-Status "'update' is not reachable from this shell (enable with -PathSetup On)" -Type Warning
+    }
+    $shim   = Test-Path (Join-Path $ScriptDir 'update.cmd')
+    $inPath = Test-DirInUserPath -Dir $ScriptDir
+    $optOut = Test-Path $script:PathOptOutFile
+    Write-Status "  update.cmd shim: $(if ($shim) { 'present' } else { 'none' })   script dir in User PATH: $(if ($inPath) { 'yes' } else { 'no' })   auto-setup: $(if ($optOut) { 'off (-PathSetup Off)' } else { 'on' })" -Type Success
+}
+
 # Ensures 'update' is callable from any shell by writing a small update.cmd shim
 # in the script directory and adding that directory to the User PATH. Idempotent:
 # no-op if an 'update' command already resolves (respects user's existing setup).
@@ -1057,18 +1101,8 @@ if %errorlevel%==0 (
         Write-Status "Created update.cmd shim" -Type Info
     }
 
-    $resolvedDir = try { (Resolve-Path $ScriptDir).Path.TrimEnd('\') } catch { $ScriptDir.TrimEnd('\') }
-    $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
-    $entries  = @()
-    if ($userPath) { $entries = $userPath -split ';' | Where-Object { $_ } }
-
-    $alreadyInPath = $false
-    foreach ($e in $entries) {
-        $resolved = try { (Resolve-Path $e -ErrorAction Stop).Path.TrimEnd('\') } catch { $e.TrimEnd('\') }
-        if ($resolved -ieq $resolvedDir) { $alreadyInPath = $true; break }
-    }
-
-    if (-not $alreadyInPath) {
+    if (-not (Test-DirInUserPath -Dir $ScriptDir)) {
+        $userPath    = [Environment]::GetEnvironmentVariable('PATH', 'User')
         $newUserPath = if ($userPath) { "$userPath;$ScriptDir" } else { $ScriptDir }
         [Environment]::SetEnvironmentVariable('PATH', $newUserPath, 'User')
         Write-Status "Added $ScriptDir to user PATH — 'update' is now reachable from any shell" -Type Success
@@ -1081,7 +1115,8 @@ if %errorlevel%==0 (
     }
 }
 
-# Removes the update.cmd shim and strips the script directory from User PATH.
+# -PathSetup Off: removes the update.cmd shim, strips the script directory from User PATH and
+# writes the opt-out marker so it stays off.
 function Remove-UpdateCommand {
     param([string]$ScriptDir)
 
@@ -1113,6 +1148,11 @@ function Remove-UpdateCommand {
             Write-Status "$ScriptDir was not in User PATH" -Type Skip
         }
     }
+
+    # Persist the opt-out — otherwise the next normal run's Initialize-UpdateCommand re-adds both.
+    Set-Content -Path $script:PathOptOutFile -Value "Created by 'update -PathSetup Off' on $(Get-Date -Format s). Delete or run 'update -PathSetup On' to re-enable." -Encoding ASCII
+    Write-Status "Auto-setup disabled — re-enable with -PathSetup On" -Type Success
+    Write-Log "PATH: auto-setup disabled (opt-out marker written)." -Level "INFO"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1127,7 +1167,13 @@ function Lock-UpdateRun {
         try {
             $existing = Get-Content $LockPath -ErrorAction Stop | ConvertFrom-Json
             $alive = $false
-            if ($existing.PID) { $alive = [bool](Get-Process -Id $existing.PID -ErrorAction SilentlyContinue) }
+            # A lock holding OUR OWN PID is always stale: it's left by an earlier run in this same
+            # shell that was aborted with Ctrl+C (the Scoop shim runs the script in-process, so
+            # that PID — the user's shell — is still alive and the dead-PID check below never
+            # fired; every following 'update' in that window then claimed "Another run is active").
+            if ($existing.PID -and $existing.PID -ne $PID) {
+                $alive = [bool](Get-Process -Id $existing.PID -ErrorAction SilentlyContinue)
+            }
             if ($alive) {
                 Write-Status "Another run is active (PID $($existing.PID), started $($existing.StartTime))" -Type Error
                 Write-Log "Lock active: PID=$($existing.PID), started=$($existing.StartTime)" -Level "INFO"
@@ -1463,6 +1509,9 @@ if (-not $PSBoundParameters.ContainsKey('LogFile')) {
     $LogFile = Join-Path $ScriptPath $LogFile
 }
 $script:LockFilePath         = Join-Path $LogDir "update.lock"
+# Marker written by -PathSetup Off so the next normal run doesn't silently re-add the shim/PATH
+# entry (which made the old -RemoveFromPath undo itself on the very next run).
+$script:PathOptOutFile       = Join-Path $ScriptPath ".no-path-setup"
 $script:PendingGitUpdateFlag = Join-Path $LogDir "pending-git-update.json"
 # Log rotation: rename existing log with timestamp, keep the last $LogArchiveCount archives
 # Not on an elevated re-launch or a self-update re-exec: those continue the SAME logical run, and
@@ -1473,9 +1522,13 @@ if ((Test-Path $LogFile) -and -not $isContinuation) {
     $stamp   = $scriptStartTime.ToString('yyyy-MM-dd_HHmmss')
     $logBase = [System.IO.Path]::GetFileNameWithoutExtension($LogFile)
     if ([string]::IsNullOrWhiteSpace($logBase)) { $logBase = 'update' }
-    $archivePath = Join-Path $LogDir "$logBase-$stamp.log"
-    Rename-Item -Path $LogFile -NewName $archivePath -ErrorAction SilentlyContinue
-    Get-ChildItem -Path $LogDir -Filter "$logBase-*.log" |
+    # Archive next to the log file itself: with a custom -LogFile outside logs\, Rename-Item to a
+    # path in logs\ threw ("Cannot rename ... represents a path") — rotation never happened and
+    # the cleanup below looked in the wrong folder.
+    $archiveDir  = Split-Path -Parent $LogFile
+    $archivePath = Join-Path $archiveDir "$logBase-$stamp.log"
+    Move-Item -Path $LogFile -Destination $archivePath -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Path $archiveDir -Filter "$logBase-*.log" |
         Sort-Object LastWriteTime -Descending |
         Select-Object -Skip $script:LogArchiveCount |
         Remove-Item -Force -ErrorAction SilentlyContinue
@@ -1551,9 +1604,15 @@ if ($RegisterSchedule) {
     exit $(if ($ok) { $script:ExitOk } else { $script:ExitHardFailure })
 }
 
-# --- Handle -RemoveFromPath: strip shim + PATH entry and exit ---
-if ($RemoveFromPath) {
-    Remove-UpdateCommand -ScriptDir $ScriptPath
+# --- Handle -PathSetup On|Off|Status and exit ---
+if ($PathSetup) {
+    switch ($PathSetup) {
+        'On'     { Remove-Item $script:PathOptOutFile -Force -ErrorAction SilentlyContinue
+                   Initialize-UpdateCommand -ScriptDir $ScriptPath
+                   Show-UpdateCommandStatus -ScriptDir $ScriptPath }
+        'Off'    { Remove-UpdateCommand -ScriptDir $ScriptPath }
+        'Status' { Show-UpdateCommandStatus -ScriptDir $ScriptPath }
+    }
     exit $script:ExitOk
 }
 
@@ -1575,7 +1634,11 @@ if (-not $SkipNetworkCheck -and -not $DryRun) {
 }
 
 # --- Auto-register 'update' command on PATH (silent if already reachable) ---
-Initialize-UpdateCommand -ScriptDir $ScriptPath
+# Not on -DryRun (must not change the system), not in the elevated child / self-update re-exec
+# (the parent already did it), and never after an explicit -PathSetup Off.
+if (-not $DryRun -and -not $isContinuation -and -not (Test-Path $script:PathOptOutFile)) {
+    Initialize-UpdateCommand -ScriptDir $ScriptPath
+}
 
 # --- Self-update via git pull ---
 # Skipped on an elevated re-launch — the parent process already ran this check.
@@ -1818,6 +1881,10 @@ if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -o
         # Mark the child as the elevated re-launch so it skips the banner, self-update check and
         # pre-checks — this process (the parent) already did all of that.
         $argArray += "-Elevated"
+        # The elevated child doesn't inherit WT_SESSION (sudo/runas start a fresh environment), so
+        # it fell back to plain symbols — hand the parent's emoji decision down explicitly.
+        if ($script:UseEmoji)          { $argArray += "-Emoji" }
+        if ($script:InWindowsTerminal) { $argArray += "-InWindowsTerminal" }
 
         # Not running as admin, so attempt to re-launch with elevation.
         # Use the current PowerShell executable (pwsh.exe for PS7, powershell.exe for PS5)
@@ -1836,7 +1903,9 @@ if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -o
         if ($sudoExists) {
             # Use the new Windows 'sudo' to re-launch.
             Write-Status "Administrator privileges required — re-launching with 'sudo'..." -Type Action
-            & sudo $psExe -ExecutionPolicy Bypass -File $MyInvocation.MyCommand.Definition @argArray
+            # -NoProfile: the elevated child loaded the user's profile — slow, and profile output
+            # ("Profile loading finished in …") leaked into the middle of the run's output.
+            & sudo $psExe -NoProfile -ExecutionPolicy Bypass -File $MyInvocation.MyCommand.Definition @argArray
             exit $LASTEXITCODE
         } else {
             # Fallback to the traditional self-elevation method.
@@ -1852,9 +1921,11 @@ if (-not $DryRun -and ($Sudo -or $wingetNeedsElevation -or $wslNeedsElevation -o
                 }
             }
             $argStrParts += "-Elevated"
+            if ($script:UseEmoji)          { $argStrParts += "-Emoji" }
+            if ($script:InWindowsTerminal) { $argStrParts += "-InWindowsTerminal" }
             $argStr = $argStrParts -join ' '
             $newProcess = New-Object System.Diagnostics.ProcessStartInfo $psExe
-            $newProcess.Arguments = "-ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Definition)`" $argStr"
+            $newProcess.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Definition)`" $argStr"
             $newProcess.Verb = "runas"
             try {
                 [System.Diagnostics.Process]::Start($newProcess) | Out-Null
@@ -2010,19 +2081,23 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
 
         # Git.Git-Schutz: Inno Setup erkennt laufende bash.exe/git.exe und bricht Silent-Install
         # mit Exit 1 ab. Wenn update.ps1 aus einer Git-Bash läuft (z.B. Claude-Code-Terminal),
-        # würde Git.Git bei jedem Lauf reproduzierbar fehlschlagen. Lösung: temporärer --gated-Pin,
+        # würde Git.Git bei jedem Lauf reproduzierbar fehlschlagen. Lösung: temporärer Pin,
         # im finally wieder entfernt. User-eigene Pins lassen wir unangetastet.
         $pinAddedByUs  = $false
         $gitSkipReason = $null
         if ($upgradablePackages -contains 'Git.Git') {
             $gitBlockers = Test-GitBinariesInUse
             if ($gitBlockers.Count -gt 0) {
-                $pinList = (& winget pin list --id Git.Git 2>$null | Out-String)
-                $alreadyPinned = $pinList -match '(?im)^\s*Git\.Git\b'
+                $pinList = (& winget pin list --id Git.Git -e 2>$null | Out-String)
+                # Rows start with the package name ("Git"), not the ID — match the ID anywhere.
+                $alreadyPinned = $pinList -match '(?i)\bGit\.Git\b'
                 if (-not $alreadyPinned) {
                     Write-Status "Git.Git update would fail (running: $($gitBlockers -join ', ')) — pinning Git.Git temporarily" -Type Warning
                     Write-Log "Winget: pinning Git.Git to skip during --all (blockers: $($gitBlockers -join ', '))" -Level "INFO"
-                    & winget pin add --id Git.Git --gated --accept-source-agreements 2>&1 |
+                    # Plain pin (no --gated: that option doesn't exist and failed with 0x8A150002
+                    # "invalid arguments" every time). A default pin excludes the package from
+                    # `upgrade --all` while still allowing explicit upgrades — exactly what's needed.
+                    & winget pin add --id Git.Git -e --accept-source-agreements 2>&1 |
                         ForEach-Object { Write-Log "  [winget-pin] $_" -Level "DEBUG" }
                     if ($LASTEXITCODE -eq 0) {
                         $pinAddedByUs  = $true
@@ -2049,25 +2124,31 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
         # Winget-Abschnitt ab, noch bevor die Upgrade-Liste überhaupt vollständig abgearbeitet ist
         # (siehe Vorfall 2026-09-15). Aus einer anderen Konsole (klassisches powershell.exe/cmd.exe,
         # kein WT_SESSION) ist das Update ungefährlich und wird nicht geskippt.
-        $terminalPinAddedByUs = $false
-        if ($upgradablePackages -contains 'Microsoft.IntelligentTerminal' -and $env:WT_SESSION) {
-            $pinList = (& winget pin list --id Microsoft.IntelligentTerminal 2>$null | Out-String)
-            $alreadyPinned = $pinList -match '(?im)^\s*Microsoft\.IntelligentTerminal\b'
-            if (-not $alreadyPinned) {
-                Write-Status "Windows Terminal update would kill this session (running inside Windows Terminal) — pinning temporarily" -Type Warning
-                Write-Log "Winget: pinning Microsoft.IntelligentTerminal — WT_SESSION set, self-upgrade would kill the host console." -Level "INFO"
-                & winget pin add --id Microsoft.IntelligentTerminal --gated --accept-source-agreements 2>&1 |
-                    ForEach-Object { Write-Log "  [winget-pin] $_" -Level "DEBUG" }
-                if ($LASTEXITCODE -eq 0) {
-                    $terminalPinAddedByUs = $true
+        # $script:InWindowsTerminal instead of $env:WT_SESSION: winget almost always runs in the
+        # elevated child, which doesn't inherit WT_SESSION — the protection never fired there.
+        # Both package IDs: Windows Terminal and its "Intelligent Terminal" variant can host us.
+        $terminalPinsAddedByUs = @()
+        if ($script:InWindowsTerminal) {
+            foreach ($termId in @('Microsoft.WindowsTerminal', 'Microsoft.IntelligentTerminal')) {
+                if ($upgradablePackages -notcontains $termId) { continue }
+                # pin list rows start with the package *name*, so match the ID anywhere in the line.
+                $pinList = (& winget pin list --id $termId -e 2>$null | Out-String)
+                if ($pinList -match "(?i)\b$([regex]::Escape($termId))\b") {
+                    Write-Log "Winget: $termId already pinned by user — leaving as-is." -Level "INFO"
                 } else {
-                    Write-Status "winget pin add for Microsoft.IntelligentTerminal failed (exit $LASTEXITCODE) — proceeding anyway, this session may die mid-run" -Type Warning
+                    Write-Status "$termId update would kill this session (running inside Windows Terminal) — pinning temporarily" -Type Warning
+                    Write-Log "Winget: pinning $termId — running inside Windows Terminal, self-upgrade would kill the host console." -Level "INFO"
+                    $pinOut = & winget pin add --id $termId -e --accept-source-agreements 2>&1
+                    Write-LogBlock -Lines $pinOut -Prefix "  [winget-pin] "
+                    if ($LASTEXITCODE -eq 0) {
+                        $terminalPinsAddedByUs += $termId
+                    } else {
+                        Write-Status "winget pin add for $termId failed (exit $LASTEXITCODE) — proceeding anyway, this session may die mid-run" -Type Warning
+                    }
                 }
-            } else {
-                Write-Log "Winget: Microsoft.IntelligentTerminal already pinned by user — leaving as-is." -Level "INFO"
+                $script:skippedSections += "$termId (skipped — run from outside Windows Terminal, e.g. classic powershell.exe/cmd.exe, to update it)"
+                $upgradablePackages = @($upgradablePackages | Where-Object { $_ -ne $termId })
             }
-            $script:skippedSections += "Microsoft.IntelligentTerminal (skipped — run from outside Windows Terminal, e.g. classic powershell.exe/cmd.exe, to update it)"
-            $upgradablePackages = @($upgradablePackages | Where-Object { $_ -ne 'Microsoft.IntelligentTerminal' })
         }
 
         Write-Status "Refreshing winget sources..." -Type Action
@@ -2098,19 +2179,19 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
         finally {
             if ($pinAddedByUs) {
                 Write-Log "Winget: removing temporary Git.Git pin." -Level "INFO"
-                & winget pin remove --id Git.Git 2>&1 |
+                & winget pin remove --id Git.Git -e 2>&1 |
                     ForEach-Object { Write-Log "  [winget-unpin] $_" -Level "DEBUG" }
                 if ($LASTEXITCODE -ne 0) {
                     Write-Status "winget pin remove for Git.Git failed (exit $LASTEXITCODE) — run 'winget pin remove --id Git.Git' manually" -Type Warning
                     Write-Log "Winget: pin remove failed exit $LASTEXITCODE — manual cleanup needed" -Level "INFO"
                 }
             }
-            if ($terminalPinAddedByUs) {
-                Write-Log "Winget: removing temporary Microsoft.IntelligentTerminal pin." -Level "INFO"
-                & winget pin remove --id Microsoft.IntelligentTerminal 2>&1 |
-                    ForEach-Object { Write-Log "  [winget-unpin] $_" -Level "DEBUG" }
+            foreach ($termId in $terminalPinsAddedByUs) {
+                Write-Log "Winget: removing temporary $termId pin." -Level "INFO"
+                $unpinOut = & winget pin remove --id $termId -e 2>&1
+                Write-LogBlock -Lines $unpinOut -Prefix "  [winget-unpin] "
                 if ($LASTEXITCODE -ne 0) {
-                    Write-Status "winget pin remove for Microsoft.IntelligentTerminal failed (exit $LASTEXITCODE) — run 'winget pin remove --id Microsoft.IntelligentTerminal' manually" -Type Warning
+                    Write-Status "winget pin remove for $termId failed (exit $LASTEXITCODE) — run 'winget pin remove --id $termId' manually" -Type Warning
                     Write-Log "Winget: pin remove failed exit $LASTEXITCODE — manual cleanup needed" -Level "INFO"
                 }
             }
@@ -2360,13 +2441,11 @@ Write-GroupHeader "System"
 # Runs automatically whenever the script is elevated anyway (winget/WSL/npm/-Sudo), but never
 # triggers elevation by itself — a plain run stays fast and UAC-free. Never reboots on its own
 # (-IgnoreReboot); -AutoReboot at the end of the run handles that if requested.
-Update-Section "Windows Update" ($NoWindowsUpdate -or $OnlyWsl -or $OnlyWslPackages) { Get-Module -ListAvailable -Name PSWindowsUpdate } {
-    if (-not $script:isAdmin) {
-        Write-Status "Windows Update needs admin — run 'update -Sudo' to include it" -Type Skip
-        Write-Log "Windows Update skipped: not elevated." -Level "INFO"
-        $script:skippedSections += "Windows Update (needs admin, use -Sudo)"
-        return
-    }
+# Only report "needs admin" when the module is actually installed — otherwise the normal
+# "not installed" path should win.
+$wuNeedsAdmin = (-not $script:isAdmin) -and [bool](Get-Module -ListAvailable -Name PSWindowsUpdate)
+$wuSkipReason = if ($wuNeedsAdmin -and -not ($NoWindowsUpdate -or $OnlyWsl -or $OnlyWslPackages)) { 'needs admin, use -Sudo' } else { $null }
+Update-Section "Windows Update" ($NoWindowsUpdate -or $OnlyWsl -or $OnlyWslPackages -or $wuNeedsAdmin) { Get-Module -ListAvailable -Name PSWindowsUpdate } -SkipReason $wuSkipReason -UpdateAction {
     Import-Module PSWindowsUpdate -ErrorAction Stop
     Write-Status "Searching for Windows updates..." -Type Action
     $wuAvailable = @(Get-WindowsUpdate -ErrorAction Stop)
