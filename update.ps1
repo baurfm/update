@@ -170,7 +170,7 @@
 .NOTES
     Author: baurfm
     Date: 2026-10-27
-    Version: 12.20
+    Version: 12.21
 #>
 
 [CmdletBinding()]
@@ -208,6 +208,7 @@ param(
     [switch]$NoComposer,    # Skip Composer self-update
     [switch]$NoKrew,        # Skip krew (kubectl plugin manager) upgrade
     [switch]$NoClaude,      # Skip Claude Code self-update
+    [switch]$NoCursor,      # Skip Cursor extension updates
     [switch]$DryRun,        # Show what would be updated without running updates
     [switch]$RemoveFromPath, # Remove update.cmd shim and strip script dir from User PATH, then exit
     [switch]$OnlyWsl,
@@ -331,10 +332,39 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.20'
+$script:VersionString  = '12.21'
 $script:OnlyFilter     = ConvertTo-OnlyFilter -Only $Only
 $script:parallelJobs   = @{}
+$script:prefetchVersions = @{}
+# Cheap version probes for self-updating tools — Add-SelfUpdateResult compares before/after so a
+# no-op self-update isn't reported as an update. Shared by the sections and Start-ParallelPrefetch.
+$script:SelfUpdateVersionCommands = @{
+    'Oh My Posh'  = { oh-my-posh version }
+    'pnpm'        = { pnpm --version }
+    'Bun'         = { bun --version }
+    'Deno'        = { deno --version }
+    'Poetry'      = { poetry --version }
+    'Rye'         = { rye --version }
+    'Composer'    = { composer --version }
+    'Claude Code' = { claude --version }
+}
 $script:lastLineBlank  = $true   # avoids a spurious leading blank before the very first output
+
+# Emoji only where the terminal reliably renders them (Windows Terminal, VS Code's terminal) —
+# classic conhost shows boxes instead. UPDATE_NO_EMOJI=1 forces the plain-symbol fallback.
+$script:UseEmoji = (-not $env:UPDATE_NO_EMOJI) -and [bool]($env:WT_SESSION -or $env:TERM_PROGRAM -eq 'vscode')
+# Built via ConvertFromUtf32 rather than literal emoji so the source stays readable/safe on PS5.1.
+$script:GroupStyles = @{
+    'Package Managers' = @{ Icon = [char]::ConvertFromUtf32(0x1F4E6); Color = 'Yellow';  Dark = 'DarkYellow' }   # package
+    'Shell / Terminal' = @{ Icon = [char]::ConvertFromUtf32(0x1F41A); Color = 'Green';   Dark = 'DarkGreen' }    # shell
+    'System'           = @{ Icon = [char]::ConvertFromUtf32(0x1F4BB); Color = 'Blue';    Dark = 'DarkBlue' }     # laptop
+    'JavaScript'       = @{ Icon = [char]::ConvertFromUtf32(0x26A1);  Color = 'Yellow';  Dark = 'DarkYellow' }   # zap
+    'Python'           = @{ Icon = [char]::ConvertFromUtf32(0x1F40D); Color = 'Cyan';    Dark = 'DarkCyan' }     # snake
+    'Other Languages'  = @{ Icon = [char]::ConvertFromUtf32(0x1F9E9); Color = 'Magenta'; Dark = 'DarkMagenta' }  # puzzle
+    'Cloud / DevOps'   = @{ Icon = [char]::ConvertFromUtf32(0x1F680); Color = 'Cyan';    Dark = 'DarkCyan' }     # rocket
+    'Dev Tooling'      = @{ Icon = [char]::ConvertFromUtf32(0x1F527); Color = 'Green';   Dark = 'DarkGreen' }    # wrench
+    'Typesetting'      = @{ Icon = [char]::ConvertFromUtf32(0x1F4DC); Color = 'Magenta'; Dark = 'DarkMagenta' }  # scroll
+}
 
 # Prints exactly one blank separator line — never two in a row, regardless of which combination
 # of Write-GroupHeader / Write-SectionHeader / Update-Section / Write-Status calls precede it.
@@ -384,7 +414,17 @@ function Write-SectionHeader {
     if ($script:QuietMode) { return }
     Write-BlankLine
     Write-Host "  $([char]0x25B6)  " -NoNewline -ForegroundColor DarkCyan   # ▶
-    if ($Progress) { Write-Host "[$Progress]  " -NoNewline -ForegroundColor DarkGray }
+    if ($Progress) {
+        Write-Host "[$Progress] " -NoNewline -ForegroundColor DarkGray
+        # Mini progress bar ━━━━──── so the position in the run is visible at a glance.
+        $parts = $Progress -split '/'
+        if ($parts.Count -eq 2 -and [int]$parts[1] -gt 0) {
+            $barWidth = 10
+            $filled   = [Math]::Max(1, [Math]::Round(([int]$parts[0] / [int]$parts[1]) * $barWidth))
+            Write-Host (([char]0x2501).ToString() * $filled) -NoNewline -ForegroundColor Cyan
+            Write-Host (([char]0x2500).ToString() * ($barWidth - $filled) + '  ') -NoNewline -ForegroundColor DarkGray
+        }
+    }
     Write-Host $Title -ForegroundColor Cyan
     $script:lastLineBlank = $false
     Write-BlankLine
@@ -396,11 +436,16 @@ function Write-GroupHeader {
     if ($script:QuietMode) { return }
     $maxLen = 54   # 58-char rule minus 4 for the ▪ prefix — truncate if longer
     if ($Title.Length -gt $maxLen) { $Title = $Title.Substring(0, $maxLen - 3) + '...' }
-    $line = ([char]0x2550).ToString() * 58   # ══════════ (double rule — visually heavier)
+    $line  = ([char]0x2550).ToString() * 58   # ══════════ (double rule — visually heavier)
+    # Each group gets its own color (and an emoji where supported) so the run is easy to scan.
+    $style = $script:GroupStyles[$Title]
+    $color = if ($style) { $style.Color } else { 'Yellow' }
+    $dark  = if ($style) { $style.Dark }  else { 'DarkYellow' }
+    $icon  = if ($script:UseEmoji -and $style) { $style.Icon } else { [char]0x25AA }   # ▪ fallback
     Write-BlankLine
-    Write-Host "  $line" -ForegroundColor DarkGray
-    Write-Host "  $([char]0x25AA) " -NoNewline -ForegroundColor DarkYellow   # ▪
-    Write-Host $Title -ForegroundColor Yellow
+    Write-Host "  $line" -ForegroundColor $dark
+    Write-Host "  $icon " -NoNewline -ForegroundColor $dark
+    Write-Host $Title.ToUpper() -ForegroundColor $color
     $script:lastLineBlank = $false
     Write-BlankLine
 }
@@ -618,6 +663,30 @@ function Invoke-WithRetry {
 
 # Helper: standard "tool self-update" — wraps Invoke-WithRetry and records into result hashtables.
 # Write-Status for the action line is intentionally inside callers so the message can be customised.
+# Runs a tool's cheap version probe (e.g. { deno --version }); $null if none given or it fails.
+function Get-ToolVersionText {
+    param([scriptblock]$Command)
+    if (-not $Command) { return $null }
+    try { return ((& $Command 2>$null | Out-String).Trim()) } catch { return $null }
+}
+
+# Records a successful self-update — but only as "updated" if the version actually changed.
+# Without the before/after comparison every no-op self-update (tool already current) inflated
+# the summary, JSON report and -NotifyOn Always messages as an update.
+function Add-SelfUpdateResult {
+    param([string]$ToolName, [string]$Key, [AllowNull()] [string]$Before, [AllowNull()] [string]$After)
+    $outcome = Get-SelfUpdateOutcome -Before $Before -After $After
+    if ($outcome -eq 'Current') {
+        Write-Status "$ToolName already up-to-date" -Type Success
+        Write-Log "$ToolName already current ($After)." -Level "INFO"
+        return
+    }
+    if ($outcome -eq 'Updated') {
+        Write-Log "$ToolName updated: $Before -> $After" -Level "INFO"
+    }
+    $updatedItems[$Key] += $ToolName
+}
+
 function Invoke-SelfUpdate {
     param(
         [Parameter(Mandatory)]
@@ -626,12 +695,15 @@ function Invoke-SelfUpdate {
         [string]$Key,
         [Parameter(Mandatory)]
         [scriptblock]$Action,
-        [string]$ActionName
+        [string]$ActionName,
+        [scriptblock]$VersionCommand,
+        [string]$VersionBefore
     )
     if (-not $ActionName) { $ActionName = "$ToolName self-update" }
+    if (-not $VersionBefore) { $VersionBefore = Get-ToolVersionText $VersionCommand }
     Write-Status "Updating $ToolName..." -Type Action
     if (Invoke-WithRetry -Action $Action -ActionName $ActionName) {
-        $updatedItems[$Key] += $ToolName
+        Add-SelfUpdateResult -ToolName $ToolName -Key $Key -Before $VersionBefore -After (Get-ToolVersionText $VersionCommand)
     } else {
         Write-Status "$ToolName self-update failed" -Type Error
         $failedItems[$Key] += "$ToolName self-update (failed)"
@@ -648,12 +720,16 @@ function Invoke-SelfUpdateWithPrefetch {
         [Parameter(Mandatory)] [string]$ToolName,
         [Parameter(Mandatory)] [string]$Key,
         [Parameter(Mandatory)] [scriptblock]$Action,
-        [string]$ActionName
+        [string]$ActionName,
+        [scriptblock]$VersionCommand
     )
     if (-not $ActionName) { $ActionName = "$ToolName self-update" }
+    $versionBefore = $null
     if ($script:parallelJobs.ContainsKey($Key)) {
         $job = $script:parallelJobs[$Key]
         $script:parallelJobs.Remove($Key)
+        # Captured by Start-ParallelPrefetch before the job could change the tool.
+        $versionBefore = $script:prefetchVersions[$Key]
         Write-Status "Updating $ToolName..." -Type Action
         $done = $job | Wait-Job -Timeout 90
         $result = if ($done) { $job | Receive-Job -ErrorAction SilentlyContinue } else { $null }
@@ -661,12 +737,12 @@ function Invoke-SelfUpdateWithPrefetch {
         $job | Remove-Job -Force -ErrorAction SilentlyContinue
         if ($result -and $result.ExitCode -eq 0) {
             Write-Log "$ActionName succeeded (prefetched in parallel)." -Level "INFO"
-            $updatedItems[$Key] += $ToolName
+            Add-SelfUpdateResult -ToolName $ToolName -Key $Key -Before $versionBefore -After (Get-ToolVersionText $VersionCommand)
             return
         }
         Write-Log "$ActionName prefetch missed or failed (exit $($result.ExitCode)) — falling back to sequential retry." -Level "INFO"
     }
-    Invoke-SelfUpdate -ToolName $ToolName -Key $Key -Action $Action -ActionName $ActionName
+    Invoke-SelfUpdate -ToolName $ToolName -Key $Key -Action $Action -ActionName $ActionName -VersionCommand $VersionCommand -VersionBefore $versionBefore
 }
 
 # Launches independent, quick tool self-updates as background jobs before the (much slower)
@@ -687,6 +763,7 @@ function Start-ParallelPrefetch {
         $spec = $specs[$key]
         if ($spec.Skip -or -not (Test-SectionWanted -Name $key)) { continue }
         if (-not (Get-Command $spec.Tool -ErrorAction SilentlyContinue)) { continue }
+        $script:prefetchVersions[$key] = Get-ToolVersionText $script:SelfUpdateVersionCommands[$key]
         $cmdText = $spec.Cmd.ToString()
         $script:parallelJobs[$key] = Start-Job -Name "prefetch-$key" -ScriptBlock {
             param($cmdText)
@@ -1302,7 +1379,16 @@ if (-not $script:QuietMode -and -not $Elevated) {
     $_gem     = [char]0x25C6
     $_title   = "  $_gem  Windows Update Script  "
     $_dateStr = "  $_gem  $($scriptStartTime.ToString('yyyy-MM-dd  HH:mm:ss'))"
+    # "UPDATE" logo, each line one step of a cyan -> magenta gradient.
+    $_logo = @(
+        '   _   _ ___ ___   _ _____ ___ '
+        '  | | | | _ \   \ /_\_   _| __|'
+        '  | |_| |  _/ |) / _ \| | | _| '
+        '   \___/|_| |___/_/ \_\_| |___|'
+    )
+    $_logoColors = 'Cyan', 'DarkCyan', 'Blue', 'Magenta'
     Write-Host ""
+    for ($_i = 0; $_i -lt $_logo.Count; $_i++) { Write-Host $_logo[$_i] -ForegroundColor $_logoColors[$_i] }
     Write-Host $_bTop -ForegroundColor DarkGray
     Write-Host "  $_bBar" -NoNewline -ForegroundColor DarkGray
     Write-Host $_title -NoNewline -ForegroundColor DarkGray
@@ -1654,7 +1740,7 @@ $sectionKeys = "Scoop", "Winget", "Chocolatey",
               "pipx", "uv", "Poetry", "Rye",
               ".NET Global Tools", "Rust", "Ruby Gems", "Composer",
               "Google Cloud SDK", "Azure CLI", "Android SDK", "Helm plugins", "krew plugins",
-              "VS Code Extensions", "GitHub CLI Extensions", "Claude Code",
+              "VS Code Extensions", "Cursor Extensions", "GitHub CLI Extensions", "Claude Code",
               "TeX Live"
 $script:sectionIndex   = 0
 $script:totalSections  = $sectionKeys.Count
@@ -1949,6 +2035,31 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
     $installedModules = Get-InstalledModule
     Write-Status "Found $($installedModules.Count) modules to check" -Type Info
 
+    # PSResourceGet (Install-PSResource, the default in PS 7.4+) keeps its own install records —
+    # modules installed that way are invisible to Get-InstalledModule and were never updated.
+    # Runs before the "all current" early return below.
+    if (Get-Command Get-InstalledPSResource -ErrorAction SilentlyContinue) {
+        $v2Names = @($installedModules.Name)
+        $psrOnly = @(Get-InstalledPSResource -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notin $v2Names } | Select-Object -ExpandProperty Name -Unique)
+        Write-Log "PSResourceGet-only resources: $($psrOnly.Count)" -Level "INFO"
+        foreach ($name in $psrOnly) {
+            $before = (Get-InstalledPSResource -Name $name -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).Version
+            try {
+                Update-PSResource -Name $name -TrustRepository -ErrorAction Stop -WarningAction SilentlyContinue
+                $after = (Get-InstalledPSResource -Name $name -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).Version
+                if ("$after" -ne "$before") {
+                    $updatedItems["PowerShell Modules"] += $name
+                    Write-Log "PSResourceGet: $name $before -> $after" -Level "INFO"
+                }
+            } catch {
+                Write-Status "Failed: $name (PSResourceGet) - $($_.Exception.Message)" -Type Error
+                Write-Log "PSResourceGet: $name failed: $($_.Exception.Message)" -Level "INFO"
+                $failedItems["PowerShell Modules"] += "$name (PSResourceGet) - $($_.Exception.Message)"
+            }
+        }
+    }
+
     # Batch-check latest versions from PSGallery — skip modules already at latest
     Write-Status "Checking PSGallery for available updates..." -Type Action
     $latestInGallery = @{}
@@ -2074,7 +2185,7 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
 # --- Update Oh My Posh ---
 Update-Section "Oh My Posh" ($NoOhMyPosh -or $OnlyWsl -or $OnlyWslPackages) { Get-Command oh-my-posh -ErrorAction SilentlyContinue } {
     Invoke-SelfUpdateWithPrefetch -ToolName "Oh My Posh" -Key "Oh My Posh" `
-        -Action { & oh-my-posh upgrade 2>&1 | Out-Null } -ActionName "oh-my-posh upgrade"
+        -Action { & oh-my-posh upgrade 2>&1 | Out-Null } -ActionName "oh-my-posh upgrade" -VersionCommand $script:SelfUpdateVersionCommands['Oh My Posh']
 }
 
 # ══════════════════════════════════════════════════════
@@ -2216,35 +2327,50 @@ Update-Section "npm (Node Package Manager) Packages" ($NoNpm -or $OnlyWsl -or $O
     }
 
     Write-Status "Updating npm itself..." -Type Action
-    if (-not (Invoke-WithRetry -Action { & npm install -g npm } -ActionName "npm install -g npm")) {
+    $npmSelfOk = Invoke-WithRetry -Action { & npm install -g npm } -ActionName "npm install -g npm"
+    if (-not $npmSelfOk) {
         Write-Status "npm self-update failed" -Type Warning
         $failedItems["npm"] += "npm install -g npm (failed after retries)"
     }
 
-    Write-Status "Updating all global packages..." -Type Action
-    if (Invoke-WithRetry -Action { & npm update -g } -ActionName "npm update -g") {
-        $updatedItems["npm"] += $npmToUpdate
+    # Explicit <pkg>@<latest> instead of `npm update -g`: update respects semver ranges and never
+    # crosses a major version, so major-outdated packages were reported as updated but stayed old.
+    $npmSpecs = @($npmToUpdate | Where-Object { $_ -ne 'npm' } | ForEach-Object {
+        $latest = $npmOutdated.$_.latest
+        if ($latest) { "$_@$latest" } else { "$_@latest" }
+    })
+    if ($npmSelfOk -and $npmToUpdate -contains 'npm') { $updatedItems["npm"] += 'npm' }
+    if ($npmSpecs.Count -eq 0) { return }
+
+    Write-Status "Installing latest versions of $($npmSpecs.Count) global package(s)..." -Type Action
+    # Built as text with every spec single-quoted: a closure over $npmSpecs wouldn't survive
+    # Invoke-WithTimeout's scriptblock serialization (-Unattended), and an unquoted
+    # "@scope/pkg@1.0" token would be parsed by PowerShell as splatting.
+    $npmArgText = ($npmSpecs | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ' '
+    $npmInstall = [scriptblock]::Create("& npm install -g $npmArgText")
+    if (Invoke-WithRetry -Action $npmInstall -ActionName "npm install -g (outdated packages)") {
+        $updatedItems["npm"] += @($npmToUpdate | Where-Object { $_ -ne 'npm' })
     } else {
-        Write-Status "npm update -g failed after retries" -Type Error
-        $failedItems["npm"] += "npm update -g (failed after retries)"
+        Write-Status "npm install -g failed after retries" -Type Error
+        $failedItems["npm"] += "npm install -g $($npmSpecs -join ' ') (failed after retries)"
     }
 }
 
 # --- Update pnpm ---
 Update-Section "pnpm" ($NoPnpm -or $OnlyWsl -or $OnlyWslPackages) { Get-Command pnpm -ErrorAction SilentlyContinue } {
-    Invoke-SelfUpdateWithPrefetch -ToolName "pnpm" -Key "pnpm" -Action { & pnpm self-update 2>&1 | Out-Null }
+    Invoke-SelfUpdateWithPrefetch -ToolName "pnpm" -Key "pnpm" -Action { & pnpm self-update 2>&1 | Out-Null } -VersionCommand $script:SelfUpdateVersionCommands['pnpm']
 }
 
 # --- Update Bun ---
 Update-Section "Bun" ($NoBun -or $OnlyWsl -or $OnlyWslPackages) { Get-Command bun -ErrorAction SilentlyContinue } {
     Invoke-SelfUpdateWithPrefetch -ToolName "Bun" -Key "Bun" `
-        -Action { & bun upgrade 2>&1 | Out-Null } -ActionName "bun upgrade"
+        -Action { & bun upgrade 2>&1 | Out-Null } -ActionName "bun upgrade" -VersionCommand $script:SelfUpdateVersionCommands['Bun']
 }
 
 # --- Update Deno ---
 Update-Section "Deno" ($NoDeno -or $OnlyWsl -or $OnlyWslPackages) { Get-Command deno -ErrorAction SilentlyContinue } {
     Invoke-SelfUpdateWithPrefetch -ToolName "Deno" -Key "Deno" `
-        -Action { & deno upgrade 2>&1 | Out-Null } -ActionName "deno upgrade"
+        -Action { & deno upgrade 2>&1 | Out-Null } -ActionName "deno upgrade" -VersionCommand $script:SelfUpdateVersionCommands['Deno']
 }
 
 # ══════════════════════════════════════════════════════
@@ -2267,9 +2393,10 @@ Update-Section "pipx packages" ($NoPipx -or $OnlyWsl -or $OnlyWslPackages) { Get
 # --- Update uv ---
 Update-Section "uv" ($NoUv -or $OnlyWsl -or $OnlyWslPackages) { Get-Command uv -ErrorAction SilentlyContinue } {
     Write-Status "Updating uv..." -Type Action
+    $uvBefore = Get-ToolVersionText { uv --version }
     & uv self update 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) {
-        $updatedItems["uv"] += "uv"
+        Add-SelfUpdateResult -ToolName "uv" -Key "uv" -Before $uvBefore -After (Get-ToolVersionText { uv --version })
     } elseif ($LASTEXITCODE -eq 2) {
         # Exit code 2 = uv managed by an external package manager (Scoop, pip, brew, etc.)
         # It will be updated by that manager — not a failure.
@@ -2290,13 +2417,13 @@ Update-Section "uv" ($NoUv -or $OnlyWsl -or $OnlyWslPackages) { Get-Command uv -
 # --- Update Poetry ---
 Update-Section "Poetry" ($NoPoetry -or $OnlyWsl -or $OnlyWslPackages) { Get-Command poetry -ErrorAction SilentlyContinue } {
     Invoke-SelfUpdateWithPrefetch -ToolName "Poetry" -Key "Poetry" `
-        -Action { & poetry self update 2>&1 | Out-Null } -ActionName "poetry self update"
+        -Action { & poetry self update 2>&1 | Out-Null } -ActionName "poetry self update" -VersionCommand $script:SelfUpdateVersionCommands['Poetry']
 }
 
 # --- Update Rye ---
 Update-Section "Rye" ($NoRye -or $OnlyWsl -or $OnlyWslPackages) { Get-Command rye -ErrorAction SilentlyContinue } {
     Invoke-SelfUpdateWithPrefetch -ToolName "Rye" -Key "Rye" `
-        -Action { & rye self update 2>&1 | Out-Null } -ActionName "rye self update"
+        -Action { & rye self update 2>&1 | Out-Null } -ActionName "rye self update" -VersionCommand $script:SelfUpdateVersionCommands['Rye']
 }
 
 # ══════════════════════════════════════════════════════
@@ -2375,7 +2502,7 @@ Update-Section "Ruby Gems" ($NoGem -or $OnlyWsl -or $OnlyWslPackages) { Get-Comm
 
 # --- Update Composer ---
 Update-Section "Composer" ($NoComposer -or $OnlyWsl -or $OnlyWslPackages) { Get-Command composer -ErrorAction SilentlyContinue } {
-    Invoke-SelfUpdateWithPrefetch -ToolName "Composer" -Key "Composer" -Action { & composer self-update 2>&1 | Out-Null }
+    Invoke-SelfUpdateWithPrefetch -ToolName "Composer" -Key "Composer" -Action { & composer self-update 2>&1 | Out-Null } -VersionCommand $script:SelfUpdateVersionCommands['Composer']
 }
 
 # ══════════════════════════════════════════════════════
@@ -2497,83 +2624,97 @@ Update-Section "krew plugins" ($NoKrew -or $OnlyWsl -or $OnlyWslPackages) { Get-
 # ══════════════════════════════════════════════════════
 # DEV TOOLING
 # ══════════════════════════════════════════════════════
-if (Test-GroupWanted 'Visual Studio Code Extensions','GitHub CLI Extensions','Claude Code') {
+if (Test-GroupWanted 'Visual Studio Code Extensions','Cursor Extensions','GitHub CLI Extensions','Claude Code') {
 Write-GroupHeader "Dev Tooling"
+}
+
+# Shared by the VS Code and Cursor sections (Cursor is a VS Code fork with the same CLI).
+# Prefers the CLI's own `--update-extensions` (one call, touches only outdated extensions — the
+# old per-extension `--install-extension --force` loop reinstalled every extension on every run);
+# falls back to that loop for CLIs too old to have the flag.
+function Update-EditorExtension {
+    param(
+        [Parameter(Mandatory)] [string]$Cli,
+        [Parameter(Mandatory)] [string]$Key,
+        [Parameter(Mandatory)] [string]$Label,
+        [string[]]$ProcessNames
+    )
+    # A running editor can hold its extensions directory locked, making installs fail with a bare
+    # exit 1 and no useful message — same class of problem as Git.Git vs. bash.exe. See issue #9.
+    if ($ProcessNames -and (Get-Process -Name $ProcessNames -ErrorAction SilentlyContinue)) {
+        Write-Status "$Label is currently running — extension updates may fail while files are locked" -Type Warning
+        Write-Log "${Key}: $Label process detected running before update." -Level "INFO"
+    }
+
+    if ((& $Cli --help 2>&1 | Out-String) -match '--update-extensions') {
+        Write-Status "Updating outdated extensions ($Cli --update-extensions)..." -Type Action
+        $out  = @(& $Cli --update-extensions 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -notmatch 'DeprecationWarning|--trace-deprecation' })
+        $exit = $LASTEXITCODE
+        $out | ForEach-Object { Write-Log "  [$Cli --update-extensions] $_" -Level "DEBUG" }
+        if ($exit -ne 0) {
+            $out | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
+            Write-Status "$Cli --update-extensions failed (exit $exit)" -Type Error
+            $failedItems[$Key] += "$Cli --update-extensions (exit $exit)"
+            return
+        }
+        $updated = @(Get-VsCodeUpdatedExtensionIds -Output $out)
+        if ($updated.Count -gt 0) {
+            Write-Status "$($updated.Count) extension(s) updated: $($updated -join ', ')" -Type Success
+            $updatedItems[$Key] += $updated
+        } else {
+            Write-Status "All extensions already up-to-date" -Type Success
+        }
+        return
+    }
+
+    Write-Status "Listing installed extensions..." -Type Action
+    $installedExtensions = & $Cli --list-extensions
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "$Cli --list-extensions failed (exit code $LASTEXITCODE)" -Type Error
+        $failedItems[$Key] += "$Cli --list-extensions (Exit Code: $LASTEXITCODE)"
+        return
+    }
+    $validExtensions = @($installedExtensions | Where-Object {
+        $_.Trim().Length -gt 0 -and $_ -match '^[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+$'
+    })
+    Write-Status "Checking $($validExtensions.Count) extensions for updates (legacy per-extension mode)..." -Type Info
+    $actuallyUpdated = @()
+    $progress = 0
+    foreach ($extensionId in $validExtensions) {
+        $progress++
+        Write-Progress -Activity "Checking $Label Extensions" -Status "$extensionId ($progress/$($validExtensions.Count))" -PercentComplete (($progress / $validExtensions.Count) * 100)
+        $updateOutput = & $Cli --install-extension $extensionId --force 2>&1
+        if ($LASTEXITCODE -ne 0 -and ($updateOutput -join ' ') -like '*not found*') {
+            Write-Status "$extensionId no longer exists in the Marketplace — uninstall it with '$Cli --uninstall-extension $extensionId'" -Type Skip
+            Write-Log "${Key}: $extensionId not found in Marketplace (delisted)." -Level "INFO"
+            $script:skippedSections += "$extensionId (delisted from Marketplace)"
+        } elseif ($LASTEXITCODE -ne 0) {
+            Write-Status "Failed: $extensionId" -Type Error
+            Write-Log "${Key}: $extensionId failed: $($updateOutput -join ' ')" -Level "INFO"
+            $failedItems[$Key] += "$extensionId (Exit Code: $LASTEXITCODE)"
+        } elseif (($updateOutput -join ' ') -like '*successfully installed*') {
+            Write-Status "Updated: $extensionId" -Type Info
+            $actuallyUpdated += $extensionId
+        }
+    }
+    Write-Progress -Activity "Checking $Label Extensions" -Completed
+    if ($actuallyUpdated.Count -gt 0) {
+        Write-Status "$($actuallyUpdated.Count) extensions updated" -Type Success
+        $updatedItems[$Key] += $actuallyUpdated
+    } else {
+        Write-Status "All extensions already up-to-date" -Type Success
+    }
 }
 
 # --- Update Visual Studio Code Extensions ---
 Update-Section "Visual Studio Code Extensions" ($NoVsCode -or $OnlyWsl -or $OnlyWslPackages) { Get-Command code -ErrorAction SilentlyContinue } {
-    # A running VS Code can hold its extensions directory locked, making `code --install-extension`
-    # fail with a bare exit 1 and no useful message — same class of problem as Git.Git vs. bash.exe
-    # (see Test-GitBinariesInUse). Warn up front so a failure isn't a mystery. See issue #9.
-    if (Get-Process -Name 'Code','Code - Insiders' -ErrorAction SilentlyContinue) {
-        Write-Status "VS Code is currently running — extension updates may fail while files are locked" -Type Warning
-        Write-Log "VS Code Extensions: VS Code process detected running before update." -Level "INFO"
-    }
-    Write-Status "Listing installed extensions..." -Type Action
-    $installedExtensions = & code --list-extensions
-    if ($LASTEXITCODE -ne 0) {
-        Write-Status "code --list-extensions failed (exit code $LASTEXITCODE)" -Type Error
-        $failedItems["VS Code Extensions"] += "code --list-extensions (Exit Code: $LASTEXITCODE)"
-    } else {
-        $validExtensions = $installedExtensions | Where-Object {
-            $_.Trim().Length -gt 0 -and $_ -match '^[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+$'
-        }
-        $actuallyUpdated = @()
+    Update-EditorExtension -Cli 'code' -Key 'VS Code Extensions' -Label 'VS Code' -ProcessNames 'Code','Code - Insiders'
+}
 
-        if ($PSVersionTable.PSVersion.Major -ge 7) {
-            Write-Status "Updating $($validExtensions.Count) extensions (parallel, limit 6)..." -Type Info
-            $results = $validExtensions | ForEach-Object -Parallel {
-                $out = & code --install-extension $_ --force 2>&1
-                [PSCustomObject]@{ Id = $_; Output = ($out -join ' '); ExitCode = $LASTEXITCODE }
-            } -ThrottleLimit 6
-
-            foreach ($r in $results) {
-                if ($r.ExitCode -ne 0 -and $r.Output -like '*not found*') {
-                    Write-Status "$($r.Id) no longer exists in the Marketplace — uninstall it with 'code --uninstall-extension $($r.Id)'" -Type Skip
-                    Write-Log "VS Code: $($r.Id) not found in Marketplace (delisted)." -Level "INFO"
-                    $script:skippedSections += "$($r.Id) (delisted from Marketplace)"
-                } elseif ($r.ExitCode -ne 0) {
-                    Write-Status "Failed: $($r.Id)" -Type Error
-                    Write-Log "VS Code: $($r.Id) failed: $($r.Output)" -Level "INFO"
-                    $failedItems["VS Code Extensions"] += "$($r.Id) (Exit Code: $($r.ExitCode))"
-                } elseif ($r.Output -like '*successfully installed*') {
-                    Write-Status "Updated: $($r.Id)" -Type Info
-                    $actuallyUpdated += $r.Id
-                }
-            }
-        } else {
-            Write-Status "Checking $($validExtensions.Count) extensions for updates..." -Type Info
-            $progress = 0
-            foreach ($extensionId in $validExtensions) {
-                $progress++
-                Write-Progress -Activity "Checking VS Code Extensions" -Status "$extensionId ($progress/$($validExtensions.Count))" -PercentComplete (($progress / $validExtensions.Count) * 100)
-                $updateOutput = & code --install-extension $extensionId --force 2>&1
-                if ($LASTEXITCODE -ne 0 -and ($updateOutput -join ' ') -like '*not found*') {
-                    Write-Status "$extensionId no longer exists in the Marketplace — uninstall it with 'code --uninstall-extension $extensionId'" -Type Skip
-                    Write-Log "VS Code: $extensionId not found in Marketplace (delisted)." -Level "INFO"
-                    $script:skippedSections += "$extensionId (delisted from Marketplace)"
-                } elseif ($LASTEXITCODE -ne 0) {
-                    Write-Status "Failed: $extensionId" -Type Error
-                    Write-Log "VS Code: $extensionId failed: $($updateOutput -join ' ')" -Level "INFO"
-                    $failedItems["VS Code Extensions"] += "$extensionId (Exit Code: $LASTEXITCODE)"
-                } elseif ($updateOutput -join ' ' -like '*successfully installed*') {
-                    Write-Status "Updated: $extensionId" -Type Info
-                    $actuallyUpdated += $extensionId
-                }
-            }
-            Write-Progress -Activity "Checking VS Code Extensions" -Completed
-        }
-
-        if ($actuallyUpdated.Count -gt 0) {
-            Write-Status "$($actuallyUpdated.Count) extensions updated" -Type Success
-            Write-Log "VS Code: $($actuallyUpdated.Count) updated: $($actuallyUpdated -join ', ')" -Level "INFO"
-            $updatedItems["VS Code Extensions"] += $actuallyUpdated
-        } else {
-            Write-Status "All extensions already up-to-date" -Type Success
-            Write-Log "VS Code: all $($validExtensions.Count) extensions up-to-date." -Level "INFO"
-        }
-    }
+# --- Update Cursor Extensions ---
+# Cursor itself is updated by winget / its own updater; its extensions are separate from VS Code's.
+Update-Section "Cursor Extensions" ($NoCursor -or $OnlyWsl -or $OnlyWslPackages) { Get-Command cursor -ErrorAction SilentlyContinue } {
+    Update-EditorExtension -Cli 'cursor' -Key 'Cursor Extensions' -Label 'Cursor' -ProcessNames 'Cursor'
 }
 
 # --- Update GitHub CLI Extensions ---
@@ -2598,8 +2739,7 @@ Update-Section "GitHub CLI Extensions" ($NoGhExt -or $OnlyWsl -or $OnlyWslPackag
 # rarely-used machines and unattended runs current too. npm-installed copies are also handled by
 # the npm section — `claude update` detects the install method itself.
 Update-Section "Claude Code" ($NoClaude -or $OnlyWsl -or $OnlyWslPackages) { Get-Command claude -ErrorAction SilentlyContinue } {
-    Write-Status "Updating Claude Code..." -Type Action
-    Invoke-UpdateStep -Key "Claude Code" -ActionName "claude update" -Action { & claude update } -SuccessLabel "Claude Code" | Out-Null
+    Invoke-SelfUpdate -ToolName "Claude Code" -Key "Claude Code" -Action { & claude update } -ActionName "claude update" -VersionCommand $script:SelfUpdateVersionCommands['Claude Code']
 }
 
 # ══════════════════════════════════════════════════════
@@ -2730,8 +2870,16 @@ $slowSections = $script:sectionTimings.GetEnumerator() |
 if ($slowSections) {
     Write-BlankLine
     Write-Host "  $([char]0x25CB)  Timings" -ForegroundColor DarkGray
+    # Horizontal bar chart, scaled to the slowest section; color by duration.
+    $maxSec   = ($slowSections | Select-Object -First 1).Value.TotalSeconds
+    $labelLen = ($slowSections | ForEach-Object { $_.Key.Length } | Measure-Object -Maximum).Maximum
     $slowSections | ForEach-Object {
-        Write-Host "       $([char]0x2022) $($_.Key): $(Format-Elapsed $_.Value)" -ForegroundColor DarkGray
+        $sec   = $_.Value.TotalSeconds
+        $len   = [Math]::Max(1, [Math]::Round(($sec / $maxSec) * 28))
+        $color = if ($sec -ge 300) { 'Red' } elseif ($sec -ge 60) { 'Yellow' } else { 'Green' }
+        Write-Host ("       {0}  " -f $_.Key.PadRight($labelLen)) -NoNewline -ForegroundColor Gray
+        Write-Host (([char]0x2588).ToString() * $len) -NoNewline -ForegroundColor $color
+        Write-Host " $(Format-Elapsed $_.Value)" -ForegroundColor DarkGray
     }
     $script:lastLineBlank = $false
 }
@@ -2750,8 +2898,9 @@ if ($hasFailures) {
         "Details: $LogFile"
     )
 } else {
+    $doneIcon = if ($script:UseEmoji) { [char]::ConvertFromUtf32(0x1F389) } else { [char]0x2713 }   # party popper
     Write-ResultBox -BorderColor Green -LineColors @('Green', 'Gray') -Lines @(
-        "$([char]0x2713)  All done  $([char]0x00B7)  $(Format-Elapsed $totalElapsed)"
+        "$doneIcon  All done  $([char]0x00B7)  $(Format-Elapsed $totalElapsed)"
         "$updatedCount updated ($totalUpdatedItems items)  $([char]0x00B7)  $failedCount failed ($totalFailedItems items)  $([char]0x00B7)  $skippedCount skipped"
     )
 }

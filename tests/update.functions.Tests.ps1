@@ -123,6 +123,39 @@ Describe 'Test-VersionNewer' {
     }
 }
 
+Describe 'Get-SelfUpdateOutcome' {
+    It 'is Current when the version did not change' {
+        Get-SelfUpdateOutcome -Before '2.1.310 (Claude Code)' -After '2.1.310 (Claude Code) ' | Should -Be 'Current'
+    }
+    It 'is Updated when the version changed' {
+        Get-SelfUpdateOutcome -Before 'deno 2.1.0' -After 'deno 2.2.0' | Should -Be 'Updated'
+    }
+    It 'is Unknown when a probe returned nothing' {
+        Get-SelfUpdateOutcome -Before $null -After '1.0' | Should -Be 'Unknown'
+        Get-SelfUpdateOutcome -Before '1.0' -After '' | Should -Be 'Unknown'
+    }
+}
+
+Describe 'Get-VsCodeUpdatedExtensionIds' {
+    It 'returns nothing for "No extension to update"' {
+        @(Get-VsCodeUpdatedExtensionIds -Output @('No extension to update')).Count | Should -Be 0
+    }
+    It 'parses per-extension success lines' {
+        $out = @(
+            'Updating extensions: ms-python.python, esbenp.prettier-vscode',
+            "Extension 'ms-python.python' v2026.10.0 was successfully updated.",
+            "Extension 'esbenp.prettier-vscode' v12.1.0 was successfully updated."
+        )
+        Get-VsCodeUpdatedExtensionIds -Output $out | Should -Be @('ms-python.python', 'esbenp.prettier-vscode')
+    }
+    It 'falls back to the "Updating extensions:" list when there are no success lines' {
+        Get-VsCodeUpdatedExtensionIds -Output @('Updating extensions: a.b, c.d') | Should -Be @('a.b', 'c.d')
+    }
+    It 'ignores node deprecation noise' {
+        @(Get-VsCodeUpdatedExtensionIds -Output @('(node:1) [DEP0169] DeprecationWarning: x', 'No extension to update')).Count | Should -Be 0
+    }
+}
+
 Describe 'Winget output parsing' {
     Context 'the original v12.10 garbage-entry bug scenario' {
         BeforeAll {

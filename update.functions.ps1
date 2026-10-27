@@ -86,6 +86,34 @@ function Test-VersionNewer {
     return ($Latest -ne $Installed)
 }
 
+# Classifies a successful self-update by comparing the tool's --version output before and after.
+# 'Unknown' when either probe produced nothing (tool has no cheap version command, or it failed) —
+# callers then fall back to the old behavior of counting the run as an update.
+function Get-SelfUpdateOutcome {
+    param([AllowNull()] [string]$Before, [AllowNull()] [string]$After)
+    if ([string]::IsNullOrWhiteSpace($Before) -or [string]::IsNullOrWhiteSpace($After)) { return 'Unknown' }
+    if ($Before.Trim() -eq $After.Trim()) { return 'Current' }
+    return 'Updated'
+}
+
+# Extracts extension IDs from `code --update-extensions` output. VS Code prints either
+# "No extension to update" or an "Updating extensions: a.b, c.d" line followed by one
+# "Extension 'a.b' v1.2.3 was successfully updated." line per extension.
+function Get-VsCodeUpdatedExtensionIds {
+    param([AllowNull()] [AllowEmptyCollection()] [AllowEmptyString()] [string[]]$Output)
+    $ids = @()
+    foreach ($line in $Output) {
+        if ($line -match "Extension '([^']+)'.*successfully (updated|installed)") { $ids += $Matches[1] }
+    }
+    if ($ids.Count -eq 0) {
+        $listLine = $Output | Where-Object { $_ -match '^\s*Updating extensions:\s*(.+)$' } | Select-Object -First 1
+        if ($listLine -and $listLine -match '^\s*Updating extensions:\s*(.+)$') {
+            $ids = @($Matches[1] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        }
+    }
+    return @($ids | Select-Object -Unique)
+}
+
 # Shared -Only substring-match check, used both by Update-Section (to skip sections) and the
 # elevation pre-check block (to avoid probing/elevating for a section -Only would filter out
 # anyway — no point triggering a UAC prompt for winget when -Only excludes it).
