@@ -159,6 +159,66 @@ Describe 'Test-NoOpOutput' {
     }
 }
 
+Describe 'Get-LoggableLines' {
+    It 'drops blanks, spinners and progress bars but keeps real lines' {
+        $in = @('', '   ', '-', 'Download: [#e615e5 22MiB/1.4GiB(1%) CN:8]', "[=== ] 10% Computing updates...", 'Successfully installed')
+        Get-LoggableLines -Lines $in | Should -Be @('Successfully installed')
+    }
+    It 'splits embedded line breaks and handles null' {
+        Get-LoggableLines -Lines @("a`r`nb") | Should -Be @('a', 'b')
+        @(Get-LoggableLines -Lines $null).Count | Should -Be 0
+    }
+}
+
+Describe 'Get-WingetUpgradeResult' {
+    It 'separates installed from failed packages' {
+        $out = @(
+            '(1/3) Found Docker Desktop [Docker.DockerDesktop] Version 4.97.0',
+            'Starting package install...',
+            'Successfully installed',
+            '(2/3) Found Google Chrome (EXE) [Google.Chrome.EXE] Version 156.0',
+            'Starting package install...',
+            'Installer failed with exit code: 1',
+            '(3/3) Found GitHub Copilot CLI [GitHub.Copilot] Version 1.0.105',
+            'Successfully extracted archive',
+            'Successfully installed',
+            '1 package(s) are pinned and need to be explicitly upgraded.'
+        )
+        $r = Get-WingetUpgradeResult -Output $out
+        $r.Installed | Should -Be @('Docker.DockerDesktop', 'GitHub.Copilot')
+        $r.Failed    | Should -Be @('Google.Chrome.EXE')
+    }
+    It 'counts a last block without a success line as failed' {
+        (Get-WingetUpgradeResult -Output @('(1/1) Found A [A.A] Version 1')).Failed | Should -Be @('A.A')
+    }
+    It 'returns nothing for output without package blocks' {
+        $r = Get-WingetUpgradeResult -Output @('No applicable upgrades were found.')
+        @($r.Installed).Count | Should -Be 0
+        @($r.Failed).Count    | Should -Be 0
+    }
+}
+
+Describe 'Get-ScoopUpdateResult' {
+    It 'separates installed from failed apps' {
+        $out = @(
+            'android-studio: 2026.2.2.8 -> 2026.2.2.9',
+            'Updating 2 outdated apps:',
+            "Updating 'android-studio' (2026.2.2.8 -> 2026.2.2.9)",
+            "'android-studio' (2026.2.2.9) was installed successfully!",
+            "Updating 'anki' (26.09.3 -> 26.09.4)",
+            'ERROR download failed'
+        )
+        $r = Get-ScoopUpdateResult -Output $out
+        $r.Installed | Should -Be @('android-studio')
+        $r.Failed    | Should -Be @('anki')
+    }
+    It 'returns nothing when all apps are current' {
+        $r = Get-ScoopUpdateResult -Output @("Latest versions for all apps are installed! For more information try 'scoop status'")
+        @($r.Installed).Count | Should -Be 0
+        @($r.Failed).Count    | Should -Be 0
+    }
+}
+
 Describe 'Get-VsCodeUpdatedExtensionIds' {
     It 'returns nothing for "No extension to update"' {
         @(Get-VsCodeUpdatedExtensionIds -Output @('No extension to update')).Count | Should -Be 0

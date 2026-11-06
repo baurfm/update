@@ -177,7 +177,7 @@
 .NOTES
     Author: baurfm
     Date: 2026-10-27
-    Version: 12.28
+    Version: 12.29
 #>
 
 [CmdletBinding()]
@@ -351,7 +351,7 @@ $env:PYTHONUTF8                   = '1'
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.28'
+$script:VersionString  = '12.29'
 $script:OnlyFilter     = ConvertTo-OnlyFilter -Only $Only
 $script:parallelJobs   = @{}
 $script:prefetchVersions = @{}
@@ -527,6 +527,8 @@ function Write-LogBlock {
     )
     if (-not $Lines -or -not $LogFile) { return }
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $Lines = Get-LoggableLines -Lines $Lines
+    if (-not $Lines) { return }
     $sb = New-Object System.Text.StringBuilder
     foreach ($l in $Lines) { [void]$sb.Append("[$timestamp] [$Level] $Prefix$l`r`n") }
     Write-LogFileText $sb.ToString()
@@ -638,18 +640,32 @@ function Invoke-NativeCapture {
     param(
         [Parameter(Mandatory)] [scriptblock]$Command,
         [Parameter(Mandatory)] [string]$LogTag,
-        [switch]$EchoOnFailure
+        [switch]$EchoOnFailure,
+        # Lines matching this are shown live in the default tier, so a 30-minute `winget upgrade
+        # --all` shows which package it's on instead of a silent terminal.
+        [string]$ProgressPattern
     )
+    $isVerbose = ($VerbosePreference -ne 'SilentlyContinue')
+    # The progress stream can't be redirected by *>&1: scoop's in-process Remove-Item left stray
+    # "Removed 3344 of 3264 files [3,3 GB ...]" lines in the terminal. Function-local, inherited
+    # by what $Command runs.
+    if (-not $isVerbose) { $ProgressPreference = 'SilentlyContinue' }
+    $out = New-Object System.Collections.Generic.List[object]
     # *>&1 (not 2>&1): PowerShell-based tools like scoop write via Write-Host, which lands on the
     # Information stream — 2>&1 only merges stderr and would let that chatter leak through anyway.
-    $out    = & $Command *>&1
-    $failed = ($LASTEXITCODE -ne 0)
-    $script:LastActionOutput = $out   # read by Invoke-UpdateStep for "nothing to do" detection
-    if ($out) {
-        Write-LogBlock -Lines $out -Prefix "  [$LogTag] "
-        if ($VerbosePreference -ne 'SilentlyContinue' -or ($EchoOnFailure -and $failed)) {
-            $out | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
+    # Streamed line by line: the log stays current during long commands and survives an aborted
+    # run (previously nothing was written until the command had finished).
+    & $Command *>&1 | ForEach-Object {
+        $out.Add($_)
+        Write-LogBlock -Lines (Get-LoggableLines -Lines @($_)) -Prefix "  [$LogTag] "
+        if ($ProgressPattern -and -not $isVerbose -and -not $script:QuietMode -and "$_" -match $ProgressPattern) {
+            Write-Host "      $_" -ForegroundColor DarkGray
         }
+    }
+    $failed = ($LASTEXITCODE -ne 0)
+    $script:LastActionOutput = $out.ToArray()   # read by callers for "nothing to do" / per-package results
+    if ($EchoOnFailure -and $failed -and -not $isVerbose) {
+        Get-LoggableLines -Lines $out.ToArray() | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
     }
 }
 
@@ -672,8 +688,10 @@ function Invoke-WithRetry {
 
     $attempt = 0
     $maxAttempts = $MaxRetries + 1
+    $script:EarlierAttemptFailed = $false
     do {
         $attempt++
+        if ($attempt -gt 1) { $script:EarlierAttemptFailed = $true }
         Write-Log "Executing $ActionName (attempt $attempt of $maxAttempts$( if ($TimeoutSec -gt 0) { ", timeout ${TimeoutSec}s" } ))" -Level "DEBUG"
         try {
             if ($TimeoutSec -gt 0) {
@@ -864,7 +882,10 @@ function Invoke-UpdateStep {
     if (-not $FailureLabel) { $FailureLabel = "$ActionName (failed after retries)" }
     $script:LastActionOutput = $null
     if (Invoke-WithRetry -Action $Action -ActionName $ActionName -MaxRetries $MaxRetries) {
-        if (Test-NoOpOutput -Output $script:LastActionOutput) {
+        # A retry saying "nothing to do" proves nothing if an earlier attempt failed: that attempt
+        # may have done most of the work (live run: uv upgraded dozens of packages, hit an error,
+        # the retry said "Nothing to upgrade" and the summary reported no update at all).
+        if ((Test-NoOpOutput -Output $script:LastActionOutput) -and -not $script:EarlierAttemptFailed) {
             Write-Status "$SuccessLabel already up-to-date" -Type Success
             Write-Log "${ActionName}: nothing to do." -Level "INFO"
         } else {
@@ -2001,60 +2022,48 @@ Write-GroupHeader "Package Managers"
 
 # --- Update Scoop ---
 Update-Section "Scoop and its packages" ($NoScoop -or $OnlyWsl -or $OnlyWslPackages) { Get-Command scoop -ErrorAction SilentlyContinue } {
-    Write-Status "Checking for outdated packages..." -Type Action
-    # *>&1: scoop writes status chatter ("Everything is ok!" etc.) via Write-Host, which lands on
-    # the Information stream — a plain assignment wouldn't capture it and it would leak straight
-    # to the console regardless of verbosity tier.
-    $scoopStatus = & scoop status *>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-Status "scoop status failed (exit code $LASTEXITCODE)" -Type Error
-        $failedItems["Scoop"] += "scoop status (Exit Code: $LASTEXITCODE)"
-    } else {
-        $outdatedApps = @()
-        foreach ($line in ($scoopStatus -split [System.Environment]::NewLine)) {
-            if ($line -like '*outdated*') {
-                $appName = ($line.Trim() -split '\s+')[0]
-                if (-not [string]::IsNullOrWhiteSpace($appName) -and $appName -match '^[a-zA-Z0-9._-]+$') {
-                    $outdatedApps += $appName
-                }
-            }
-        }
+    Write-Status "Updating Scoop itself..." -Type Action
+    # "Scoop was updated successfully!" is printed even when nothing changed — compare the
+    # core version instead (first two lines of `scoop --version`; the rest lists buckets).
+    Invoke-SelfUpdate -ToolName "Scoop" -Key "Scoop" -Action { & scoop update } -ActionName "scoop update" `
+        -VersionCommand { scoop --version *>&1 | Select-Object -First 2 }
 
-        if ($outdatedApps.Count -gt 0) {
-            Write-Status "Found $($outdatedApps.Count) outdated: $($outdatedApps -join ', ')" -Type Info
-            Write-Log "Scoop: $($outdatedApps.Count) outdated: $($outdatedApps -join ', ')" -Level "INFO"
-            $updatedItems["Scoop"] += $outdatedApps
-        } else {
-            Write-Status "All packages up-to-date" -Type Success
-            Write-Log "Scoop: all packages up-to-date." -Level "INFO"
-        }
-
-        Write-Status "Updating Scoop itself..." -Type Action
-        # "Scoop was updated successfully!" is printed even when nothing changed — compare the
-        # core version instead (first two lines of `scoop --version`; the rest lists buckets).
-        Invoke-SelfUpdate -ToolName "Scoop" -Key "Scoop" -Action { & scoop update } -ActionName "scoop update" `
-            -VersionCommand { scoop --version *>&1 | Select-Object -First 2 }
-
-        Write-Status "Updating all installed packages..." -Type Action
-        # No retry — scoop returns non-zero if ANY package fails.
-        # Retrying would re-run ALL updates unnecessarily.
-        Invoke-NativeCapture -Command { & scoop update * } -LogTag "scoop update *" -EchoOnFailure
-        if ($LASTEXITCODE -ne 0) {
-            Write-Status "Some packages may have failed (exit code $LASTEXITCODE)" -Type Warning
-            Write-Log "scoop update * exited with code $LASTEXITCODE" -Level "INFO"
-        }
-
-        Write-Status "Removing old package versions..." -Type Action
-        Invoke-NativeCapture -Command { & scoop cleanup * } -LogTag "scoop cleanup *" -EchoOnFailure
-        if ($LASTEXITCODE -ne 0) {
-            Write-Status "scoop cleanup failed (exit $LASTEXITCODE)" -Type Warning
-            $failedItems["Scoop"] += "scoop cleanup (Exit Code: $LASTEXITCODE)"
-        }
-
-        # Downloaded installers are only needed to reinstall the exact same version — clearing them
-        # every run keeps the cache from growing into gigabytes over time.
-        Invoke-CacheCleanup -Label "Scoop download cache" -Command { & scoop cache rm --all }
+    Write-Status "Updating all installed packages..." -Type Action
+    # No retry — scoop returns non-zero if ANY package fails.
+    # Retrying would re-run ALL updates unnecessarily.
+    # Results come from this command's own output: a `scoop status` beforehand ran against stale
+    # buckets and reported "All packages up-to-date" right before a 1.4 GiB update (live run).
+    Invoke-NativeCapture -Command { & scoop update * } -LogTag "scoop update *" -EchoOnFailure -ProgressPattern "^Updating '"
+    $scoopCode   = $LASTEXITCODE
+    $scoopResult = Get-ScoopUpdateResult -Output $script:LastActionOutput
+    if ($scoopResult.Installed.Count -gt 0) {
+        Write-Status "$($scoopResult.Installed.Count) package(s) updated" -Type Success
+        Write-Log "Scoop: updated $($scoopResult.Installed -join ', ')" -Level "INFO"
+        $updatedItems["Scoop"] += $scoopResult.Installed
     }
+    if ($scoopResult.Failed.Count -gt 0) {
+        Write-Status "Failed: $($scoopResult.Failed -join ', ')" -Type Error
+        Write-Log "Scoop: failed $($scoopResult.Failed -join ', ') (exit $scoopCode)" -Level "INFO"
+        $failedItems["Scoop"] += $scoopResult.Failed
+    } elseif ($scoopCode -ne 0) {
+        Write-Status "scoop update * failed (exit code $scoopCode)" -Type Error
+        Write-Log "scoop update * exited with code $scoopCode" -Level "INFO"
+        $failedItems["Scoop"] += "scoop update * (Exit Code: $scoopCode)"
+    } elseif ($scoopResult.Installed.Count -eq 0) {
+        Write-Status "All packages up-to-date" -Type Success
+        Write-Log "Scoop: all packages up-to-date." -Level "INFO"
+    }
+
+    Write-Status "Removing old package versions..." -Type Action
+    Invoke-NativeCapture -Command { & scoop cleanup * } -LogTag "scoop cleanup *" -EchoOnFailure
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "scoop cleanup failed (exit $LASTEXITCODE)" -Type Warning
+        $failedItems["Scoop"] += "scoop cleanup (Exit Code: $LASTEXITCODE)"
+    }
+
+    # Downloaded installers are only needed to reinstall the exact same version — clearing them
+    # every run keeps the cache from growing into gigabytes over time.
+    Invoke-CacheCleanup -Label "Scoop download cache" -Command { & scoop cache rm --all }
 }
 
 # --- Update Winget & Microsoft Store Apps ---
@@ -2191,14 +2200,20 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
             # No retry — winget returns non-zero if ANY package fails (e.g. Office).
             # Pinned packages are excluded by default; we deliberately do not pass
             # --include-pinned so user pins are preserved.
-            Invoke-NativeCapture -Command { & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-unknown } -LogTag "winget upgrade --all" -EchoOnFailure
+            Invoke-NativeCapture -Command { & winget upgrade --all --accept-source-agreements --accept-package-agreements --include-unknown } -LogTag "winget upgrade --all" -EchoOnFailure -ProgressPattern '^\(\d+/\d+\) Found '
             $wingetUpgradeCode = $LASTEXITCODE
-            # Record results AFTER the upgrade so the summary reflects what actually ran.
-            $updatedItems["Winget"] += $upgradablePackages
-            if ($wingetUpgradeCode -ne 0) {
-                Write-Status "Some packages may have failed, e.g. Office (exit code $wingetUpgradeCode)" -Type Warning
+            # Per-package results from winget's own output, not the candidate list — a candidate
+            # that failed or was held back must not show up as updated.
+            $wingetResult = Get-WingetUpgradeResult -Output $script:LastActionOutput
+            $updatedItems["Winget"] += $wingetResult.Installed
+            if ($wingetResult.Failed.Count -gt 0) {
+                Write-Status "Failed: $($wingetResult.Failed -join ', ')" -Type Error
+                Write-Log "winget upgrade --all: failed $($wingetResult.Failed -join ', ') (exit $wingetUpgradeCode)" -Level "INFO"
+                $failedItems["Winget"] += $wingetResult.Failed
+            } elseif ($wingetUpgradeCode -ne 0) {
+                Write-Status "winget upgrade --all failed (exit code $wingetUpgradeCode)" -Type Warning
                 Write-Log "winget upgrade --all exited with code $wingetUpgradeCode" -Level "INFO"
-                $failedItems["Winget"] += "Some installers failed (exit $wingetUpgradeCode)"
+                $failedItems["Winget"] += "winget upgrade --all (exit $wingetUpgradeCode)"
             }
             if ($gitSkipReason) {
                 $script:skippedSections += "Git.Git ($gitSkipReason)"
@@ -2271,6 +2286,7 @@ Update-Section "Winget & Microsoft Store apps" ($NoWinget -or $OnlyWsl -or $Only
     $wingetTemp = Join-Path $env:TEMP 'WinGet'
     if (Test-Path $wingetTemp) {
         $before = (Get-ChildItem $wingetTemp -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        $ProgressPreference = 'SilentlyContinue'   # PS7's Remove-Item prints "Removed N of M files" bars
         Get-ChildItem $wingetTemp -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
         $after  = (Get-ChildItem $wingetTemp -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
         $freedMB = [Math]::Round(($before - $after) / 1MB)
@@ -2497,7 +2513,10 @@ Update-Section "Windows Update" ($NoWindowsUpdate -or $OnlyWsl -or $OnlyWslPacka
         $wuAvailable | ForEach-Object { Write-Log "Windows Update: pending $($_.KB) $($_.Title)" -Level "INFO" }
         # 6>$null: PSWindowsUpdate prints its own progress table to the information stream.
         $wuResults = @(Install-WindowsUpdate -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction Stop 6>$null)
-        foreach ($r in $wuResults) {
+        # The cmdlet emits each update once per phase (accept/download/install), so group by update
+        # and keep the final state — otherwise every update is listed three times in the summary.
+        $wuFinal = $wuResults | Group-Object { "$($_.KB) $($_.Title)" } | ForEach-Object { $_.Group[-1] }
+        foreach ($r in $wuFinal) {
             $label = if ($r.KB) { "$($r.KB) $($r.Title)" } else { "$($r.Title)" }
             Write-Log "Windows Update: $($r.Result) - $label" -Level "INFO"
             if ("$($r.Result)" -match 'Fail|Abort') {
@@ -2903,10 +2922,20 @@ Update-Section "Google Cloud SDK" ($NoGCloud -or $OnlyWsl -or $OnlyWslPackages) 
         if ($copyCode -eq 0 -and $pythonPath -and (Test-Path $pythonPath)) {
             $env:CLOUDSDK_PYTHON = $pythonPath
             Write-Log "gcloud: CLOUDSDK_PYTHON set to $pythonPath, retrying update." -Level "INFO"
-            $gcloudOut  = & gcloud components update --quiet 2>&1
-            $gcloudCode = $LASTEXITCODE
-            $gcloudText = ($gcloudOut | Out-String)
-            Write-LogBlock -Lines $gcloudOut -Prefix "  [gcloud-retry] "
+            try {
+                $gcloudOut  = & gcloud components update --quiet 2>&1
+                $gcloudCode = $LASTEXITCODE
+                $gcloudText = ($gcloudOut | Out-String)
+                Write-LogBlock -Lines $gcloudOut -Prefix "  [gcloud-retry] "
+            } finally {
+                # Every workaround run left a full Python copy behind in %TEMP%\tmpXXXX.
+                Remove-Item Env:CLOUDSDK_PYTHON -ErrorAction SilentlyContinue
+                $pythonTemp = Split-Path (Split-Path $pythonPath -Parent) -Parent
+                if ($pythonTemp -like "$env:TEMP\tmp*") {
+                    $ProgressPreference = 'SilentlyContinue'
+                    Remove-Item $pythonTemp -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
         } else {
             Write-Status "gcloud copy-bundled-python failed (exit $copyCode)" -Type Error
             Write-Log "gcloud copy-bundled-python output: $copyOut" -Level "INFO"

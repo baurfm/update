@@ -123,6 +123,53 @@ function Test-NoOpOutput {
     return $false
 }
 
+# Flattens captured tool output to the lines worth keeping in the log: drops blanks, spinners and
+# progress bars (one aria2 download alone produced hundreds of them in a live run).
+function Get-LoggableLines {
+    param([AllowNull()] [AllowEmptyCollection()] [object[]]$Lines)
+    $noise = '^\s*$|^\s*[-\\|/]\s*$|^Download: \[|FileAlloc|[█▒]|^\[[= ]*\]\s*\d+%'
+    return @($Lines | ForEach-Object { "$_" -split "\r\n|\r|\n" } | Where-Object { $_ -notmatch $noise })
+}
+
+# Per-package result of `winget upgrade --all`, from its "(n/m) Found Name [Id] Version x" blocks:
+# a block counts as installed only if it contains "Successfully installed". Formats taken from a
+# real run. Without this, every upgrade candidate was reported as updated, even failed ones.
+function Get-WingetUpgradeResult {
+    param([AllowNull()] [AllowEmptyCollection()] [object[]]$Output)
+    $installed = @()
+    $failed    = @()
+    $current   = $null
+    $ok        = $false
+    foreach ($line in (Get-LoggableLines -Lines $Output)) {
+        if ($line -match '^\(\d+/\d+\) Found .*\[([^\]]+)\]') {
+            $id = $Matches[1]
+            if ($current) { if ($ok) { $installed += $current } else { $failed += $current } }
+            $current = $id
+            $ok      = $false
+        } elseif ($current -and $line -match '^Successfully installed') {
+            $ok = $true
+        }
+    }
+    if ($current) { if ($ok) { $installed += $current } else { $failed += $current } }
+    return [PSCustomObject]@{ Installed = $installed; Failed = $failed }
+}
+
+# Per-app result of `scoop update *`: "Updating 'x' (a -> b)" means attempted, "'x' (b) was
+# installed successfully!" means done. Format taken from a real run.
+function Get-ScoopUpdateResult {
+    param([AllowNull()] [AllowEmptyCollection()] [object[]]$Output)
+    $attempted = @()
+    $installed = @()
+    foreach ($line in (Get-LoggableLines -Lines $Output)) {
+        if ($line -match "^Updating '([^']+)' \(") { $attempted += $Matches[1] }
+        elseif ($line -match "^'([^']+)' \(.*\) was installed successfully") { $installed += $Matches[1] }
+    }
+    return [PSCustomObject]@{
+        Installed = $installed
+        Failed    = @($attempted | Where-Object { $installed -notcontains $_ })
+    }
+}
+
 # Extracts extension IDs from `code --update-extensions` output. VS Code prints either
 # "No extension to update" or an "Updating extensions: a.b, c.d" line followed by one
 # "Extension 'a.b' v1.2.3 was successfully updated." line per extension.
