@@ -117,6 +117,11 @@ Describe 'Test-VersionNewer' {
         Test-VersionNewer -Installed '3.0.0-preview1' -Latest '3.0.0' | Should -BeTrue
         Test-VersionNewer -Installed '3.0.0' -Latest '3.0.0-preview2' | Should -BeFalse
     }
+    It 'treats missing version parts as zero (1.0.6 equals 1.0.6.0)' {
+        Test-VersionNewer -Installed '1.0.6' -Latest '1.0.6.0' | Should -BeFalse
+        Test-VersionNewer -Installed '1.0.6.0' -Latest '1.0.6' | Should -BeFalse
+        Test-VersionNewer -Installed '1.0.6' -Latest '1.0.6.1' | Should -BeTrue
+    }
     It 'falls back to string inequality for unparseable versions' {
         Test-VersionNewer -Installed 'abc' -Latest 'abd' | Should -BeTrue
         Test-VersionNewer -Installed 'abc' -Latest 'abc' | Should -BeFalse
@@ -145,6 +150,7 @@ Describe 'Test-NoOpOutput' {
         @{ Out = 'No updates available' }
         @{ Out = "Latest versions for all apps are installed! For more information try 'scoop status'" }
         @{ Out = 'Chocolatey upgraded 0/12 packages.' }
+        @{ Out = 'The most recent version of Windows Subsystem for Linux is already installed.' }
     ) {
         param($Out)
         Test-NoOpOutput -Output @('some preamble', $Out) | Should -BeTrue
@@ -216,6 +222,23 @@ Describe 'Get-ScoopUpdateResult' {
         $r = Get-ScoopUpdateResult -Output @("Latest versions for all apps are installed! For more information try 'scoop status'")
         @($r.Installed).Count | Should -Be 0
         @($r.Failed).Count    | Should -Be 0
+    }
+}
+
+Describe 'Get-CustomModulePath' {
+    BeforeAll {
+        $script:std = @('C:\Users\me\OneDrive\Documents', 'C:\Program Files', 'C:\Program Files (x86)', 'C:\WINDOWS')
+    }
+    It 'returns only entries outside the standard locations' {
+        $p = 'C:\Users\me\OneDrive\Documents\PowerShell\Modules;C:\Program Files\PowerShell\Modules;c:\program files\powershell\7\Modules;C:\Users\me\PowerShell\Modules;C:\WINDOWS\system32\WindowsPowerShell\v1.0\Modules'
+        Get-CustomModulePath -ModulePath $p -StandardPrefixes $std | Should -Be @('C:\Users\me\PowerShell\Modules')
+    }
+    It 'removes duplicates, trailing slashes and empty entries' {
+        $p = 'D:\Mods\;;d:\mods; '
+        Get-CustomModulePath -ModulePath $p -StandardPrefixes $std | Should -Be @('D:\Mods')
+    }
+    It 'returns nothing for an empty path' {
+        @(Get-CustomModulePath -ModulePath $null -StandardPrefixes $std).Count | Should -Be 0
     }
 }
 

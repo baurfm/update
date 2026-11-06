@@ -79,6 +79,9 @@ function Test-VersionNewer {
     $i = $null; $l = $null
     if ([version]::TryParse(($Installed -split '[-+]')[0], [ref]$i) -and
         [version]::TryParse(($Latest    -split '[-+]')[0], [ref]$l)) {
+        # [version] treats missing parts as -1, which made 1.0.6.0 "newer" than 1.0.6.
+        $i = New-Object System.Version $i.Major, $i.Minor, ([Math]::Max($i.Build, 0)), ([Math]::Max($i.Revision, 0))
+        $l = New-Object System.Version $l.Major, $l.Minor, ([Math]::Max($l.Build, 0)), ([Math]::Max($l.Revision, 0))
         if ($l -ne $i) { return ($l -gt $i) }
         # Same numeric version: only a prerelease -> stable transition counts as newer.
         return ($Installed -match '-' -and $Latest -notmatch '-')
@@ -112,6 +115,7 @@ $script:NoOpPatterns = @(
     'upgraded 0/'                                          # choco upgrade all ("Chocolatey upgraded 0/12 packages")
     'Latest version already installed'                    # gem update --system
     '0 upgraded, 0 newly installed, 0 to remove'          # apt-get full-upgrade (WSL)
+    'most recent version of Windows Subsystem for Linux is already installed'   # wsl --update
 )
 function Test-NoOpOutput {
     param([AllowNull()] [AllowEmptyCollection()] [object[]]$Output)
@@ -167,6 +171,28 @@ function Get-ScoopUpdateResult {
     return [PSCustomObject]@{
         Installed = $installed
         Failed    = @($attempted | Where-Object { $installed -notcontains $_ })
+    }
+}
+
+# PSModulePath entries outside the standard install locations. Get-InstalledModule and a plain
+# Get-InstalledPSResource only look in Documents + Program Files, so modules moved elsewhere (e.g.
+# out of OneDrive) are importable but silently never updated.
+function Get-CustomModulePath {
+    param(
+        [AllowNull()] [string]$ModulePath,
+        [string[]]$StandardPrefixes
+    )
+    $seen = @{}
+    foreach ($entry in @("$ModulePath" -split ';' | Where-Object { $_.Trim() })) {
+        $norm = $entry.Trim().TrimEnd('\')
+        $isStandard = $false
+        foreach ($prefix in $StandardPrefixes) {
+            if ($prefix -and $norm -like "$($prefix.TrimEnd('\'))*") { $isStandard = $true; break }
+        }
+        if (-not $isStandard -and -not $seen.ContainsKey($norm.ToLowerInvariant())) {
+            $seen[$norm.ToLowerInvariant()] = $true
+            $norm
+        }
     }
 }
 

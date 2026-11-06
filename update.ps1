@@ -177,7 +177,7 @@
 .NOTES
     Author: baurfm
     Date: 2026-10-27
-    Version: 12.29
+    Version: 12.30
 #>
 
 [CmdletBinding()]
@@ -347,11 +347,12 @@ $env:DOTNET_CLI_TELEMETRY_OPTOUT  = '1'
 $env:NEXT_TELEMETRY_DISABLED      = '1'
 $env:DO_NOT_TRACK                 = '1'
 $env:PYTHONUTF8                   = '1'
+$env:WSL_UTF8                     = '1'   # wsl.exe otherwise prints UTF-16: "C h e c k i n g" in logs, text matches fail
 
 $script:QuietMode      = [bool]$Quiet
 $script:CmdTimeoutSec  = [int]$CmdTimeoutSec
 $script:LockAcquired   = $false
-$script:VersionString  = '12.29'
+$script:VersionString  = '12.30'
 $script:OnlyFilter     = ConvertTo-OnlyFilter -Only $Only
 $script:parallelJobs   = @{}
 $script:prefetchVersions = @{}
@@ -997,7 +998,8 @@ function Test-WslHasUpdates {
         # Normalise to Major.Minor.Patch (drop 4th segment if present)
         $cur3 = ($current -split '\.' | Select-Object -First 3) -join '.'
         $lat3 = ($latest  -split '\.' | Select-Object -First 3) -join '.'
-        if ($cur3 -ne $lat3) {
+        # Newer-than, not not-equal: a preview build ahead of "latest" must not ask for UAC every run.
+        if (Test-VersionNewer -Installed $cur3 -Latest $lat3) {
             Write-Status "WSL update available: $cur3 → $lat3" -Type Info
             return $true
         }
@@ -1804,7 +1806,9 @@ if ($Elevated) {
     # Skip when -NoWsl or -OnlyWslPackages is set (wsl --update won't run anyway).
     if (-not $NoWsl -and -not $OnlyWslPackages -and (Test-SectionWanted 'Windows Subsystem for Linux (WSL)') -and (Get-Command wsl -ErrorAction SilentlyContinue)) {
         $fnWsl = ${Function:Test-WslHasUpdates}.ToString()
+        $fnVersionNewer = ${Function:Test-VersionNewer}.ToString()
         $preWslJob = Start-Job -ScriptBlock {
+            . ([scriptblock]::Create("function Test-VersionNewer { $($using:fnVersionNewer) }"))
             # Capture Write-Status calls so they can be replayed in the main runspace
             $wslMsgs = [System.Collections.Generic.List[hashtable]]::new()
             function Write-Status {
@@ -2363,10 +2367,57 @@ Update-Section "PowerShell Modules" ($NoPowerShell -or $OnlyWsl -or $OnlyWslPack
         $latest = $latestInGallery[$_.Name]
         $latest -and (Test-VersionNewer -Installed "$($_.Version)" -Latest "$latest")
     })
+    # Modules on a custom PSModulePath entry (e.g. moved out of OneDrive): importable, but invisible
+    # to Get-InstalledModule and Update-PSResource. Save-PSResource -Path adds the new version next
+    # to the old one, so a module that's in use can't block it. Same trust rule as above.
+    if (Get-Command Save-PSResource -ErrorAction SilentlyContinue) {
+        $standardRoots = @([Environment]::GetFolderPath('MyDocuments'), "$env:USERPROFILE\Documents", $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:windir, $PSHOME)
+        foreach ($customPath in @(Get-CustomModulePath -ModulePath $env:PSModulePath -StandardPrefixes $standardRoots)) {
+            if (-not (Test-Path $customPath)) { continue }
+            $customInstalled = @(Get-InstalledPSResource -Path $customPath -ErrorAction SilentlyContinue |
+                Group-Object Name | ForEach-Object { $_.Group | Sort-Object Version -Descending | Select-Object -First 1 })
+            if ($customInstalled.Count -eq 0) { continue }
+            Write-Status "Checking $($customInstalled.Count) modules in $customPath..." -Type Action
+            $customUpdated = 0
+            $customFailed  = 0
+            foreach ($group in ($customInstalled | Group-Object Repository)) {
+                $repo     = $group.Name
+                $repoInfo = if ($repo) { Get-PSResourceRepository -Name $repo -ErrorAction SilentlyContinue } else { $null }
+                if (-not $repoInfo -or -not ($repo -eq 'PSGallery' -or $repoInfo.Trusted)) {
+                    Write-Log "PSResourceGet: skipping $($group.Count) module(s) in $customPath — repository '$repo' unknown or not trusted." -Level "INFO"
+                    $script:skippedSections += "$($group.Group.Name -join ', ') (repository '$repo' not trusted)"
+                    continue
+                }
+                $latest = @{}
+                Find-PSResource -Name $group.Group.Name -Repository $repo -ErrorAction SilentlyContinue |
+                    ForEach-Object { $latest[$_.Name] = $_.Version }
+                foreach ($res in $group.Group) {
+                    if (-not $latest[$res.Name] -or -not (Test-VersionNewer -Installed "$($res.Version)" -Latest "$($latest[$res.Name])")) { continue }
+                    try {
+                        # -IncludeXml: without PSGetModuleInfo.xml the new version is invisible to
+                        # Get-InstalledPSResource and would be downloaded again on every run.
+                        Save-PSResource -Name $res.Name -Path $customPath -Repository $repo -TrustRepository -IncludeXml -ErrorAction Stop -WarningAction SilentlyContinue
+                        Write-Log "PSResourceGet: $($res.Name) $($res.Version) -> $($latest[$res.Name]) in $customPath" -Level "INFO"
+                        $updatedItems["PowerShell Modules"] += $res.Name
+                        $customUpdated++
+                    } catch {
+                        Write-Status "Failed: $($res.Name) - $($_.Exception.Message)" -Type Error
+                        Write-Log "PSResourceGet: $($res.Name) failed: $($_.Exception.Message)" -Level "INFO"
+                        $failedItems["PowerShell Modules"] += "$($res.Name) - $($_.Exception.Message)"
+                        $customFailed++
+                    }
+                }
+            }
+            if ($customUpdated -eq 0 -and $customFailed -eq 0) {
+                Write-Status "All $($customInstalled.Count) modules in $customPath already at latest version" -Type Success
+            }
+        }
+    }
+
     if (@($installedModules).Count -eq 0) {
         # Windows PowerShell and PowerShell 7 keep separate module folders — modules installed
         # from pwsh are invisible here (and vice versa). Not an error, just nothing to do.
-        Write-Status "No PowerShellGet-installed modules for PowerShell $($PSVersionTable.PSVersion.Major)" -Type Success
+        Write-Log "No PowerShellGet-installed modules for PowerShell $($PSVersionTable.PSVersion.Major) in the standard locations." -Level "INFO"
         return
     }
     if ($modulesToUpdate.Count -eq 0) {
@@ -2536,7 +2587,8 @@ Update-Section "Windows Update" ($NoWindowsUpdate -or $OnlyWsl -or $OnlyWslPacka
     # Admin-only (we are, or this section wouldn't run). Cmdlet missing on old builds → skip.
     if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) {
         try {
-            Delete-DeliveryOptimizationCache -Force -ErrorAction Stop
+            # *>&1: the cmdlet prints "Deleting..." / "Successfully deleted..." straight to the host.
+            Delete-DeliveryOptimizationCache -Force -ErrorAction Stop *>&1 | Out-Null
             Write-Log "Windows Update: Delivery Optimization cache cleared." -Level "INFO"
         } catch {
             Write-Status "Clearing Delivery Optimization cache failed: $($_.Exception.Message)" -Type Warning
